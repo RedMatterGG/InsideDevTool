@@ -1,0 +1,168 @@
+-- InsideDev link for Cheat Engine (Lua). Loaded by InsideDev.CT, or copy this file into
+-- "C:\Program Files\Cheat Engine\autorun\" to have it every time Cheat Engine starts.
+--   * attaches to INSIDE.exe if nothing is attached
+--   * group "InsideDev selection" in the address list = the object selected in InsideDev (updates on every selection)
+--   * right-click menus:
+--       address list:   "InsideDev: what is this?"            (the address of the selected record)
+--       memory viewer:  "InsideDev: what is this?" / "InsideDev: which method?"   (selected byte / instruction)
+--       Table menu:     "InsideDev: what is at address..." / "InsideDev: which method at address..."
+-- Talks to the game through files in <INSIDE>\_mod\ce\ (creating that folder switches the link on in the game).
+-- Addresses are only valid until the object is destroyed, the level reloads or the game restarts.
+
+InsideDev = InsideDev or {}
+local D = InsideDev
+D.dir = nil; D.stamp = nil; D.askId = 0; D.waiting = nil
+
+local function log(s) print("[InsideDev] " .. tostring(s)) end
+
+local function findDir()
+  if getOpenedProcessID() == 0 then return nil end
+  local ok, mods = pcall(enumModules)
+  if not ok or mods == nil then return nil end
+  for _, m in ipairs(mods) do
+    if m.Name and m.Name:lower() == "inside.exe" and m.PathToFile then
+      local base = m.PathToFile:match("^(.*)[\\/][^\\/]+$")
+      if base then return base .. "\\_mod\\ce" end
+    end
+  end
+  return nil
+end
+
+local function ensureDir()
+  if D.dir == nil then
+    D.dir = findDir()
+    if D.dir then
+      if createDirectory then pcall(createDirectory, D.dir) end
+      local f = io.open(D.dir .. "\\.link", "w")
+      if f then f:write("cheat engine link\n"); f:close(); log("linked: " .. D.dir)
+      else log("cannot write to " .. D.dir .. " (start InsideDev once so _mod exists)"); D.dir = nil end
+    end
+  end
+  return D.dir
+end
+
+local types = { ["Float"] = vtSingle, ["4 Bytes"] = vtDword, ["8 Bytes"] = vtQword, ["Double"] = vtDouble, ["2 Bytes"] = vtWord, ["Byte"] = vtByte }
+
+local function group()
+  local al = getAddressList()
+  for i = 0, al.Count - 1 do
+    local r = al[i]
+    if r.Description:sub(1, 19) == "InsideDev selection" and r.Parent == nil then return r end
+  end
+  local g = al.createMemoryRecord()
+  g.Description = "InsideDev selection"
+  g.IsGroupHeader = true
+  return g
+end
+
+local function rebuild(lines)
+  local g = group()
+  while g.Count > 0 do g.Child[g.Count - 1].delete() end
+  local al = getAddressList()
+  local comp = nil
+  for _, l in ipairs(lines) do
+    local p = {}
+    for x in (l .. "|"):gmatch("([^|]*)|") do p[#p + 1] = x end
+    if p[1] == "none" then g.Description = "InsideDev selection: " .. (p[2] or "")
+    elseif p[1] == "object" then g.Description = "InsideDev selection: " .. p[2] .. "   (" .. p[3] .. ")"
+    elseif p[1] == "comp" then
+      comp = al.createMemoryRecord()
+      comp.Description = p[2] .. "   script " .. (p[3] ~= "0" and p[3] or "-") .. "   native " .. (p[4] ~= "0" and p[4] or "-")
+      comp.IsGroupHeader = true
+      comp.appendToEntry(g)
+    elseif p[1] == "rec" then
+      local r = al.createMemoryRecord()
+      r.Description = p[2]
+      r.Type = types[p[3]] or vtDword
+      r.Address = p[4]
+      if p[5] == "1" then r.ShowAsHex = true end
+      r.appendToEntry(comp or g)
+    end
+  end
+  g.Active = false
+end
+
+local function readAll(path)
+  local f = io.open(path, "r"); if not f then return nil end
+  local s = f:read("*a"); f:close(); return s
+end
+
+local function ask(q)
+  if not ensureDir() then showMessage("InsideDev: attach Cheat Engine to INSIDE.exe first."); return end
+  D.askId = D.askId + 1
+  local f = io.open(D.dir .. "\\ask.txt", "w")
+  if not f then showMessage("InsideDev: cannot write " .. D.dir .. "\\ask.txt"); return end
+  f:write(D.askId .. "|" .. q); f:close()
+  os.remove(D.dir .. "\\answer.txt")
+  D.waiting = { id = tostring(D.askId), q = q, t = os.clock() }
+end
+
+local function tick()
+  if getOpenedProcessID() == 0 then D.dir = nil; return end
+  if not ensureDir() then return end
+  local s = readAll(D.dir .. "\\selection.txt")
+  if s then
+    local lines = {}
+    for l in s:gmatch("[^\r\n]+") do lines[#lines + 1] = l end
+    local st = lines[1]
+    if st and st ~= D.stamp then D.stamp = st; table.remove(lines, 1); local ok, e = pcall(rebuild, lines); if not ok then log(e) end end
+  end
+  if D.waiting then
+    local a = readAll(D.dir .. "\\answer.txt")
+    if a then
+      local id, text = a:match("^([^\r\n]*)\r?\n(.*)$")
+      if id == D.waiting.id then D.waiting = nil; os.remove(D.dir .. "\\answer.txt"); showMessage(text) end
+    elseif os.clock() - D.waiting.t > 5 then
+      D.waiting = nil; showMessage("InsideDev did not answer. Is the game running with InsideDev, and not paused in a loading screen?")
+    end
+  end
+end
+
+local function hex(a) return string.format("%X", a) end
+
+local function addItem(menu, caption, fn)
+  if menu == nil then return end
+  local mi = createMenuItem(menu)
+  mi.Caption = caption
+  mi.OnClick = function() local ok, e = pcall(fn); if not ok then showMessage("InsideDev: " .. tostring(e)) end end
+  menu.Items.add(mi)
+end
+
+local function install()
+  if D.installed then return end
+  D.installed = true
+  -- address list
+  addItem(MainForm.PopupMenu2, "InsideDev: what is this?", function()
+    local r = getAddressList().getSelectedRecord()
+    if r == nil then showMessage("select a record first"); return end
+    ask("what " .. hex(r.CurrentAddress))
+  end)
+  -- memory viewer
+  local mv = getMemoryViewForm()
+  if mv then
+    local dv = mv.DisassemblerView
+    addItem(dv and dv.PopupMenu, "InsideDev: which method?", function() ask("method " .. hex(dv.SelectedAddress)) end)
+    addItem(dv and dv.PopupMenu, "InsideDev: what is this?", function() ask("what " .. hex(dv.SelectedAddress)) end)
+    local hv = mv.HexadecimalView
+    addItem(hv and hv.PopupMenu, "InsideDev: what is this?", function() ask("what " .. hex(hv.SelectionStart)) end)
+  end
+  -- main menu "Table"
+  local mm = MainForm.Menu
+  local tableMenu = nil
+  if mm then for i = 0, mm.Items.Count - 1 do local it = mm.Items[i]; if it.Caption:gsub("&", "") == "Table" then tableMenu = it end end end
+  if tableMenu then
+    local function sub(caption, fn) local mi = createMenuItem(tableMenu); mi.Caption = caption; mi.OnClick = fn; tableMenu.add(mi) end
+    sub("InsideDev: what is at address...", function() local a = inputQuery("InsideDev", "Address (hex):", ""); if a and a ~= "" then ask("what " .. a) end end)
+    sub("InsideDev: which method at address...", function() local a = inputQuery("InsideDev", "Code address (hex):", ""); if a and a ~= "" then ask("method " .. a) end end)
+    sub("InsideDev: re-send selection", function() ask("refresh") end)
+  end
+end
+
+if D.timer then D.timer.destroy() end
+install()
+if getOpenedProcessID() == 0 then pcall(openProcess, "INSIDE.exe") end
+D.timer = createTimer(nil, false)
+D.timer.Interval = 300
+D.timer.OnTimer = function() local ok, e = pcall(tick); if not ok then log(e) end end
+D.timer.Enabled = true
+log("ready")

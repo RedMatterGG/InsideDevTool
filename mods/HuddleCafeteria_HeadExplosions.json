@@ -1,0 +1,98 @@
+{
+  "format": "insidedev-mod",
+  "formatVersion": 1,
+  "name": "HuddleCafeteria_HeadExplosions",
+  "title": "HuddleCafeteria_HeadExplosions",
+  "description": "Huddle cafeteria: when the Huddle crashes into the office crowd at the entrance (OfficeCrowdFloorGoLeft), up to 4 of them have their heads explode while they run, instead of all of them getting away. Uses the crowd's own headache branch, which the game switches off for this group (headacheCount 0) and delays past the point where they stop running.",
+  "author": "",
+  "created": "2026-10-01T13:35:27Z",
+  "game": "INSIDE",
+  "editor": "InsideDev 0.35.7",
+  "enabled": false,
+  "operations": [
+    {
+      "id": 1,
+      "type": "set",
+      "target": "#8_Huddle.2#huddleCafeteria.Gameplay/#huddleCafeteria_Gameplay_ContentRoot/LateAwake3/LateAwakeNode/LateAwake1/_Crowd/OfficeCrowdFloorGoLeft @3450.49,-846.43,0",
+      "component": "CrowdManager",
+      "componentIndex": 0,
+      "property": "field",
+      "field": "headacheCount",
+      "valueType": "Int32",
+      "value": "4",
+      "original": "0"
+    },
+    {
+      "id": 2,
+      "type": "set",
+      "target": "#8_Huddle.2#huddleCafeteria.Gameplay/#huddleCafeteria_Gameplay_ContentRoot/LateAwake3/LateAwakeNode/LateAwake1/_Crowd/OfficeCrowdFloorGoLeft @3450.49,-846.43,0",
+      "component": "CrowdManager",
+      "componentIndex": 0,
+      "property": "field",
+      "field": "headacheDist",
+      "valueType": "Single",
+      "value": "12",
+      "original": "1"
+    },
+    {
+      "id": 3,
+      "type": "set",
+      "target": "#8_Huddle.2#huddleCafeteria.Gameplay/#huddleCafeteria_Gameplay_ContentRoot/LateAwake3/LateAwakeNode/LateAwake1/_Crowd/OfficeCrowdFloorGoLeft @3450.49,-846.43,0",
+      "component": "CrowdManager",
+      "componentIndex": 0,
+      "property": "field",
+      "field": "internalHeadacheDist",
+      "valueType": "Single",
+      "value": "144",
+      "original": "1"
+    },
+    {
+      "id": 4,
+      "type": "set",
+      "target": "#8_Huddle.2#huddleCafeteria.Gameplay/#huddleCafeteria_Gameplay_ContentRoot/LateAwake3/LateAwakeNode/LateAwake1/_Crowd/OfficeCrowdFloorGoLeft @3450.49,-846.43,0",
+      "component": "CrowdManager",
+      "componentIndex": 0,
+      "property": "field",
+      "field": "headacheZ",
+      "valueType": "Single",
+      "value": "1.5",
+      "original": "10"
+    },
+    {
+      "id": 5,
+      "type": "set",
+      "target": "#8_Huddle.2#huddleCafeteria.Gameplay/#huddleCafeteria_Gameplay_ContentRoot/LateAwake3/LateAwakeNode/LateAwake1/_Crowd/OfficeCrowdFloorGoLeft @3450.49,-846.43,0",
+      "component": "CrowdManager",
+      "componentIndex": 0,
+      "property": "field",
+      "field": "safeTime",
+      "valueType": "Single",
+      "value": "0.5",
+      "original": "3"
+    },
+    {
+      "id": 6,
+      "type": "set",
+      "target": "#8_Huddle.2#huddleCafeteria.Gameplay/#huddleCafeteria_Gameplay_ContentRoot/LateAwake3/LateAwakeNode/LateAwake1/_Crowd/OfficeCrowdFloorGoLeft @3450.49,-846.43,0",
+      "component": "CrowdManager",
+      "componentIndex": 0,
+      "property": "field",
+      "field": "headacheBegin",
+      "valueType": "Single",
+      "value": "0.5",
+      "original": "2.5"
+    },
+    {
+      "id": 7,
+      "type": "set",
+      "target": "#8_Huddle.2#huddleCafeteria.Gameplay/#huddleCafeteria_Gameplay_ContentRoot/LateAwake3/LateAwakeNode/LateAwake1/_Crowd/OfficeCrowdFloorGoLeft @3450.49,-846.43,0",
+      "component": "CrowdManager",
+      "componentIndex": 0,
+      "property": "field",
+      "field": "headacheCheckTimer",
+      "valueType": "Single",
+      "value": "0.5",
+      "original": "2.5"
+    }
+  ]
+}

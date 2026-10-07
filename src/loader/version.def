@@ -1,0 +1,31 @@
+LIBRARY version.dll
+EXPORTS
+    GetFileVersionInfoA=px_GetFileVersionInfoA @1
+    GetFileVersionInfoByHandle=px_GetFileVersionInfoByHandle @2
+    GetFileVersionInfoExA=px_GetFileVersionInfoExA @3
+    GetFileVersionInfoExW=px_GetFileVersionInfoExW @4
+    GetFileVersionInfoSizeA=px_GetFileVersionInfoSizeA @5
+    GetFileVersionInfoSizeExA=px_GetFileVersionInfoSizeExA @6
+    GetFileVersionInfoSizeExW=px_GetFileVersionInfoSizeExW @7
+    GetFileVersionInfoSizeW=px_GetFileVersionInfoSizeW @8
+    GetFileVersionInfoW=px_GetFileVersionInfoW @9
+    VerFindFileA=px_VerFindFileA @10
+    VerFindFileW=px_VerFindFileW @11
+    VerInstallFileA=px_VerInstallFileA @12
+    VerInstallFileW=px_VerInstallFileW @13
+    VerLanguageNameA=px_VerLanguageNameA @14
+    VerLanguageNameW=px_VerLanguageNameW @15
+    VerQueryValueA=px_VerQueryValueA @16
+    VerQueryValueW=px_VerQueryValueW @17
+    WT_Version
+    WT_SetFrame
+    WT_SetLevel
+    WT_Drain
+    WT_Stats
+    WT_ModulePath
+    WT_HookInfo
+    WT_Export
+    WT_RuleEnforce
+    WT_RuleClear
+    WT_RuleAdd
+    WT_RuleStats

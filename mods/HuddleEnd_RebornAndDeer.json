@@ -1,0 +1,74 @@
+{
+  "format": "insidedev-mod",
+  "formatVersion": 1,
+  "name": "HuddleEnd_RebornAndDeer",
+  "title": "Huddle ending: the boy is reborn, with the deer",
+  "description": "Ending (huddle at rest by the sea, normal stop point): the unused 'boy is reborn' sequence plays just in front of the huddle, and the unused deer run past. The deer group (Wildlife: deer + birds) is switched off in the shipped level; this mod switches it on and moves the deer trigger onto the huddle's rest spot. That trigger now also starts the reborn sequence (_PM BoyBeautiful, switched off and unconnected in the shipped game): the reborn boy animation (RebornBeautifully) 3.6 m closer to the huddle than authored, then the BoyIsReborn signal. The deer run past about 100 s after the trigger.",
+  "author": "",
+  "created": "2026-10-03T12:45:00Z",
+  "game": "INSIDE",
+  "editor": "InsideDev 0.5.0",
+  "enabled": true,
+  "operations": [
+    {
+      "id": 2,
+      "type": "set",
+      "target": "#8_Huddle.9c#huddleNorway.Gamelogic/#huddleNorway_Gamelogic_ContentRoot/_Right/_Moment_End_Right/_PM BoyBeautiful Still Silent Content Numb @4147.16,-966.31,0",
+      "property": "active",
+      "valueType": "Boolean",
+      "value": "true",
+      "original": "false",
+      "note": "the reborn state machine is switched off in the level file; on, it waits in 'Wait for end' for >EndNow"
+    },
+    {
+      "id": 4,
+      "type": "set",
+      "target": "#8_Huddle.9c#huddleNorway.Gamelogic/#huddleNorway_Gamelogic_ContentRoot/_Right/Wildlife @3923.46,-896.6,0",
+      "property": "active",
+      "valueType": "Boolean",
+      "value": "true",
+      "original": "false",
+      "note": "deer + birds group, switched off in the level file and never switched on by the game: holds Trigger DeerA, so without it nothing fires"
+    },
+    {
+      "id": 3,
+      "type": "action",
+      "target": "#8_Huddle.9c#huddleNorway.Gamelogic/#huddleNorway_Gamelogic_ContentRoot/_Right/_Moment_End_Right/_PM BoyBeautiful Still Silent Content Numb @4147.16,-966.31,0",
+      "action": "sigWire",
+      "fsm": "FSM",
+      "arg": "+|>EndNow|enterSignal|#8_Huddle.9c#huddleNorway.Gamelogic/#huddleNorway_Gamelogic_ContentRoot/_Right/Wildlife/DearDeer/Deers/Trigger DeerA @4142.96,-965.31,0",
+      "replay": "onLoad",
+      "note": "nothing sends >EndNow in the game: the deer trigger (huddle probe) now does, alongside its own >StartDeer"
+    },
+    {
+      "id": 5,
+      "type": "set",
+      "target": "#8_Huddle.9c#huddleNorway.Gamelogic/#huddleNorway_Gamelogic_ContentRoot/_Right/_Moment_End_Right/ReBorn_Beautiful @4145.59,-967.12,-0.09",
+      "property": "position",
+      "valueType": "Vector3",
+      "value": "4142,-967.12,-0.09",
+      "original": "4145.59,-967.12,-0.09",
+      "note": "reborn boy 3.6 m closer to where the huddle rests (x 4138); original spot is 7.6 m ahead, the huddle's own centre is inside it"
+    },
+    {
+      "id": 6,
+      "type": "set",
+      "target": "#8_Huddle.9c#huddleNorway.Gamelogic/#huddleNorway_Gamelogic_ContentRoot/_Right/_Moment_End_Right/_BoyEndPosRot @4145.59,-966.83,-0.09",
+      "property": "position",
+      "valueType": "Vector3",
+      "value": "4142,-966.83,-0.09",
+      "original": "4145.59,-966.83,-0.09",
+      "note": "the boy's end position marker, kept with the reborn boy"
+    },
+    {
+      "id": 7,
+      "type": "set",
+      "target": "#8_Huddle.9c#huddleNorway.Gamelogic/#huddleNorway_Gamelogic_ContentRoot/_Right/Wildlife/DearDeer/Deers/Trigger DeerA @4142.96,-965.31,0",
+      "property": "position",
+      "valueType": "Vector3",
+      "value": "4138,-965.31,0",
+      "original": "4142.96,-965.31,0",
+      "note": "deer trigger onto the huddle's normal rest spot (x 4138): the huddle stops 3 m short of the original trigger box"
+    }
+  ]
+}

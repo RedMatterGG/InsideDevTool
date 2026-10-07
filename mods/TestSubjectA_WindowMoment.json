@@ -1,0 +1,62 @@
+{
+  "format": "insidedev-mod",
+  "formatVersion": 1,
+  "name": "TestSubjectA_WindowMoment",
+  "title": "Test subject A: window moment + curtains",
+  "description": "Education Rooms test chamber: test subject A plays his 19 s Gen_HuddleSurgeryA_Moment (never reached in the game) with the curtains following their animation: once when the area loads / you respawn there, and again whenever you walk into the trigger next to the chamber.",
+  "author": "",
+  "created": "2026-09-30T16:55:00Z",
+  "game": "INSIDE",
+  "editor": "InsideDev 0.35.7",
+  "enabled": true,
+  "operations": [
+    {
+      "id": 1,
+      "type": "action",
+      "target": "#7_PreHuddle.6#EducationRooms.Gameplay/#EducationRooms_Gameplay_ContentRoot/LateAwake4/LateAwakeNode/GameLogic/TestChambersCrowd/TestSubjectA/AdditionalEffects/Curtains_BoundsCullers/CurtainA @3547.87,-770.3,13.62",
+      "action": "reparent",
+      "arg": "#7_PreHuddle.6#EducationRooms.Gameplay/#EducationRooms_Gameplay_ContentRoot/LateAwake4/LateAwakeNode/GameLogic/TestChambersCrowd/TestSubjectA/AdditionalEffects @3547.93,-770.3,7.91",
+      "replay": "onLoad",
+      "note": "curtain back under AdditionalEffects so the Take 001 clip (path 'CurtainA') moves it"
+    },
+    {
+      "id": 2,
+      "type": "action",
+      "target": "#7_PreHuddle.6#EducationRooms.Gameplay/#EducationRooms_Gameplay_ContentRoot/LateAwake4/LateAwakeNode/GameLogic/TestChambersCrowd/TestSubjectA/AdditionalEffects/Curtains_BoundsCullers/CurtainB @3550.14,-770.3,14.59",
+      "action": "reparent",
+      "arg": "#7_PreHuddle.6#EducationRooms.Gameplay/#EducationRooms_Gameplay_ContentRoot/LateAwake4/LateAwakeNode/GameLogic/TestChambersCrowd/TestSubjectA/AdditionalEffects @3547.93,-770.3,7.91",
+      "replay": "onLoad",
+      "note": "same for CurtainB"
+    },
+    {
+      "id": 3,
+      "type": "action",
+      "target": "#7_PreHuddle.6#EducationRooms.Gameplay/#EducationRooms_Gameplay_ContentRoot/LateAwake4/LateAwakeNode/GameLogic/TestChambersCrowd/TestSubjectA/_PM TestSubject @3548.21,-770.3,7.62",
+      "action": "fsmWire",
+      "fsm": "FSM",
+      "arg": "Stand There|>GoNow|Go To Window",
+      "replay": "onLoad",
+      "note": "new exit: the trigger's >GoNow starts the 19 s moment"
+    },
+    {
+      "id": 4,
+      "type": "set",
+      "target": "#7_PreHuddle.6#EducationRooms.Gameplay/#EducationRooms_Gameplay_ContentRoot/LateAwake4/LateAwakeNode/GameLogic/TestChambersCrowd/TestSubjectA/Trigger @3528.77,-774.34,-0.81",
+      "property": "position",
+      "valueType": "Vector3",
+      "value": "3545.29,-768.9,-0.81",
+      "original": "3528.77,-774.34,-0.81",
+      "note": "trigger next to the chamber so the whole moment is in view (the game's trigger is ~17 m back)"
+    },
+    {
+      "id": 5,
+      "type": "action",
+      "target": "#7_PreHuddle.6#EducationRooms.Gameplay/#EducationRooms_Gameplay_ContentRoot/LateAwake4/LateAwakeNode/GameLogic/TestChambersCrowd/TestSubjectA/_PM TestSubject @3548.21,-770.3,7.62",
+      "action": "fsmWire",
+      "fsm": "FSM",
+      "arg": "Stop Anim|>GoNow|Go To Window",
+      "replay": "onLoad",
+      "note": "the first >GoNow after loading (level load, or the trigger when you spawn inside it at the checkpoint) also starts the moment"
+    }
+  ]
+}
