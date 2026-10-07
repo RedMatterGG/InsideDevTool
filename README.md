@@ -42,7 +42,6 @@ this project does not describe how to obtain them: dump them yourself and place 
 
 ## Screenshots
 
-Captured from the running game through the MCP server; the box in each one lists what that view does. Click to enlarge.
 
 <table>
 <tr>
