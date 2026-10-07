@@ -68,18 +68,9 @@ int wt_patch_mono(HMODULE mono, int (*patch_iat)(HMODULE, const char *, const ch
 
 // ---------------------------------------------------------------- mono wrappers
 static FARPROC(WINAPI *o_GPA)(HMODULE, LPCSTR);
-typedef void *(*fn_with_name)(char *, uint32_t, int, int *, int, const char *);
-typedef void *(*fn_full)(char *, uint32_t, int, int *, int);
-typedef void *(*fn_plain)(char *, uint32_t, int, int *);
-typedef void *(*fn_asm_open)(const char *, int *);
 typedef void *(*fn_dom_asm_open)(void *, const char *);
 typedef void *(*fn_load_from_full)(void *, const char *, int *, int);
 
-static fn_with_name o_with_name;
-static fn_full o_full;
-static fn_plain o_plain;
-static fn_asm_open o_asm_open;
-static fn_dom_asm_open o_dom_asm_open;
 static fn_load_from_full o_load_from_full;
 
 static volatile LONG g_gameAsmLoaded; // the game's main assembly (Assembly-CSharp) has loaded
@@ -87,31 +78,8 @@ static DWORD g_mainThread;
 static volatile LONG g_booted;
 static char g_modDir[MAX_PATH];
 
-static void *hk_with_name(char *d, uint32_t l, int c, int *s, int r, const char *n) {
-    logf_("image: %s (%u bytes)", n ? n : "(null)", l);
-    return o_with_name(d, l, c, s, r, n);
-}
-static void *hk_full(char *d, uint32_t l, int c, int *s, int r) {
-    logf_("image (full): %u bytes", l);
-    return o_full(d, l, c, s, r);
-}
-static void *hk_plain(char *d, uint32_t l, int c, int *s) {
-    logf_("image: %u bytes", l);
-    return o_plain(d, l, c, s);
-}
-static void *hk_asm_open(const char *f, int *s) {
-    void *r = o_asm_open(f, s);
-    logf_("mono_assembly_open(%s) -> %p status=%d", f ? f : "(null)", r, s ? *s : -1);
-    return r;
-}
-static void *hk_dom_asm_open(void *d, const char *f) {
-    void *r = o_dom_asm_open(d, f);
-    logf_("mono_domain_assembly_open(%s) -> %p", f ? f : "(null)", r);
-    return r;
-}
 static void *hk_load_from_full(void *img, const char *f, int *s, int ro) {
     void *r = o_load_from_full(img, f, s, ro);
-    logf_("mono_assembly_load_from_full(img=%p, %s) -> %p", img, f ? f : "(null)", r);
     // arm the mod boot when the game's main assembly loads (identified by its assembly name, not by file)
     typedef const char *(*fn_image_name)(void *);
     static fn_image_name image_name;
@@ -120,7 +88,7 @@ static void *hk_load_from_full(void *img, const char *f, int *s, int ro) {
     if (r && an && strcmp(an, "Assembly-CSharp") == 0) {
         g_mainThread = GetCurrentThreadId();
         InterlockedExchange(&g_gameAsmLoaded, 1);
-        logf_("Assembly-CSharp loaded on thread %lu; mod boot armed", g_mainThread);
+        logf_("game assembly loaded on thread %lu; mod boot armed", g_mainThread);
     }
     return r;
 }
@@ -174,7 +142,7 @@ static void boot_one(Module *md) {
     snprintf(path, sizeof path, "%s\\%s", g_gameDir, md->rel);
     if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) { logf_("boot: %s not present, skipping", md->rel); return; }
     void *dom = mono_domain_get();
-    void *as = (o_dom_asm_open ? o_dom_asm_open : mono_domain_assembly_open)(dom, path);
+    void *as = mono_domain_assembly_open(dom, path);
     if (!as) { logf_("boot: failed to open %s", path); return; }
     void *img = mono_assembly_get_image(as);
     void *klass = mono_class_from_name(img, md->ns, md->cls);
@@ -279,14 +247,9 @@ static FARPROC WINAPI hk_GPA(HMODULE m, LPCSTR n) {
 #define HOOK(sym, orig, hk) \
     if (!strcmp(n, sym)) { orig = (void *)r; logf_("hooked %s", sym); return (FARPROC)(void *)hk; }
 #ifndef PUBLIC_LOADER
-    HOOK("mono_image_open_from_data_with_name", o_with_name, hk_with_name)
-    HOOK("mono_image_open_from_data_full", o_full, hk_full)
-    HOOK("mono_image_open_from_data", o_plain, hk_plain)
-    HOOK("mono_assembly_open", o_asm_open, hk_asm_open)
     HOOK("mono_jit_init_version", o_jit_init_version, hk_jit_init_version)
     HOOK("mono_jit_init", o_jit_init, hk_jit_init)
 #endif
-    HOOK("mono_domain_assembly_open", o_dom_asm_open, hk_dom_asm_open)
     HOOK("mono_assembly_load_from_full", o_load_from_full, hk_load_from_full)
     HOOK("mono_runtime_invoke", o_runtime_invoke, hk_runtime_invoke)
 #undef HOOK
