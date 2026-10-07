@@ -82,15 +82,10 @@ static fn_asm_open o_asm_open;
 static fn_dom_asm_open o_dom_asm_open;
 static fn_load_from_full o_load_from_full;
 
-static volatile LONG g_gameAsmLoaded; // Assembly-CSharp (BackgroundData.asset) loaded
+static volatile LONG g_gameAsmLoaded; // the game's main assembly (Assembly-CSharp) has loaded
 static DWORD g_mainThread;
 static volatile LONG g_booted;
 static char g_modDir[MAX_PATH];
-
-static int ends_with_ci(const char *s, const char *suf) {
-    size_t a = strlen(s), b = strlen(suf);
-    return a >= b && _stricmp(s + a - b, suf) == 0;
-}
 
 static void *hk_with_name(char *d, uint32_t l, int c, int *s, int r, const char *n) {
     logf_("image: %s (%u bytes)", n ? n : "(null)", l);
@@ -117,7 +112,12 @@ static void *hk_dom_asm_open(void *d, const char *f) {
 static void *hk_load_from_full(void *img, const char *f, int *s, int ro) {
     void *r = o_load_from_full(img, f, s, ro);
     logf_("mono_assembly_load_from_full(img=%p, %s) -> %p", img, f ? f : "(null)", r);
-    if (r && f && ends_with_ci(f, "BackgroundData.asset")) {
+    // arm the mod boot when the game's main assembly loads (identified by its assembly name, not by file)
+    typedef const char *(*fn_image_name)(void *);
+    static fn_image_name image_name;
+    if (!image_name) { image_name = (fn_image_name)(void *)o_GPA(GetModuleHandleA("mono.dll"), "mono_image_get_name"); if (!image_name) logf_("mono_image_get_name missing: mod boot cannot be armed"); }
+    const char *an = (r && img && image_name) ? image_name(img) : NULL;
+    if (r && an && strcmp(an, "Assembly-CSharp") == 0) {
         g_mainThread = GetCurrentThreadId();
         InterlockedExchange(&g_gameAsmLoaded, 1);
         logf_("Assembly-CSharp loaded on thread %lu; mod boot armed", g_mainThread);

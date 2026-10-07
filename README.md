@@ -4,6 +4,9 @@ An in-game editor and explorer for Playdead's INSIDE (Unity 5.0.4f1): browse and
 objects, signals, PlayMaker state machines, code and audio are connected, record changes as mods, and inspect memory
 with Cheat Engine.
 
+> Unofficial fan-made tool, not affiliated with or endorsed by Playdead. INSIDE is a trademark of Playdead.
+> This repository contains no game files or game code; you need your own copy of the game.
+
 ## Requirements and install
 
 | File | Where | What it is |
