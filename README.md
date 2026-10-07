@@ -25,8 +25,9 @@ To uninstall, delete `version.dll` from the game folder (and `_mod\` if you want
 
 ### Game code (`<game>\GameCode\`)
 
-Building InsideDev from source compiles against four assemblies in `<game>\GameCode\` (the prebuilt DLLs in `bin\`
-don't need them):
+Players using the prebuilt DLLs in `bin\` need nothing extra: the editor reads the game's code from memory while the
+game runs. To build InsideDev from source, the compiler needs the game's assemblies as references (like any Unity
+mod), placed in `<game>\GameCode\`:
 
 | File | Source |
 |------|--------|
@@ -37,9 +38,7 @@ don't need them):
 
 The game does not ship the last two as ordinary DLLs. **ExpGuiViewer does not extract, decode or dump them**, and
 this project does not describe how to obtain them: dump them yourself and place them in `GameCode\`.
-Until both are present, InsideDev shows a reminder above every panel (can be hidden) and a status block under
-**Settings > Game code** with a "Check again" button. The in-game editor itself does not need them — it uses the
-game's code from memory while the game runs. The loader never writes any game assembly to disk.
+**Settings > Game code** shows which of the four are present. The loader never writes any game assembly to disk.
 
 ## Screenshots
 
