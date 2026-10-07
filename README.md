@@ -1,4 +1,4 @@
-# ExpGuiViewer — INSIDE runtime editor (InsideDev 0.5.0)
+#  INSIDE runtime editor (InsideDev 0.5.0)
 
 An in-game editor and explorer for Playdead's INSIDE (Unity 5.0.4f1): browse and edit the live scene, see how
 objects, signals, PlayMaker state machines, code and audio are connected, record changes as mods, and inspect memory
@@ -42,7 +42,6 @@ this project does not describe how to obtain them: dump them yourself and place 
 
 ## Screenshots
 
-Captured from the running game through the MCP server; the box in each one lists what that view does. Click to enlarge.
 
 <table>
 <tr>
