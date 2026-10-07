@@ -25,8 +25,6 @@ To uninstall, delete `version.dll` from the game folder (and `_mod\` if you want
 
 ### Game code (`<game>\GameCode\`)
 
-Building InsideDev from source compiles against four assemblies in `<game>\GameCode\` (the prebuilt DLLs in `bin\`
-don't need them):
 
 | File | Source |
 |------|--------|
