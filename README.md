@@ -91,7 +91,8 @@ Global search / command palette **Ctrl+P**, bookmarks. Beyond what the screensho
 
 ## Keys
 
-F1 panel · F2 trigger overlay (all / general / savepoints / cameras / kill / audio) · F3 solids · F4 labels
+F1 panel · F2 trigger overlay (all / general / savepoints / cameras / kill / audio / logic / water / fx /
+streaming) · F3 solids · F4 labels
 (off / selected / nearby / all) · P pick (Shift+P filter) · F5 HUD · F6 savepoints · F7 god · F8 kill · F9 flip ·
 F10 hidden · F11 diagnostics · Insert free camera · + / − / 0 zoom · [ ] \ time scale · middle mouse teleport ·
 ` console · Ctrl+Z / Ctrl+Y undo / redo · Ctrl+P palette.

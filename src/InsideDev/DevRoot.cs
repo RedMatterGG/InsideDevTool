@@ -987,7 +987,7 @@ namespace InsideDev
             ui.Label("Draw distance " + overlay.maxDistance.ToString("0") + "m", null, 150);
             overlay.maxDistance = ui.Slider("dist", overlay.maxDistance, 5f, 300f);
             ui.EndRow();
-            ui.Label("green = savepoint   red = kill/death   cyan = camera   purple = audio   yellow = other trigger   grey = solid", UI.Dim);
+            ui.Label("green = savepoint   red = kill/death   cyan = camera   purple = audio   orange = logic   deep blue = water   teal = fx   white = streaming   yellow = other trigger   grey = solid", UI.Dim);
             ui.Label("Middle-click in the world teleports the boy/huddle to the cursor (on its current depth plane).", UI.Dim);
 
             ui.Space();
@@ -1067,7 +1067,7 @@ namespace InsideDev
             EditorCommands.Register("pick", "Toggle world pick mode", "world", () => { WorldPick.mode = !WorldPick.mode; return "pick mode " + (WorldPick.mode ? "on" : "off"); }, "P");
             EditorCommands.Register("scope", "Cycle overlay scope (selected / 1 hop / 2 hops / nearby / all)", "world", () => { overlay.scope = (overlay.scope + 1) % 5; EditorState.Set("overlay.scope", overlay.scope); return "scope " + Overlay.Scopes[overlay.scope]; }, "Shift+F4");
             EditorCommands.Register("labels", "Cycle overlay labels", "world", () => { overlay.labelLevel = (overlay.labelLevel + 1) % 4; overlay.showLabels = overlay.labelLevel > 0; EditorState.Set("overlay.labels", overlay.labelLevel); return "labels " + Overlay.LabelLevels[overlay.labelLevel]; }, "F4");
-            EditorCommands.Register("triggers", "Cycle trigger overlay: all / general / savepoints / cameras / kill / audio / off", "world", () => { overlay.CycleTriggers(); return "triggers: " + overlay.TriggerModeLabel; }, "F2");
+            EditorCommands.Register("triggers", "Cycle trigger overlay: all / general / savepoints / cameras / kill / audio / logic / water / fx / streaming / off", "world", () => { overlay.CycleTriggers(); return "triggers: " + overlay.TriggerModeLabel; }, "F2");
             EditorCommands.Register("god", "Toggle god mode", "cheats", () => { G.God = !G.God; return "god " + G.God; }, "F7");
             EditorCommands.Register("kill", "Kill the boy", "cheats", () => { G.Kill(); return "killed"; }, "F8");
             for (int i = 0; i < tabIds.Length; i++) { string id = tabIds[i]; EditorCommands.Register("open-" + id, "Open panel: " + tabs[i], "panels", () => { ShowPanel(id); return ""; }); }

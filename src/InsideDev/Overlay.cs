@@ -22,10 +22,10 @@ namespace InsideDev
     {
         public bool showTriggers = true;
         // F2 cycles: all triggers, then one category at a time: general (yellow), savepoints (green), cameras (blue),
-        // kill (red), audio (purple)
+        // kill (red), audio (purple), logic (orange), water (deep blue), fx (teal), streaming (white)
         public int triggerFilter;
-        public static readonly string[] triggerFilterNames = { "all", "general (yellow)", "savepoints (green)", "cameras (blue)", "kill (red)", "audio (purple)" };
-        static readonly string[] triggerFilterKinds = { null, "trigger", "save", "camera", "kill", "audio" };
+        public static readonly string[] triggerFilterNames = { "all", "general (yellow)", "savepoints (green)", "cameras (blue)", "kill (red)", "audio (purple)", "logic (orange)", "water (deep blue)", "fx (teal)", "streaming (white)" };
+        static readonly string[] triggerFilterKinds = { null, "trigger", "save", "camera", "kill", "audio", "logic", "water", "fx", "stream" };
         public string TriggerModeLabel { get { return showTriggers ? triggerFilterNames[triggerFilter] : "off"; } }
         // F2: all -> each category -> off -> all
         public void CycleTriggers()
@@ -66,6 +66,10 @@ namespace InsideDev
         static readonly Color cCam = new Color(0.3f, 0.85f, 1f, 0.9f);
         static readonly Color cAudio = new Color(0.8f, 0.45f, 1f, 0.85f);
         static readonly Color cTrig = new Color(1f, 0.9f, 0.2f, 0.9f);
+        static readonly Color cLogic = new Color(1f, 0.58f, 0.15f, 0.9f);
+        static readonly Color cWater = new Color(0.25f, 0.45f, 1f, 0.9f);
+        static readonly Color cFx = new Color(0.35f, 0.9f, 0.75f, 0.85f);
+        static readonly Color cStream = new Color(0.92f, 0.92f, 0.92f, 0.8f);
         static readonly Color cSolid = new Color(0.7f, 0.7f, 0.7f, 0.35f);
         static readonly Color cSpawn = new Color(0.2f, 1f, 1f, 1f);
 
@@ -95,15 +99,17 @@ namespace InsideDev
                 bool trig = c.isTrigger;
                 if (trig ? !showTriggers : !showSolids) continue;
                 var e = new ColliderEntry { col = c, name = c.gameObject.name, trigger = trig };
-                sb.Length = 0;
+                sb.Length = 0; typeNames.Clear();
                 foreach (var mb in c.GetComponents<MonoBehaviour>())
                 {
                     if (mb == null) continue;
+                    string tn = mb.GetType().Name;
+                    typeNames.Add(tn);
                     if (sb.Length > 0) sb.Append(", ");
-                    sb.Append(mb.GetType().Name);
+                    sb.Append(tn);
                 }
                 e.types = sb.ToString();
-                Classify(e);
+                Classify(e, typeNames);
                 entries.Add(e);
             }
         }
@@ -112,21 +118,51 @@ namespace InsideDev
         public static string TriggerKindOf(Collider c)
         {
             var e = new ColliderEntry { col = c, name = c.gameObject.name, trigger = true };
-            var sb = new StringBuilder();
-            foreach (var mb in c.GetComponents<MonoBehaviour>()) if (mb != null) sb.Append(mb.GetType().Name).Append(' ');
-            e.types = sb.ToString();
-            Classify(e);
+            var names = new List<string>();
+            foreach (var mb in c.GetComponents<MonoBehaviour>()) if (mb != null) names.Add(mb.GetType().Name);
+            e.types = string.Join(" ", names.ToArray());
+            Classify(e, names);
             return e.kind == "save" ? "savepoint" : e.kind == "trigger" ? "general" : e.kind;
         }
 
-        static void Classify(ColliderEntry e)
+        // Component types decide first (Playdead's scripts say what a volume does); the object name only when they do not.
+        // Names alone filed VfxConfig_HardImpact_Dust_Gradient as kill ("die" in Gradient) and fog boxes named Camera... as camera.
+        static readonly List<string> typeNames = new List<string>();
+        static readonly HashSet<string> tSave = new HashSet<string> { "Savepoint", "SavepointEventHandler", "SavepointAudio" };
+        static readonly HashSet<string> tCam = new HashSet<string> { "CameraBlendBox", "CameraBorder", "CameraBlendProbe", "CameraZoneOverride" };
+        static readonly HashSet<string> tWater = new HashSet<string> { "BoyWater", "FluidVolume", "WaterQueueMaster", "WaterEdge", "WaterMesh", "WaterDust", "WaterSplashHandler", "WaterTrigger", "WaterTrigger2" };
+        static readonly HashSet<string> tStream = new HashSet<string> { "UnloadInactiveSubscenes", "SubsceneLoadTrigger", "LoadTrigger" };
+        static readonly HashSet<string> tAudio = new HashSet<string> { "RTPCBox", "RTPCCapsule", "RTPCSphere", "AkGameObj", "AudioProbe", "AkAmbient", "AkEnvironment", "AudioProperties" };
+        static readonly HashSet<string> tFx = new HashSet<string> { "EnvironmentBox", "FogAmbientBlendBox", "PostEffectTransitionBox", "MaterialInstanceBlendBox", "ColorBlendProbe", "VfxConfig", "VfxProbe", "EnvironmentSlave", "EffectMaterial", "EffectMaterialSwitcher", "LadderEffectMaterial", "BoyDepthObstruction" };
+        static readonly HashSet<string> tPlumbing = new HashSet<string> { "PlayMakerFixedUpdate", "PlayMakerTriggerEnter", "PlayMakerTriggerExit", "PlayMakerTriggerStay", "PlayMakerCollisionEnter", "PlayMakerCollisionExit", "PlayMakerCollisionStay", "PlayMakerMouseEvents" };
+
+        static void Classify(ColliderEntry e, List<string> types)
         {
             if (!e.trigger) { e.color = cSolid; e.kind = "solid"; return; }
-            string s = (e.types + " " + e.name).ToLowerInvariant();
-            if (s.Contains("savepoint") || s.Contains("checkpoint")) { e.color = cSave; e.kind = "save"; }
-            else if (s.Contains("kill") || s.Contains("death") || s.Contains("die") || s.Contains("drown")) { e.color = cKill; e.kind = "kill"; }
-            else if (s.Contains("camera") || s.Contains("cam")) { e.color = cCam; e.kind = "camera"; }
-            else if (s.Contains("audio") || s.Contains("sound") || s.Contains("akevent") || s.Contains("music")) { e.color = cAudio; e.kind = "audio"; }
+            string n = e.name.ToLowerInvariant();
+            bool save = false, kill = false, cam = false, water = false, stream = false, audio = false, fx = false, logic = false;
+            foreach (var t in types)
+            {
+                if (tSave.Contains(t)) save = true;
+                else if (t.Contains("Kill") || t.Contains("Death")) kill = true;
+                else if (tCam.Contains(t) || t.StartsWith("Camera")) cam = true;
+                else if (tWater.Contains(t)) water = true;
+                else if (tStream.Contains(t)) stream = true;
+                else if (tAudio.Contains(t) || t.StartsWith("Ak") || t.StartsWith("RTPC") || t.StartsWith("Audio")) audio = true;
+                else if (tFx.Contains(t) || t.EndsWith("ColorTrigger") || t.EndsWith("BlendBox") || (t.EndsWith("Probe") && t != "IsTriggeredByProbe")) fx = true;
+                else if (!tPlumbing.Contains(t)) logic = true;
+            }
+            if (save || n.StartsWith("savepoint") || n.Contains("checkpoint")) { e.color = cSave; e.kind = "save"; }
+            else if (kill) { e.color = cKill; e.kind = "kill"; }
+            else if (cam) { e.color = cCam; e.kind = "camera"; }
+            else if (water) { e.color = cWater; e.kind = "water"; }
+            else if (stream) { e.color = cStream; e.kind = "stream"; }
+            else if (audio) { e.color = cAudio; e.kind = "audio"; }
+            else if (fx) { e.color = cFx; e.kind = "fx"; }
+            else if (n.Contains("kill") || n.Contains("death") || n.Contains("drown") || n.Contains("squash") || n.Contains("crush") || n.StartsWith("die") || n.Contains("_die") || n.Contains(" die")) { e.color = cKill; e.kind = "kill"; }
+            else if (logic) { e.color = cLogic; e.kind = "logic"; }
+            else if (n.Contains("cam")) { e.color = cCam; e.kind = "camera"; }
+            else if (n.Contains("audio") || n.Contains("sound") || n.Contains("akevent") || n.Contains("music")) { e.color = cAudio; e.kind = "audio"; }
             else { e.color = cTrig; e.kind = "trigger"; }
         }
 
