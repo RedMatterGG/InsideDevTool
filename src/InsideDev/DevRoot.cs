@@ -1362,11 +1362,16 @@ namespace InsideDev
         void OnApplicationPause(bool pause) { try { RenderHost.OnPause(pause); } catch (Exception e) { DevLog.Error("OnApplicationPause", e); } }
         void OnLevelWasLoaded(int level) { try { RenderHost.OnLevelLoaded(level); } catch (Exception e) { DevLog.Error("OnLevelWasLoaded", e); } }
 
-        void OnApplicationQuit() { try { PassiveHidden.SaveIfDirty(); } catch (Exception e) { DevLog.Error("OnApplicationQuit", e); } }
+        void OnApplicationQuit()
+        {
+            try { PassiveHidden.SaveIfDirty(); } catch (Exception e) { DevLog.Error("OnApplicationQuit", e); }
+            try { Extensions.Quit(); } catch (Exception e) { DevLog.Error("OnApplicationQuit extensions", e); }
+        }
 
         void OnDestroy()
         {
             try { PassiveHidden.SaveIfDirty(); } catch { }
+            try { Extensions.Quit(); } catch { }
             RenderHost.Snapshot("DevRoot destroyed");
             RenderHost.Shutdown();
             DevLog.Write("DevRoot destroyed");

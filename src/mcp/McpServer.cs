@@ -50,6 +50,7 @@ namespace InsideDev.McpExt
         Thread acceptThread;
         volatile bool running;
         readonly Dictionary<string, DateTime> sessions = new Dictionary<string, DateTime>();
+        readonly List<TcpClient> clients = new List<TcpClient>();
         public int Port { get; private set; }
         public int Requests, ToolCalls, Errors;
         public string LastClient = "";
@@ -75,6 +76,7 @@ namespace InsideDev.McpExt
             running = false;
             try { if (listener != null) listener.Stop(); } catch { }
             listener = null;
+            lock (clients) { foreach (var c in clients) { try { c.Close(); } catch { } } clients.Clear(); }
             lock (sessions) sessions.Clear();
         }
 
@@ -95,6 +97,7 @@ namespace InsideDev.McpExt
 
         void Serve(TcpClient c)
         {
+            lock (clients) clients.Add(c);
             try
             {
                 c.NoDelay = true;
@@ -112,7 +115,8 @@ namespace InsideDev.McpExt
                 }
             }
             catch (IOException) { }
-            catch (Exception e) { LastError = e.Message; host.Log("MCP connection: " + e.Message); }
+            catch (Exception e) { if (running) { LastError = e.Message; host.Log("MCP connection: " + e.Message); } }
+            finally { lock (clients) clients.Remove(c); }
         }
 
         static string ReadLine(Stream s)
