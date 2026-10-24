@@ -1,0 +1,141 @@
+subscene	i	file	path	x	y	z	info
+#gamestart_Gameplay	0	level114	#gamestart_Gameplay/#gamestart_Gameplay_ContentRoot/_SaveLogic/Savepoint 1	-723.4479370117188	-152.5133819580078	-2.384185791015625e-07	Boy
+#forestReveal_Gameplay	0	level216	#forestReveal_Gameplay/#forestReveal_Gameplay_ContentRoot/SaveLogic/Savepoint 2	-581.1740112304688	-166.377197265625	0.0	Boy
+#riverWithDog_Gameplay	0	level222	#riverWithDog_Gameplay/#riverWithDog_Gameplay_ContentRoot/SaveLogic/Savepoint 7	-452.97491455078125	-194.58792114257812	3.725290298461914e-09	Boy
+#SentryTruckChase_Gameplay	0	level80	#SentryTruckChase_Gameplay/#SentryTruckChase_Gameplay_ContentRoot/SaveLogic/Save Point 1	-344.91888427734375	-192.53370666503906	1.862645149230957e-09	Boy
+#finalChase_Gameplay	0	level78	#finalChase_Gameplay/#finalChase_Gameplay_ContentRoot/Savepoint 4	-252.16238403320312	-198.6585693359375	0.0	Boy
+#lake_Gameplay	0	level162	#lake_Gameplay/#lake_Gameplay_ContentRoot/SaveLogic/Savepoint 1	-70.80131530761719	-218.63235473632812	0.0	Boy
+#lake_Gameplay	1	level162	#lake_Gameplay/#lake_Gameplay_ContentRoot/SaveLogic/Savepoint 2	-28.969940185546875	-218.63235473632812	0.0	Boy
+#fields_Gameplay	0	level150	#fields_Gameplay/#fields_Gameplay_ContentRoot/GameLogic/SaveLogic/Savepoint	49.957332611083984	-220.51034545898438	-1.4901161193847656e-07	Boy
+#chickenGun_Gameplay	0	level171	#chickenGun_Gameplay/#chickenGun_Gameplay_ContentRoot/Outside(LateAwake)/1Outside/_SaveLogic/Savepoint 1	191.2313690185547	-222.84933471679688	5.960464477539063e-08	Boy
+#pigJump_Gameplay	0	level104	#pigJump_Gameplay/#pigJump_Gameplay_ContentRoot/SaveLogic/Savepoint 1	269.1219482421875	-211.7975311279297	0.0	Boy
+#wormSwamp_Gameplay	0	level158	#wormSwamp_Gameplay/#wormSwamp_Gameplay_ContentRoot/SaveLogic/Savepoint 2	309.40087890625	-228.33529663085938	-4.470348358154297e-08	Boy
+#pigFight_Gameplay	0	level38	#pigFight_Gameplay/#pigFight_Gameplay_ContentRoot/SaveLogic/Savepoint 1	350.65350341796875	-227.73524475097656	0.0	Boy
+#pigFight_Gameplay	1	level38	#pigFight_Gameplay/#pigFight_Gameplay_ContentRoot/SaveLogic/Savepoint 2	389.758544921875	-226.97901916503906	0.0	Boy
+#noMansLand_Gameplay	0	level151	#noMansLand_Gameplay/#noMansLand_Gameplay_ContentRoot/SaveLogic/Savepoint 1	453.5084228515625	-230.4810791015625	0.0	Boy
+#noMansLand_Gameplay	1	level151	#noMansLand_Gameplay/#noMansLand_Gameplay_ContentRoot/SaveLogic/Savepoint 2	517.7220458984375	-230.4810791015625	0.0	Boy
+#factoryWithCorpses_Gameplay	0	level210	#factoryWithCorpses_Gameplay/#factoryWithCorpses_Gameplay_ContentRoot/SaveLogic/Savepoint	555.969482421875	-224.26806640625	-1.1920928955078125e-07	Boy
+#3D_crane_Gameplay	0	level22	#3D_crane_Gameplay/#3D_crane_Gameplay_ContentRoot/SaveLogic/Savepoint 0	597.6591186523438	-224.0309295654297	-9.5367431640625e-07	Boy
+#3D_crane_Gameplay	1	level22	#3D_crane_Gameplay/#3D_crane_Gameplay_ContentRoot/SaveLogic/Savepoint 1	596.7838745117188	-219.99098205566406	0.0	Boy
+#pushDownSafe_Gameplay	0	level201	#pushDownSafe_Gameplay/#pushDownSafe_Gameplay_ContentRoot/SaveLogic/Savepoint	579.4475708007812	-215.41639709472656	0.0	Boy
+#mindhatBasement_Gameplay	0	level119	#mindhatBasement_Gameplay/#mindhatBasement_Gameplay_ContentRoot/SaveLogic/Savepoint_1	573.3135986328125	-232.0157470703125	0.0	Boy
+#mindhatBasement_Gameplay	1	level119	#mindhatBasement_Gameplay/#mindhatBasement_Gameplay_ContentRoot/SaveLogic/Savepoint_2	613.6621704101562	-234.39431762695312	-4.76837158203125e-06	Boy
+#rooftops2New_Gameplay	0	level198	#rooftops2New_Gameplay/#rooftops2New_Gameplay_ContentRoot/SaveLogic/Savepoint 1	679.5282592773438	-228.82638549804688	0.0	Boy
+#rooftops2New_Gameplay	1	level198	#rooftops2New_Gameplay/#rooftops2New_Gameplay_ContentRoot/SaveLogic/Savepoint 2	729.5039672851562	-231.2042694091797	0.0	Boy
+#rooftops2New_Gameplay	2	level198	#rooftops2New_Gameplay/#rooftops2New_Gameplay_ContentRoot/SaveLogic/Savepoint 3	744.6034545898438	-241.5960693359375	-1.1920928955078125e-06	Boy
+#Old_Sentry_Room_Gameplay	0	level74	#Old_Sentry_Room_Gameplay/#Old_Sentry_Room_Gameplay_ContentRoot/SaveLogic/Savepoint0	777.4537353515625	-260.88763427734375	0.0	Boy
+#Old_Sentry_Room_Gameplay	1	level74	#Old_Sentry_Room_Gameplay/#Old_Sentry_Room_Gameplay_ContentRoot/SaveLogic/Savepoint1	811.3515625	-265.6470947265625	-2.86102294921875e-06	Boy
+#Old_Sentry_Room_Gameplay	2	level74	#Old_Sentry_Room_Gameplay/#Old_Sentry_Room_Gameplay_ContentRoot/SaveLogic/Savepoint2	814.1141357421875	-265.6433410644531	-9.5367431640625e-07	Boy
+#Old_Sentry_Room_Gameplay	3	level74	#Old_Sentry_Room_Gameplay/#Old_Sentry_Room_Gameplay_ContentRoot/SaveLogic/Savepoint3	854.3726196289062	-257.5955505371094	3.5762786865234375e-07	Boy
+#lineup_Gameplay	0	level32	#lineup_Gameplay/#lineup_Gameplay_ContentRoot/SaveLogic/Savepoints/lineup_savepoint_01	875.7041015625	-263.7918395996094	0.0	Boy, checkpoint-only
+#lineup_Gameplay	1	level32	#lineup_Gameplay/#lineup_Gameplay_ContentRoot/SaveLogic/Savepoints/lineup_savepoint_02	898.241943359375	-263.7918395996094	0.0	Boy, checkpoint-only
+#lineup_Gameplay	2	level32	#lineup_Gameplay/#lineup_Gameplay_ContentRoot/SaveLogic/Savepoints/lineup_savepoint_03	938.8922729492188	-263.7918395996094	0.0	Boy, checkpoint-only
+#lineupHulvChase_Gameplay	0	level219	#lineupHulvChase_Gameplay/#lineupHulvChase_Gameplay_ContentRoot/SaveLogic/lineup_savepoint_04	983.8734741210938	-272.907958984375	0.0	Boy
+#mindHatWagon_Gameplay	0	level236	#mindHatWagon_Gameplay/#mindHatWagon_Gameplay_ContentRoot/SaveLogic/Savepoint01	1027.222412109375	-271.5237121582031	0.0	Boy
+#mindHatWagon_Gameplay	1	level236	#mindHatWagon_Gameplay/#mindHatWagon_Gameplay_ContentRoot/SaveLogic/Savepoint02	1040.330810546875	-271.1513366699219	0.0	Boy
+#mindHatWagon_Gameplay	2	level236	#mindHatWagon_Gameplay/#mindHatWagon_Gameplay_ContentRoot/SaveLogic/Savepoint03	1084.09130859375	-271.18017578125	0.0	Boy
+#mindHatWagon_Gameplay	3	level236	#mindHatWagon_Gameplay/#mindHatWagon_Gameplay_ContentRoot/SaveLogic/Savepoint04	1111.6474609375	-270.76251220703125	0.0	Boy
+#mindHatJumpIntoWater_Gameplay	0	level96	#mindHatJumpIntoWater_Gameplay/#mindHatJumpIntoWater_Gameplay_ContentRoot/SaveLogic/Savepoint	1121.103271484375	-299.9773864746094	0.0	Boy
+#waterLockDoors_GamePlay	0	level51	#waterLockDoors_GamePlay/#waterLockDoors_GamePlay_ContentRoot/SaveLogic/Savepoint 1	1157.1741943359375	-295.8951721191406	0.0	Boy
+#waterLockDoors_GamePlay	1	level51	#waterLockDoors_GamePlay/#waterLockDoors_GamePlay_ContentRoot/SaveLogic/Savepoint 2	1196.792236328125	-293.0925598144531	-2.384185791015625e-07	Boy
+#hideInShadows_GamePlay	0	level202	#hideInShadows_GamePlay/#hideInShadows_GamePlay_ContentRoot/SaveLogic/Savepoint_1	1215.31103515625	-280.01593017578125	0.0	Boy
+#hideInShadows_GamePlay	1	level202	#hideInShadows_GamePlay/#hideInShadows_GamePlay_ContentRoot/SaveLogic/Savepoint_2	1245.447265625	-286.3932800292969	0.0	Boy
+#hideInShadows_GamePlay	2	level202	#hideInShadows_GamePlay/#hideInShadows_GamePlay_ContentRoot/SaveLogic/Savepoint_3	1272.9970703125	-293.2760009765625	-3.374225343577564e-10	Boy
+#sewerPoopWater2_GamePlay	0	level145	#sewerPoopWater2_GamePlay/#sewerPoopWater2_GamePlay_ContentRoot/SaveLogic/Savepoint 1	1276.2158203125	-320.7960205078125	-1.9073486328125e-06	Boy
+#sewerPoopWater2_GamePlay	1	level145	#sewerPoopWater2_GamePlay/#sewerPoopWater2_GamePlay_ContentRoot/SaveLogic/Savepoint 2	1325.3299560546875	-329.8106384277344	7.152557373046875e-07	Boy
+#hulvesInSewer_GamePlay	0	level232	#hulvesInSewer_GamePlay/#hulvesInSewer_GamePlay_ContentRoot/SaveLogic/Savepoint 10	1374.6898193359375	-335.5296325683594	0.0	Boy
+#dogChaseAndFenceSewers_GamePlay	0	level13	#dogChaseAndFenceSewers_GamePlay/#dogChaseAndFenceSewers_GamePlay_ContentRoot/SaveLogic/Savepoint 1	1434.729736328125	-341.6129150390625	0.0	Boy
+#stealSubmarine_Gameplay	0	level3	#stealSubmarine_Gameplay/#stealSubmarine_Gameplay_ContentRoot/Savepoints/Savepoint 0	1468.5355224609375	-344.3139343261719	0.0	Boy
+#stealSubmarine_Gameplay	1	level3	#stealSubmarine_Gameplay/#stealSubmarine_Gameplay_ContentRoot/Savepoints/Savepoint 1	1494.1497802734375	-364.9969482421875	-4.76837158203125e-07	Boy
+#submarineBigRoom_GamePlay	0	level59	#submarineBigRoom_GamePlay/#submarineBigRoom_GamePlay_ContentRoot/SaveLogic/Savepoint 1	1524.7969970703125	-439.1828918457031	0.0	Boy
+#submarineBigRoom_GamePlay	1	level59	#submarineBigRoom_GamePlay/#submarineBigRoom_GamePlay_ContentRoot/SaveLogic/Savepoint 2	1620.4534912109375	-554.18994140625	0.0	Boy
+#submergedChamber_GamePlay	0	level93	#submergedChamber_GamePlay/#submergedChamber_GamePlay_ContentRoot/SaveLogic/Save_1/0_Savepoint_submergedChamber	1658.1583251953125	-543.2432250976562	0.0	Boy
+#submergedChamber_GamePlay	1	level93	#submergedChamber_GamePlay/#submergedChamber_GamePlay_ContentRoot/SaveLogic/Save_2/1_Savepoint_submergedChamber	1717.869384765625	-534.4691772460938	2.086162567138672e-07	Boy
+#submergedChamber_GamePlay	2	level93	#submergedChamber_GamePlay/#submergedChamber_GamePlay_ContentRoot/SaveLogic/Save_3/1_Savepoint_submergedChamber	1720.2767333984375	-523.3948364257812	-1.1920928955078125e-07	Boy
+#submergedChamber_GamePlay	3	level93	#submergedChamber_GamePlay/#submergedChamber_GamePlay_ContentRoot/SaveLogic/Save_4/2_Savepoint_submergedChamber	1760.46044921875	-512.3899536132812	-1.1920928955078125e-07	Boy
+#submergedChamber_GamePlay	4	level93	#submergedChamber_GamePlay/#submergedChamber_GamePlay_ContentRoot/SaveLogic/Save_5	1691.92236328125	-519.9652099609375	-3.5762786865234375e-07	Boy
+#submergedChamber_GamePlay	5	level93	#submergedChamber_GamePlay/#submergedChamber_GamePlay_ContentRoot/SaveLogic/Save_6Setup/Save_6	1647.850830078125	-537.744384765625	0.0	Boy
+#submergedChamber_GamePlay	6	level93	#submergedChamber_GamePlay/#submergedChamber_GamePlay_ContentRoot/SaveLogic/Save_7/7_Savepoint_submergedChamber	1730.666259765625	-547.8760986328125	0.0	Boy
+#SubmarineSecret_Gameplay	0	level82	#SubmarineSecret_Gameplay/#SubmarineSecret_Gameplay_ContentRoot/!SaveLogic/Save_AtPuzzle/1_Save_AtPuzzle	1709.45849609375	-589.9204711914062	0.0	Boy
+#SubmarineSecret_Gameplay	1	level82	#SubmarineSecret_Gameplay/#SubmarineSecret_Gameplay_ContentRoot/!SaveLogic/Save_BeforePuzzle/2_Save_AtPuzzle	1738.908203125	-581.1165161132812	0.0	Boy
+#SubmarineAndWaterHeight_GamePlay	0	level233	#SubmarineAndWaterHeight_GamePlay/#SubmarineAndWaterHeight_GamePlay_ContentRoot/SaveLogic/Savepoint 0	1756.1495361328125	-528.6784057617188	0.0	Boy
+#SubmarineAndGirl_Gameplay	0	level178	#SubmarineAndGirl_Gameplay/#SubmarineAndGirl_Gameplay_ContentRoot/SaveLogic/Savepoint 0	1819.989501953125	-533.023193359375	0.0	Boy
+#SubmarineAndGirl_Gameplay	1	level178	#SubmarineAndGirl_Gameplay/#SubmarineAndGirl_Gameplay_ContentRoot/SaveLogic/Savepoint 1	1850.498779296875	-531.2218627929688	0.0	Boy
+#SubmarineAndGirl_Gameplay	2	level178	#SubmarineAndGirl_Gameplay/#SubmarineAndGirl_Gameplay_ContentRoot/SaveLogic/Savepoint 2	1908.1112060546875	-495.75927734375	1.7298810917054652e-07	Boy
+#beachToMines_Gameplay	0	level10	#beachToMines_Gameplay/#beachToMines_Gameplay_ContentRoot/SaveLogic/Savepoint 1	2013.2177734375	-475.8977355957031	0.0	Boy
+#albinosInMineWagon_Gameplay	0	level224	#albinosInMineWagon_Gameplay/#albinosInMineWagon_Gameplay_ContentRoot/SaveLogic/Savepoint 1 Static	2030.215087890625	-499.5251770019531	-1.430511474609375e-06	Boy
+#albinosInMineWagon_Gameplay	1	level224	#albinosInMineWagon_Gameplay/#albinosInMineWagon_Gameplay_ContentRoot/SaveLogic/Savepoint 3 Dynamic	2008.508056640625	-499.4401550292969	-8.940696716308594e-08	Boy
+#albinosInMineWagon_Gameplay	2	level224	#albinosInMineWagon_Gameplay/#albinosInMineWagon_Gameplay_ContentRoot/SaveLogic/Savepoint 2 Dynamic	2034.508056640625	-499.8518981933594	-4.76837158203125e-07	Boy
+#cargoLift_Gameplay	0	level250	#cargoLift_Gameplay/#cargoLift_Gameplay_ContentRoot/LateAwake4/LateAwakeNode/CageMoment/Savepoint 1	2085.24951171875	-475.8450927734375	0.0	Boy
+#cargoLift_Gameplay	1	level250	#cargoLift_Gameplay/#cargoLift_Gameplay_ContentRoot/SaveLogic/Savepoint 2	2094.026123046875	-501.8857116699219	0.0	Boy
+#cargoLift_Gameplay	2	level250	#cargoLift_Gameplay/#cargoLift_Gameplay_ContentRoot/SaveLogic/Savepoint 3	2116.603271484375	-475.8929748535156	0.0	Boy
+#cargoLift_Gameplay	3	level250	#cargoLift_Gameplay/#cargoLift_Gameplay_ContentRoot/SaveLogic/Savepoint 4	2145.591064453125	-471.5530090332031	-4.284083843231201e-08	Boy
+#cargoLift_Gameplay	4	level250	#cargoLift_Gameplay/#cargoLift_Gameplay_ContentRoot/SaveLogic/Savepoint 5	2124.0888671875	-503.56011962890625	0.0	Boy
+#cargoLift_Gameplay	5	level250	#cargoLift_Gameplay/#cargoLift_Gameplay_ContentRoot/SaveLogic/Savepoint 6 - Static	2132.71826171875	-503.5311279296875	-5.960464477539063e-08	Boy
+#mindhatDetach_Gameplay	0	level122	#mindhatDetach_Gameplay/#mindhatDetach_Gameplay_ContentRoot/SaveLogic/Savepoint 1 CargoLift	2118.35595703125	-552.5574340820312	0.0	Boy
+#mindhatDetach_Gameplay	1	level122	#mindhatDetach_Gameplay/#mindhatDetach_Gameplay_ContentRoot/SaveLogic/Savepoint 2 Elevator	2136.43408203125	-558.441650390625	0.0	Boy
+#mindhatDetach_Gameplay	2	level122	#mindhatDetach_Gameplay/#mindhatDetach_Gameplay_ContentRoot/SaveLogic/Savepoint 3 Hat	2164.639404296875	-564.3389282226562	-5.962306204310153e-09	Boy
+#mindhatDetach_Gameplay	3	level122	#mindhatDetach_Gameplay/#mindhatDetach_Gameplay_ContentRoot/SaveLogic/Savepoint 4 Cave	2224.28125	-567.4533081054688	4.76837158203125e-07	Boy
+#mindhatDetach_Gameplay	4	level122	#mindhatDetach_Gameplay/#mindhatDetach_Gameplay_ContentRoot/SaveLogic/Savepoint 5 Before Hat, Chapter	2177.69580078125	-559.4171752929688	-7.450580596923828e-09	Boy
+#albinoPushBlock_Gameplay	0	level92	#albinoPushBlock_Gameplay/#albinoPushBlock_Gameplay_ContentRoot/SaveLogic/Savepoint2	2046.693359375	-547.3634033203125	0.0	Boy
+#albinoPushBlock_Gameplay	1	level92	#albinoPushBlock_Gameplay/#albinoPushBlock_Gameplay_ContentRoot/SaveLogic/Savepoint1	2086.3505859375	-552.5759887695312	-5.4016709327697754e-08	Boy
+#AlbinosInTank_Gameplay	0	level67	#AlbinosInTank_Gameplay/#AlbinosInTank_Gameplay_ContentRoot/SaveLogic/Savepoint	1997.487548828125	-541.3440551757812	-3.5762786865234375e-07	Boy
+#AlbinosInTank_Gameplay	1	level67	#AlbinosInTank_Gameplay/#AlbinosInTank_Gameplay_ContentRoot/SaveLogic/SavepointToSecret	2033.023193359375	-542.9163208007812	2.384185791015625e-07	Boy
+#AlbinosInTank_Gameplay	2	level67	#AlbinosInTank_Gameplay/#AlbinosInTank_Gameplay_ContentRoot/SaveLogic/SavepointToSecret2	2039.978515625	-546.9640502929688	0.0	Boy
+#HulvesAndTorchSecret_Gameplay	0	level46	#HulvesAndTorchSecret_Gameplay/#HulvesAndTorchSecret_Gameplay_ContentRoot/Gameplay_CULL/SaveLogic/Savepoint 10	2011.0931396484375	-563.6771850585938	-4.76837158203125e-07	Boy
+#forcePushGetWagon_Gameplay	0	level177	#forcePushGetWagon_Gameplay/#forcePushGetWagon_Gameplay_ContentRoot/SaveLogic/Savepoint1	2172.6005859375	-500.7644958496094	2.980232238769531e-07	Boy
+#forcePushRotator_Gameplay	0	level103	#forcePushRotator_Gameplay/#forcePushRotator_Gameplay_ContentRoot/SaveLogic/Savepoint1	2264.00732421875	-500.748779296875	0.0	Boy
+#forcePushRotator_Gameplay	1	level103	#forcePushRotator_Gameplay/#forcePushRotator_Gameplay_ContentRoot/SaveLogic/Savepoint2	2309.468017578125	-495.5818786621094	4.76837158203125e-07	Boy
+#forcePushMovingCover_Gameplay	0	level27	#forcePushMovingCover_Gameplay/#forcePushMovingCover_Gameplay_ContentRoot/SaveLogic/Savepoint 1	2330.16552734375	-490.9031982421875	2.980232238769531e-07	Boy
+#forcePushMovingCover_Gameplay	1	level27	#forcePushMovingCover_Gameplay/#forcePushMovingCover_Gameplay_ContentRoot/SaveLogic/Savepoint 2	2340.411865234375	-491.3341064453125	4.76837158203125e-07	Boy
+#forcePushMovingCover_Gameplay	2	level27	#forcePushMovingCover_Gameplay/#forcePushMovingCover_Gameplay_ContentRoot/SaveLogic/Savepoint 3	2393.107421875	-491.9678039550781	4.76837158203125e-07	Boy
+#ElevatorRide_Gameplay	0	level211	#ElevatorRide_Gameplay/#ElevatorRide_Gameplay_ContentRoot/SaveLogic/Savepoint 1	2479.9130859375	-522.1150512695312	6.705522537231445e-08	Boy
+#ElevatorRide_Gameplay	1	level211	#ElevatorRide_Gameplay/#ElevatorRide_Gameplay_ContentRoot/SaveLogic/Savepoint 2	2486.486328125	-526.8651123046875	-0.04931902885437012	Boy
+#LabEntrance_Gameplay	0	level18	#LabEntrance_Gameplay/#LabEntrance_Gameplay_ContentRoot/SaveLogic/Savepoint 1	2499.213623046875	-669.1966552734375	2.384185791015625e-07	Boy
+#EntranceLanding_Gameplay	0	level54	#EntranceLanding_Gameplay/#EntranceLanding_Gameplay_ContentRoot/SaveLogic/Savepoint	2542.93408203125	-666.2367553710938	-7.450580596923828e-09	Boy
+#fixedJetCratesAndHatch_Gameplay	0	level142	#fixedJetCratesAndHatch_Gameplay/#fixedJetCratesAndHatch_Gameplay_ContentRoot/SaveLogic/Savepoint 1	2566.04296875	-665.218994140625	3.725290298461914e-09	Boy
+#fixedJetCratesAndHatch_Gameplay	1	level142	#fixedJetCratesAndHatch_Gameplay/#fixedJetCratesAndHatch_Gameplay_ContentRoot/SaveLogic/Savepoint 2	2578.595458984375	-653.8326416015625	7.152557373046875e-07	Boy
+#GirlInWater_Gameplay	0	level112	#GirlInWater_Gameplay/#GirlInWater_Gameplay_ContentRoot/SaveLogic/Savepoint 1	2613.313232421875	-648.4044799804688	0.0	Boy
+#GirlInWater_Gameplay	1	level112	#GirlInWater_Gameplay/#GirlInWater_Gameplay_ContentRoot/SaveLogic/Savepoint 2	2649.58251953125	-655.1754760742188	0.0	Boy
+#GirlExplore_Gameplay	0	level194	#GirlExplore_Gameplay/#GirlExplore_Gameplay_ContentRoot/Savepoints/Savepoint1	2715.36669921875	-652.603515625	-6.705522537231445e-08	Boy
+#GirlExplore_Gameplay	1	level194	#GirlExplore_Gameplay/#GirlExplore_Gameplay_ContentRoot/Savepoints/Savepoint2	2764.086181640625	-646.9205322265625	0.0	Boy
+#GirlInWaterPart2_Gameplay	0	level60	#GirlInWaterPart2_Gameplay/#GirlInWaterPart2_Gameplay_ContentRoot/SaveLogic/Savepoint 1	2791.69677734375	-649.4296875	1.4901161193847656e-08	Boy
+#diveToLab_Gameplay	0	level218	#diveToLab_Gameplay/#diveToLab_Gameplay_ContentRoot/_0_Top_Logic/SaveLogic/Savepoint 1	2849.9521484375	-650.7274780273438	0.0	Boy
+#labEntranceFlush2_Gameplay	0	level84	#labEntranceFlush2_Gameplay/#labEntranceFlush2_Gameplay_ContentRoot/SavePoints/Savepoint 2	2851.48095703125	-760.0872802734375	0.0	Boy
+#labEntranceFlush2_Gameplay	1	level84	#labEntranceFlush2_Gameplay/#labEntranceFlush2_Gameplay_ContentRoot/SavePoints/Savepoint 7	2966.297607421875	-757.8163452148438	3.370588819961995e-05	Boy
+#rotateTheShadow_GamePlay	0	level220	#rotateTheShadow_GamePlay/#rotateTheShadow_GamePlay_ContentRoot/SaveLogic/_leftSide/Savepoint 0	3003.75	-755.34326171875	-9.5367431640625e-07	Boy
+#rotateTheShadow_GamePlay	1	level220	#rotateTheShadow_GamePlay/#rotateTheShadow_GamePlay_ContentRoot/SaveLogic/_rightSide/Savepoint 1	3035.422607421875	-755.0435791015625	-1.430511474609375e-06	Boy
+#rotateTheShadow_GamePlay	2	level220	#rotateTheShadow_GamePlay/#rotateTheShadow_GamePlay_ContentRoot/SaveLogic/_rightSide/Savepoint 2	3044.422607421875	-753.196533203125	2.2351741790771484e-08	Boy
+#rotateTheShadow_GamePlay	3	level220	#rotateTheShadow_GamePlay/#rotateTheShadow_GamePlay_ContentRoot/SaveLogic/_rightSide/Savepoint 3	3088.110595703125	-747.0887451171875	0.0	Boy
+#GetJetCrateFree_Gameplay	0	level75	#GetJetCrateFree_Gameplay/#GetJetCrateFree_Gameplay_ContentRoot/SaveLogic/Savepoint 0	3131.84912109375	-760.7396850585938	0.0	Boy
+#GetJetCrateFree_Gameplay	1	level75	#GetJetCrateFree_Gameplay/#GetJetCrateFree_Gameplay_ContentRoot/SaveLogic/Savepoint 1, 2/Savepoint1BeforeJetIsFree	3174.908935546875	-773.0711669921875	-7.152557373046875e-07	Boy
+#GetJetCrateFree_Gameplay	2	level75	#GetJetCrateFree_Gameplay/#GetJetCrateFree_Gameplay_ContentRoot/SaveLogic/Savepoint 1, 2/Savepoint2AfterJetIsFree	3177.8828125	-773.1710815429688	-4.76837158203125e-07	Boy
+#GetJetCrateFree_Gameplay	3	level75	#GetJetCrateFree_Gameplay/#GetJetCrateFree_Gameplay_ContentRoot/SaveLogic/Savepoint 3/Savepoint3	3144.39892578125	-767.4098510742188	0.0	Boy
+#GetJetCrateFree_Gameplay	4	level75	#GetJetCrateFree_Gameplay/#GetJetCrateFree_Gameplay_ContentRoot/SaveLogic/Savepoint 4/Savepoint 4	3136.564697265625	-760.7396850585938	0.0	Boy
+#JetCrateToCeilingWater_Gameplay	0	level69	#JetCrateToCeilingWater_Gameplay/#JetCrateToCeilingWater_Gameplay_ContentRoot/SaveLogic/Savepoint1	3141.622802734375	-742.879638671875	0.0	Boy
+#JetCrateToCeilingWater_Gameplay	1	level69	#JetCrateToCeilingWater_Gameplay/#JetCrateToCeilingWater_Gameplay_ContentRoot/SaveLogic/Savepoint2	3166.618896484375	-730.9406127929688	0.0	Boy
+#CargoHall_Gameplay	0	level76	#CargoHall_Gameplay/#CargoHall_Gameplay_ContentRoot/!SavepointLogic/Savepoint_1	3196.515380859375	-724.5372924804688	0.0	Boy
+#CargoHall_Gameplay	1	level76	#CargoHall_Gameplay/#CargoHall_Gameplay_ContentRoot/!SavepointLogic/Savepoint_2_box	3179.150390625	-724.5372924804688	-1.110063076019287	Boy
+#CargoHall_Gameplay	2	level76	#CargoHall_Gameplay/#CargoHall_Gameplay_ContentRoot/!SavepointLogic/Savepoint_3_box	3207.19091796875	-724.5372314453125	0.0	Boy
+#WaterGuardStorage_Gameplay	0	level85	#WaterGuardStorage_Gameplay/#WaterGuardStorage_Gameplay_ContentRoot/SaveLogic/Savepoint1	3256.071533203125	-743.1080322265625	0.0	Boy
+#AlbinosOnElevator_Gameplay	0	level146	#AlbinosOnElevator_Gameplay/#AlbinosOnElevator_Gameplay_ContentRoot/_part2/SaveLogic/Savepoint 1	3374.867431640625	-756.7525024414062	0.0	Boy
+#AlbinosOnElevator_Gameplay	1	level146	#AlbinosOnElevator_Gameplay/#AlbinosOnElevator_Gameplay_ContentRoot/_part2/SaveLogic/SavepointHuddle_1	3395.87744140625	-779.632080078125	1.7881393432617188e-07	Huddle
+#HuddleApproach_Gameplay	0	level128	#HuddleApproach_Gameplay/#HuddleApproach_Gameplay_ContentRoot/SaveLogic/Savepoint1	3447.390380859375	-785.4348754882812	0.0	Boy
+#HuddleApproach_Gameplay	1	level128	#HuddleApproach_Gameplay/#HuddleApproach_Gameplay_ContentRoot/SaveLogic/SavepointHuddle_1	3493.736572265625	-776.0035400390625	0.0	Huddle
+#Courtyard_Exterior_Gameplay	0	level5	#Courtyard_Exterior_Gameplay/#Courtyard_Exterior_Gameplay_ContentRoot/SaveLogic/Savepoint	3504.921875	-777.5198974609375	4.76837158203125e-07	Boy
+#EducationRooms_Gameplay	0	level57	#EducationRooms_Gameplay/#EducationRooms_Gameplay_ContentRoot/SaveLogic/SavepointBoy_1	3597.75146484375	-770.5752563476562	0.0	Boy
+#EducationRooms_Gameplay	1	level57	#EducationRooms_Gameplay/#EducationRooms_Gameplay_ContentRoot/SaveLogic/SavepointHuddle_1	3597.75146484375	-770.5752563476562	0.0	Huddle
+#waterOnCeilingAndSwing_Gameplay	0	level91	#waterOnCeilingAndSwing_Gameplay/#waterOnCeilingAndSwing_Gameplay_ContentRoot/SaveLogic/Savepoint0	3676.606201171875	-757.5785522460938	0.0	Boy
+#waterOnCeilingAndSwing_Gameplay	1	level91	#waterOnCeilingAndSwing_Gameplay/#waterOnCeilingAndSwing_Gameplay_ContentRoot/SaveLogic/Savepoint1	3676.135986328125	-771.282958984375	0.0	Boy
+#waterOnCeilingAndSwing_Gameplay	2	level91	#waterOnCeilingAndSwing_Gameplay/#waterOnCeilingAndSwing_Gameplay_ContentRoot/SaveLogic/Savepoint2	3654.141357421875	-803.4638061523438	2.2351741790771484e-08	Boy
+#HuddleChamber_Gameplay	0	level153	#HuddleChamber_Gameplay/#HuddleChamber_Gameplay_ContentRoot/SaveLogic/Savepoint 01	3615.476806640625	-769.5966186523438	3.639249563217163	Boy
+#HuddleVentCollapse_Gameplay	0	level47	#HuddleVentCollapse_Gameplay/#HuddleVentCollapse_Gameplay_ContentRoot/_RightSide/SaveLogic/Savepoint_1	3381.048095703125	-846.75	0.0	Huddle
+#huddleCafeteria_Gameplay	0	level196	#huddleCafeteria_Gameplay/#huddleCafeteria_Gameplay_ContentRoot/SaveLogic/Savepoint 1	3435.652099609375	-841.95068359375	1.7881393432617188e-07	Huddle
+#huddleCeoFallAndDogs_Gameplay	0	level214	#huddleCeoFallAndDogs_Gameplay/#huddleCeoFallAndDogs_Gameplay_ContentRoot/SaveLogic/Savepoint Splat	3530.844970703125	-879.7736206054688	0.0	Huddle
+#huddleCeoFallAndDogs_Gameplay	1	level214	#huddleCeoFallAndDogs_Gameplay/#huddleCeoFallAndDogs_Gameplay_ContentRoot/SaveLogic/Savepoint No Splat	3531.144775390625	-879.7247924804688	0.0	Huddle
+#huddleGarbageRoom_Gameplay	0	level63	#huddleGarbageRoom_Gameplay/#huddleGarbageRoom_Gameplay_ContentRoot/SaveLogic/Savepoint_1	3621.366943359375	-888.0848388671875	0.0	Huddle
+#huddleAndOven_Gameplay	0	level139	#huddleAndOven_Gameplay/#huddleAndOven_Gameplay_ContentRoot/RightGroup/Savepoint_5	3656.01318359375	-911.9083862304688	0.0	Huddle
+#huddleAndPendulum_Gameplay	0	level43	#huddleAndPendulum_Gameplay/#huddleAndPendulum_Gameplay_ContentRoot/SaveLogic/Savepoint_1	3721.88818359375	-910.0365600585938	0.0	Huddle
+#huddleJetCrateAndHelper_Gameplay	0	level71	#huddleJetCrateAndHelper_Gameplay/#huddleJetCrateAndHelper_Gameplay_ContentRoot/SaveLogic/Savepoint	3782.279296875	-908.2608642578125	0.0	Huddle
+#huddleTrap_Gameplay	0	level90	#huddleTrap_Gameplay/#huddleTrap_Gameplay_ContentRoot/SaveLogic/Savepoint 1	3834.355224609375	-908.2640991210938	0.0	Huddle
+#huddleTrap_Gameplay	1	level90	#huddleTrap_Gameplay/#huddleTrap_Gameplay_ContentRoot/SaveLogic/Savepoint 2	3908.68798828125	-889.705322265625	0.0	Huddle

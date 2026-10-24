@@ -138,6 +138,7 @@ namespace InsideDev
             public int count;
             public Vector3[] pos;
             public string[] info;
+            public bool atlas;      // from the level atlas (area not discovered yet), never written to spawns.cache
         }
 
         static readonly Dictionary<string, Entry> byName = new Dictionary<string, Entry>();
@@ -255,7 +256,25 @@ namespace InsideDev
         {
             Load();
             Entry e;
-            try { return byName.TryGetValue(SavepointManager.GetSubsceneName(sub), out e) ? e : null; } catch { return null; }
+            try { string name = SavepointManager.GetSubsceneName(sub); return byName.TryGetValue(name, out e) ? e : FromAtlas(name); } catch { return null; }
+        }
+
+        static readonly Dictionary<string, Entry> fromAtlas = new Dictionary<string, Entry>();
+        static Entry FromAtlas(string name)
+        {
+            Entry e;
+            if (fromAtlas.TryGetValue(name, out e)) return e;
+            Atlas.EnsureLoaded();
+            var a = Atlas.Ready ? Atlas.AreaNamed(name) : null;
+            if (a != null && a.savepoints >= 0)
+            {
+                e = new Entry { name = name, count = a.savepoints, pos = new Vector3[a.savepoints], info = new string[a.savepoints], atlas = true };
+                for (int i = 0; i < e.count; i++) e.info[i] = "";
+                var sp = Atlas.SpawnsOf(name);
+                if (sp != null) foreach (var x in sp) if (x.i >= 0 && x.i < e.count) { e.pos[x.i] = x.pos; e.info[x.i] = x.info; }
+            }
+            fromAtlas[name] = e;
+            return e;
         }
 
         public static int KnownAreas { get { Load(); return byName.Count; } }

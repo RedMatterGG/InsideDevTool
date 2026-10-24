@@ -41,6 +41,7 @@ namespace InsideDev
             hud = EditorState.Get("hud", true);
             overlay.labelLevel = Mathf.Clamp(EditorState.Get("overlay.labels", 3), 0, 3); overlay.showLabels = overlay.labelLevel > 0;
             overlay.scope = Mathf.Clamp(EditorState.Get("overlay.scope", 1), 0, 4);
+            hdAtlas = EditorState.Get("hidden.atlas", false);
             RenderDiag.board = EditorState.Get("diag.board", false);
             TransformGizmo.Load();
             try { GameCode.Boot(); } catch (Exception e) { DevLog.Error("gamecode", e); }
@@ -325,8 +326,13 @@ namespace InsideDev
             int curSub, curSp;
             G.CurrentSavepoint(out curSub, out curSp);
             int subs = SavepointManager.SubsceneCount;
-            int unknown = 0;
-            for (int k = 0; k < subs; k++) if (SavepointManager.GetSubsceneSavepointCount(k) < 0 && SpawnCache.Get(k) == null) unknown++;
+            int unknown = 0, fromAtlas = 0;
+            for (int k = 0; k < subs; k++)
+            {
+                if (SavepointManager.GetSubsceneSavepointCount(k) >= 0) continue;
+                var ke = SpawnCache.Get(k);
+                if (ke == null) unknown++; else if (ke.atlas) fromAtlas++;
+            }
             ui.BeginRow();
             ui.Label("Current: " + (curSub >= 0 ? G.SubsceneLabel(curSub) + " #" + curSp : "?"), UI.Accent, 330);
             if (ui.Button("Respawn")) GameManager.Respawn();
@@ -342,7 +348,7 @@ namespace InsideDev
             }
             else
             {
-                ui.Label(unknown > 0 ? unknown + " area(s) never loaded yet - their savepoints are unknown (?)." : "All areas discovered (" + SpawnCache.KnownAreas + " cached).", unknown > 0 ? new Color(1f, 0.85f, 0.4f, 1f) : UI.Dim, ui.Width - 130);
+                ui.Label(unknown > 0 ? unknown + " area(s) never loaded yet - their savepoints are unknown (?)." : "All areas known (" + SpawnCache.KnownAreas + " cached" + (fromAtlas > 0 ? ", " + fromAtlas + " from the atlas" : "") + ").", unknown > 0 ? new Color(1f, 0.85f, 0.4f, 1f) : UI.Dim, ui.Width - 130);
                 if (unknown > 0 && ui.Button("Discover all", 120)) Discovery.DiscoverAll();
             }
             ui.EndRow();
@@ -373,7 +379,7 @@ namespace InsideDev
                 else
                 {
                     var gp = Levels.ForSubscene(SafeSubName(s)).Find(x => x.part.StartsWith("Game", StringComparison.OrdinalIgnoreCase));
-                    string cnt = gameN > 0 ? gameN.ToString() : gameN == 0 ? "0 - no savepoint, secret/overlay area" : (ce != null ? ce.count + ", cached" : "?");
+                    string cnt = gameN > 0 ? gameN.ToString() : gameN == 0 ? "0 - no savepoint, secret/overlay area" : (ce != null ? ce.count + (ce.atlas ? ", atlas" : ", cached") : "?");
                     head = (n > 0 ? (open ? "v " : "> ") : "  ") + s.ToString("D3") + "  " + label + "  (" + cnt + ")" + (gp != null ? "   " + gp.File : "") + (anyLive ? "   [loaded]" : "") + (s == curSub ? "   <- here" : "");
                     spHeads[s] = new KeyValuePair<int, string>(hk, head);
                 }
@@ -504,8 +510,71 @@ namespace InsideDev
             overlay.hiddenEntries = hidden;
         }
 
+        // "All levels (atlas)": switched-off objects in every level file, from the level atlas
+        bool hdAtlas, hdaSwitch = true, hdaDormant = true, hdaUnclear = true, hdaLoaded;
+        string hdaFilter = "", hdaKey;
+        readonly List<Atlas.Hidden> hdaRows = new List<Atlas.Hidden>();
+        readonly List<string> hdaText = new List<string>();
+        static readonly Color cAtlasSwitch = new Color(0.55f, 1f, 0.6f, 1f), cAtlasDormant = new Color(1f, 0.45f, 0.9f, 1f);
+
+        void TabHiddenAtlas()
+        {
+            ui.BeginRow();
+            ui.Label("Filter:", null, 44);
+            ui.TextField("hdaf", ref hdaFilter, 200);
+            hdaSwitch = ui.Toggle(hdaSwitch, "switched on by the game");
+            hdaDormant = ui.Toggle(hdaDormant, "never switched on");
+            hdaUnclear = ui.Toggle(hdaUnclear, "unclear");
+            hdaLoaded = ui.Toggle(hdaLoaded, "only loaded levels");
+            ui.EndRow();
+            string key = hdaFilter + "|" + hdaSwitch + hdaDormant + hdaUnclear + hdaLoaded + (hdaLoaded ? Levels.StreamVersion : 0);
+            if (key != hdaKey)
+            {
+                hdaKey = key; hdaRows.Clear(); hdaText.Clear();
+                string f = hdaFilter.ToLowerInvariant();
+                foreach (var h in Atlas.hidden)
+                {
+                    if (h.status == "switchable" ? !hdaSwitch : h.status == "dormant" ? !hdaDormant : !hdaUnclear) continue;
+                    if (hdaLoaded && Atlas.LevelState(h.file) == "unloaded") continue;
+                    if (f.Length > 0 && !(h.path + " " + h.reason + " " + h.scripts + " " + h.file).ToLowerInvariant().Contains(f)) continue;
+                    hdaRows.Add(h);
+                    hdaText.Add(h.file + "   " + Atlas.Tail(h.path) + "   [" + h.status + ", " + h.objects + " obj]   " + (h.status == "switchable" ? "by " : "") + h.reason);
+                }
+            }
+            ui.Label(hdaRows.Count + " of " + Atlas.hidden.Count + " switched-off objects in the level files (" + Atlas.levelsChecked + " levels). Select / Go work once the level is loaded.", UI.Dim);
+            ui.VirtualList("hda", hdaRows.Count, UI.RowPitch, ui.Remaining, i =>
+            {
+                var h = hdaRows[i];
+                bool live = Atlas.LevelState(h.file) != "unloaded";
+                ui.BeginRow();
+                if (ui.Button("Go", 30))
+                {
+                    var g = Atlas.Find(h.file, h.path);
+                    if (g != null) G.Teleport(g.transform.position); else DevLog.Write("atlas: " + Atlas.SceneOf(h.file) + " is not loaded - spawn near it first (Spawn points)");
+                }
+                Color c = h.status == "switchable" ? cAtlasSwitch : h.status == "dormant" ? cAtlasDormant : UI.Txt;
+                if (!live) c.a = 0.55f;
+                if (ui.Item(hdaText[i], c))
+                {
+                    var g = Atlas.Find(h.file, h.path);
+                    if (g != null) SelectInInspector(g); else DevLog.Write("atlas: " + h.path + " (" + Atlas.SceneOf(h.file) + ", " + Atlas.LevelState(h.file) + ")");
+                }
+                ui.EndRow();
+            });
+        }
+
         void TabHidden()
         {
+            Atlas.EnsureLoaded();
+            if (Atlas.Present)
+            {
+                ui.BeginRow();
+                bool a = ui.Toggle(hdAtlas, "All levels (atlas)");
+                if (a != hdAtlas) { hdAtlas = a; EditorState.Set("hidden.atlas", a); }
+                if (!Atlas.Ready) ui.Label("atlas " + Atlas.status, UI.Dim);
+                ui.EndRow();
+                if (hdAtlas && Atlas.Ready) { TabHiddenAtlas(); return; }
+            }
             ui.BeginRow();
             if (ui.Button("Scan loaded scenes")) ScanHidden();
             ui.Label("Filter:", null, 44);
@@ -988,6 +1057,7 @@ namespace InsideDev
             EditorCommands.Register("redo", "Redo", "history", () => ChangeRecorder.Redo(), "Ctrl+Y");
             EditorCommands.Register("revert-all", "Revert all my changes", "history", () => ChangeRecorder.RevertAll());
             EditorCommands.Register("mods-reload", "Reload mods from disk", "mods", () => { Mods.LoadAll(); return Mods.Summary(); });
+            EditorCommands.Register("hidden-atlas", "Hidden: all levels (atlas) on / off", "panels", () => { Atlas.EnsureLoaded(); if (!Atlas.Ready) return "atlas " + Atlas.status; hdAtlas = !hdAtlas; EditorState.Set("hidden.atlas", hdAtlas); ShowPanel("hidden"); return hdAtlas ? "Hidden: all levels (atlas)" : "Hidden: loaded scenes"; });
             EditorCommands.Register("author-mode", "Toggle Mod Author mode", "mode", () => { HistoryPanel.authorMode = !HistoryPanel.authorMode; EditorState.Set("mode.author", HistoryPanel.authorMode); return HistoryPanel.authorMode ? "Mod Author mode" : "Explore mode"; });
             EditorCommands.Register("bookmark", "Bookmark selected object", "selection", () => { var m = Bookmarks.Add(Selection.Current); return m != null ? "bookmarked " + m.name : "nothing selected"; }, null, () => Selection.Current != null);
             EditorCommands.Register("sel-show", "Show selected object (set active)", "selection", () => { ChangeRecorder.SetActive(Selection.Current, true, "command"); return "shown"; }, null, () => Selection.Current != null && !Selection.Current.activeSelf);
@@ -1112,7 +1182,7 @@ namespace InsideDev
                 case "help":
                     DevLog.Write("tp <x> <y> [z] | spawn|load <sub> <sp> | tpsp <sub> <sp> | discover all|<sub> | post <event> | cue <name> | shockwave nokill|fire | catalog | subs [filter] | levels [filter] | where | kill | god [on|off] | ts <scale>\n" +
                                  "find <name> | sel <name> | respawn | reload | triggers|solids|labels|savepoints [on|off]\n" +
-                                 "flag <name> [on|off] | flags | clear");
+                                 "flag <name> [on|off] | flags | clear | atlas [find <text> | level <n> | check]");
                     break;
                 case "tp":
                     {
@@ -1183,6 +1253,7 @@ namespace InsideDev
                         DevLog.Write((ch != null ? ch.name + " at " + ch.pos3.ToString("F3") : "no character") + "   savepoint " + (sub >= 0 ? G.SubsceneLabel(sub) + " #" + sp + " (load " + sub + " " + sp + ")" : "?"));
                         break;
                     }
+                case "atlas": DevLog.Write(Atlas.Command(a)); break;
                 case "kill": G.Kill(); break;
                 case "god":
                     G.God = a.Length > 1 ? On(a[1]) : !G.God;

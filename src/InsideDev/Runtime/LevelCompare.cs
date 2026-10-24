@@ -44,7 +44,7 @@ namespace InsideDev
             return true;
         }
 
-        static string Dup(Transform t)
+        public static string Dup(Transform t)
         {
             if (t.parent == null) return "";
             int nth = 0;
