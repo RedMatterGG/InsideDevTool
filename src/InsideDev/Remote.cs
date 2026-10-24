@@ -296,7 +296,6 @@ namespace InsideDev
                     }
                 case "fsmfind": return FsmFind.Report(Rest(line));
                 case "gamecode":
-                    if (a.Count > 1 && a[1] == "banner") { GameCode.BannerHidden = false; return "banner shown again"; }
                     return GameCode.Report();
                 case "postfx":
                     {

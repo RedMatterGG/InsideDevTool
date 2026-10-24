@@ -8,7 +8,7 @@ namespace InsideDev
     //   UnityEngine.dll, PlayMaker.dll       plain copies of INSIDE_Data\Managed\ (copied here automatically if missing)
     //   Assembly-CSharp.dll,
     //   Assembly-CSharp-firstpass.dll        the game's own code. InsideDev does NOT extract or dump these: the user has
-    //                                        to supply them. Until they do, a notice is shown (Settings tab + panel banner).
+    //                                        to supply them. Until they do, Settings > Game code says so (and the log).
     // Nothing in the in-game GUI needs them; the game's code is used straight from memory while it runs.
     public static class GameCode
     {
@@ -23,7 +23,6 @@ namespace InsideDev
         public static string Dir { get { Init(); return dir; } }
         public static bool Complete { get { Check(); return missing.Length == 0; } }
         public static string Missing { get { Check(); return missing; } }
-        public static bool BannerHidden { get { return EditorState.Get("gamecode.hidebanner", "0") == "1"; } set { EditorState.Set("gamecode.hidebanner", value); } }
 
         static void Init()
         {
@@ -93,16 +92,6 @@ namespace InsideDev
 
         static readonly Color cWarn = new Color(1f, 0.55f, 0.3f, 1f);
 
-        // one line above every panel until the files are there (or the banner is hidden)
-        public static void DrawBanner(UI ui)
-        {
-            if (BannerHidden || Complete) return;
-            ui.BeginRow();
-            ui.Label("GameCode\\ is missing " + missing + " - see Settings > Game code", cWarn, Mathf.Max(120, ui.Width - 60));
-            if (ui.Button("hide", 50)) BannerHidden = true;
-            ui.EndRow();
-        }
-
         // Settings tab block
         public static void DrawSettings(UI ui)
         {
@@ -119,7 +108,6 @@ namespace InsideDev
             }
             ui.BeginRow();
             if (ui.Button("Check again")) { CopyShippedRefs(); Check(true); }
-            if (!ok && BannerHidden && ui.Button("Show reminder banner")) BannerHidden = false;
             ui.EndRow();
         }
     }
