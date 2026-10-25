@@ -1,4 +1,4 @@
-# INSIDE runtime editor (InsideDev 0.5.0)
+# INSIDE runtime editor (InsideDev 0.6.0)
 
 An in-game editor and explorer for Playdead's INSIDE (Unity 5.0.4f1): browse and edit the live scene, see how
 objects, signals, PlayMaker state machines, code and audio are connected, record changes as mods, and inspect memory
