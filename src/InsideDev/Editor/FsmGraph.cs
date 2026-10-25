@@ -57,8 +57,12 @@ namespace InsideDev
         }
 
         // ------------------------------------------------------------------ model (rebuilt every frame: FSMs are small)
-        sealed class N { public string key, name, sub; public Vector2 pos; public float w; public int actions; public bool start, global, sig, unconnected; }
-        sealed class E { public string from, ev, to; public bool global, sig; public int idx, count; public bool flash; }
+        sealed class N { public string key, name, sub; public Vector2 pos; public float w; public int actions; public bool start, global, sig, unconnected, dead; }
+        sealed class E { public string from, ev, to; public bool global, sig; public int idx, count; public bool flash, dead; }
+        // level atlas: states no event in the game leads to, events nothing in the game sends (looked up once per FSM)
+        static int atlasFor;
+        static Atlas.FsmIssue atlasIssue;
+        static readonly Color cDead = new Color(0.5f, 0.5f, 0.55f, 0.6f);
         static readonly Dictionary<string, N> nodes = new Dictionary<string, N>();
         static readonly List<E> edges = new List<E>();
         const string Any = "*";
@@ -75,11 +79,14 @@ namespace InsideDev
                 if (!haveFirst) { first = c; haveFirst = true; } else if ((c - first).sqrMagnitude > 1f) authored = true;
             }
             string start = null; try { start = fsm.Fsm.StartState; } catch { }
+            if (atlasFor != fsmId) { atlasFor = fsmId; atlasIssue = null; try { atlasIssue = Atlas.FsmOf(fsm); } catch (Exception e) { DevLog.Error("atlas fsm", e); } }
             foreach (var st in states)
             {
                 if (st == null || nodes.ContainsKey(st.Name)) continue;
                 var n = new N { key = st.Name, name = st.Name, actions = st.Actions != null ? st.Actions.Length : 0, start = st.Name == start };
+                n.dead = atlasIssue != null && Array.IndexOf(atlasIssue.unreachable, st.Name) >= 0;
                 n.w = Mathf.Max(110f, (d != null ? d.Measure(st.Name, 13) : st.Name.Length * 7f) + 26f);
+                if (n.dead) n.w = Mathf.Max(n.w, (d != null ? d.Measure(n.actions + " actions  · never reached (atlas)", 11) : 200f) + 22f);
                 n.pos = authored ? st.Position.center * 1.35f : Vector2.zero;
                 nodes[st.Name] = n;
             }
@@ -109,9 +116,11 @@ namespace InsideDev
                 var senders = new List<string>();
                 foreach (var c in incoming) if (c.signalInName == inName) senders.Add((c.signalOutGameObject != null ? c.signalOutGameObject.name : "?") + "." + c.signalOutName + (c.isConnected ? "" : " (waiting)"));
                 string sub = senders.Count == 0 ? "nothing connected" : senders[0] + (senders.Count > 1 ? "  +" + (senders.Count - 1) + " more" : "");
+                bool unsent = atlasIssue != null && Array.IndexOf(atlasIssue.unsent, inName) >= 0;
+                if (unsent) sub += "  ·  no sender in any level (atlas)";
                 string key = "sig:" + inName;
                 float w = Mathf.Max(130f, Mathf.Max(d != null ? d.Measure(inName, 13) : inName.Length * 7f, d != null ? d.Measure(sub, 11) : sub.Length * 6f) + 22f);
-                nodes[key] = new N { key = key, name = "signal " + inName, sub = sub, sig = true, unconnected = senders.Count == 0, w = w, pos = tn.pos + new Vector2(-tn.w * 0.5f - w * 0.5f - 90f, 52f + k * 48f) };
+                nodes[key] = new N { key = key, name = "signal " + inName, sub = sub, sig = true, unconnected = senders.Count == 0, dead = unsent, w = w, pos = tn.pos + new Vector2(-tn.w * 0.5f - w * 0.5f - 90f, 52f + k * 48f) };
                 edges.Add(new E { from = key, ev = inName, to = target, sig = true });
             }
             // user-moved boxes
@@ -124,6 +133,7 @@ namespace InsideDev
                 List<E> l; if (!groups.TryGetValue(k, out l)) groups[k] = l = new List<E>(); l.Add(e);
             }
             foreach (var l in groups.Values) for (int i = 0; i < l.Count; i++) { l[i].idx = i; l[i].count = l.Count; }
+            if (atlasIssue != null) foreach (var e in edges) e.dead = Array.IndexOf(atlasIssue.unsent, e.ev) >= 0;
             bool fl = Time.realtimeSinceStartup - flashAt < 2.5f;
             if (fl) foreach (var e in edges) e.flash = e.ev == flashEv && e.to == flashTo && (e.from == flashFrom || e.global);
         }
@@ -334,6 +344,7 @@ namespace InsideDev
                 ui.Label("state  [" + st.Name + "]" + (active ? "  (current)" : "") + "   " + (st.Transitions != null ? st.Transitions.Length : 0) + " exits", hi, Mathf.Max(200, ui.Width - 120));
                 if (ui.Button("force here")) { ChangeRecorder.Action(fsm.gameObject, "fsmState", fsm.FsmName, st.Name, "fsm graph"); fsm.SetState(st.Name); }
                 ui.EndRow();
+                if (atlasIssue != null && Array.IndexOf(atlasIssue.unreachable, st.Name) >= 0) ui.Label("atlas: no event that leads here is ever sent in the game files (force here to see it run)", cDead);
                 ActionList(ui, st);
             }
         }
@@ -530,7 +541,7 @@ namespace InsideDev
                 N na, nb; if (!nodes.TryGetValue(e.from, out na) || !nodes.TryGetValue(e.to, out nb)) continue;
                 Rect ra = NodeRect(area, na), rb = NodeRect(area, nb);
                 bool sel = e.sig ? e.ev == selSig : e.from == selEvFrom && e.ev == selEv;
-                Color c = e.flash ? Color.Lerp(cFlash, e.global ? cGlobal : cEdge, (Time.realtimeSinceStartup - flashAt) / 2.5f) : sel ? cSel : e.sig ? cSig : e.global ? cGlobal : cEdge;
+                Color c = e.flash ? Color.Lerp(cFlash, e.global ? cGlobal : cEdge, (Time.realtimeSinceStartup - flashAt) / 2.5f) : sel ? cSel : e.dead ? cDead : e.sig ? cSig : e.global ? cGlobal : cEdge;
                 Vector2 a, ctl, b, lab;
                 if (e.from == e.to)
                 {   // loop above the box
@@ -607,8 +618,8 @@ namespace InsideDev
                 if (zoom >= 0.4f)
                 {
                     d.PushClip(r);
-                    d.Text(r.x + 7, r.y + 3 * zoom, n.name, isAct ? Color.white : n.global ? cGlobal : UI.Txt, fs);
-                    if (!n.global && zoom >= 0.6f) d.Text(r.x + 7, r.y + 3 * zoom + fs + 1, n.actions + " action" + (n.actions == 1 ? "" : "s") + (isAct ? "  · current" : ""), UI.Dim, fs - 2);
+                    d.Text(r.x + 7, r.y + 3 * zoom, n.name, isAct ? Color.white : n.global ? cGlobal : n.dead ? cDead : UI.Txt, fs);
+                    if (!n.global && zoom >= 0.6f) d.Text(r.x + 7, r.y + 3 * zoom + fs + 1, n.actions + " action" + (n.actions == 1 ? "" : "s") + (isAct ? "  · current" : "") + (n.dead ? "  · never reached (atlas)" : ""), n.dead ? cDead : UI.Dim, fs - 2);
                     d.PopClip();
                 }
                 // new-exit handle

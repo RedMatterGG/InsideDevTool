@@ -266,6 +266,8 @@ namespace InsideDev
             if (go != selected) return;
             try { FactsSections.Draw(ui, go); } catch (Exception e) { ui.Label("facts error: " + e.Message, Color.red); }
             if (go != selected) return;
+            try { AtlasSection.Draw(ui, go); } catch (Exception e) { ui.Label("atlas error: " + e.Message, Color.red); }
+            if (go != selected) return;
             try { MemorySection.Draw(ui, go); } catch (Exception e) { ui.Label("memory error: " + e.Message, Color.red); }
             if (go != selected) return;
             try { Links.Draw(ui, go, this); } catch (Exception e) { ui.Label("links error: " + e.Message, Color.red); }

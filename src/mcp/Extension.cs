@@ -12,7 +12,7 @@ namespace InsideDev.McpExt
     // Loaded by InsideDev from _mod\InsideDev.Mcp.dll. Endpoint http://127.0.0.1:47811/mcp (Streamable HTTP).
     // Clients that only speak stdio use InsideDev.McpStdio.exe, which forwards to that endpoint.
     // Bridge / console: mcp [status|on|off|port <n>|selftest|test]
-    public sealed class McpExtension : IInsideDevExtension, IToolHost
+    public sealed class McpExtension : IInsideDevExtension, IToolHost, IDisposable
     {
         public string Name { get { return "MCP server (" + (server != null && server.Running ? "http://127.0.0.1:" + server.Port + McpServer.Path : "off") + ")"; } }
         public string ServerVersion { get { return Boot.Version; } }
@@ -35,6 +35,9 @@ namespace InsideDev.McpExt
         }
 
         public void Log(string msg) { lock (logq) logq.Enqueue(msg); }
+
+        // game quit: close the listener and open connections, or their threads keep the process alive
+        public void Dispose() { if (server != null) server.Stop(); }
 
         public void Start(DevCore core)
         {

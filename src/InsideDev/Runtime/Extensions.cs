@@ -72,6 +72,21 @@ namespace InsideDev
             return (loaded.Count - before) + " new extension(s) loaded\n" + Summary();
         }
 
+        // Extensions that hold threads or sockets implement IDisposable and are disposed when the game quits: a thread
+        // still blocked in a socket call keeps Unity 5.0's Mono from shutting down and the game hangs on exit.
+        static bool quit;
+        public static void Quit()
+        {
+            if (quit) return;
+            quit = true;
+            foreach (var ext in loaded)
+            {
+                var d = ext as IDisposable;
+                if (d == null) continue;
+                try { d.Dispose(); } catch (Exception e) { DevLog.Error("[ext] quit " + ext.Name, e); }
+            }
+        }
+
         public static void Tick(DevCore core)
         {
             for (int i = 0; i < loaded.Count; i++)

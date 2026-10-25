@@ -274,7 +274,7 @@ namespace InsideDev
             Panel p;
             if (!panels.TryGetValue(id, out p)) return;
             string pn; if (!perfNames.TryGetValue(id, out pn)) perfNames[id] = pn = "panel " + id;
-            Perf.RunNested(pn, () => { try { if (curUi != null) GameCode.DrawBanner(curUi); p.draw(); } catch (Exception e) { DevLog.Error("panel " + id, e); } });
+            Perf.RunNested(pn, () => { try { p.draw(); } catch (Exception e) { DevLog.Error("panel " + id, e); } });
         }
 
         // physical-pixel rect of the game view left uncovered by docks (whole screen in window mode)

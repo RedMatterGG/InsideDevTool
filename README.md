@@ -9,8 +9,6 @@ with Cheat Engine.
 
 ## Requirements and install
 
-| File | Where | What it is |
-|------|-------|------------|
 | File in this repo | Copy to | What it is |
 |------|-------|------------|
 | `bin\version.dll` | game folder (next to `INSIDE.exe`) | proxy loader: forwards the real `version.dll`, boots InsideDev once the game's code has loaded |
@@ -19,6 +17,7 @@ with Cheat Engine.
 | `tools\mcp\InsideDev.McpStdio.exe` | anywhere | optional: stdio launcher for MCP clients that start a local program |
 | `tools\cheatengine\InsideDev.CT` | anywhere | optional: Cheat Engine table |
 | `mods\*.json` | `<game>\_mod\mods\` | optional: example mods (enable them in the Mods panel) |
+| `data\atlas\*.tsv` | `<game>\_mod\atlas\` | optional: level atlas (see "Level atlas") |
 
 Start the game normally; **F1** opens the editor. Settings, logs, mods and caches live in `<game>\_mod\`.
 To uninstall, delete `version.dll` from the game folder (and `_mod\` if you want the settings gone).
@@ -60,6 +59,10 @@ this project does not describe how to obtain them: dump them yourself and place 
 <td width="50%" valign="top"><a href="docs/screenshots/cheats-memory.jpg"><img width="100%" src="docs/screenshots/cheats-memory.jpg" alt="Cheats + Cheat Engine memory"></a><br><b>Cheats + Cheat Engine memory</b></td>
 <td width="50%" valign="top"><a href="docs/screenshots/settings.jpg"><img width="100%" src="docs/screenshots/settings.jpg" alt="Settings (post effects, game code, extensions)"></a><br><b>Settings (post effects, game code, extensions)</b></td>
 </tr>
+<tr>
+<td width="50%" valign="top"><a href="docs/screenshots/atlas-hidden.jpg"><img width="100%" src="docs/screenshots/atlas-hidden.jpg" alt="Level atlas: switched-off objects in every level"></a><br><b>Level atlas: switched-off objects in every level</b></td>
+<td width="50%" valign="top"><a href="docs/screenshots/atlas-inspector.jpg"><img width="100%" src="docs/screenshots/atlas-inspector.jpg" alt="Level atlas in the Inspector: dead wires, who switches an object on"></a><br><b>Level atlas in the Inspector: dead wires, who switches an object on</b></td>
+</tr>
 </table>
 
 ## Panels
@@ -69,12 +72,15 @@ UI scale 75–150 %; Ctrl+V / Ctrl+C / Ctrl+Backspace in text fields (the boy ge
 Global search / command palette **Ctrl+P**, bookmarks. Beyond what the screenshots show:
 
 - **Inspector** — Normal / Advanced / Raw modes; ACTIVITY (animations, sounds, state machines, signals below the
-  selection), MATERIALS, LEVEL FILE (object vs. its level file: as authored / changed by you / changed in game);
+  selection), MATERIALS, LEVEL FILE (object vs. its level file: as authored / changed by you / changed in game),
+  ATLAS (switched off in the level file and who switches it on, dead signal wires, dead FSM parts);
   adapters for savepoints, PlayMaker FSMs (fire / force), animation (who plays it, play/stop, pose slider), Animator.
 - **FSM Graph** — also: action settings editable (numbers, strings, bools, events, enums, on/off) with per-setting
-  undo; connections to switched-off objects link when they wake up; click a hit in FSM Find to open it here.
+  undo; connections to switched-off objects link when they wake up; click a hit in FSM Find to open it here; with
+  the atlas, states no event in the game leads to and events nothing sends are drawn grey.
 - **Levels / Triggers / Hidden / World state / Objects** — level list, nearby triggers, objects the game switches off
-  and never on (passive scanner, `_mod\hidden\`), object database search (`t:Type`, `k:kind`, hidden/active).
+  and never on (passive scanner, `_mod\hidden\`; with the atlas also "All levels"), object database search
+  (`t:Type`, `k:kind`, hidden/active).
 - **Events** — live history of signals, FSM events, sounds and animation clips, with filters.
 - **Audio / Sounds / Audio Timeline / Wwise API** — sound files per event (name, codec, length; never extracted),
   "why did this play" call stacks, timeline, audition / trigger original / override, audio rules (mute, nuke,
@@ -85,10 +91,27 @@ Global search / command palette **Ctrl+P**, bookmarks. Beyond what the screensho
 
 ## Keys
 
-F1 panel · F2 trigger overlay (all / general / savepoints / cameras / kill / audio) · F3 solids · F4 labels
+F1 panel · F2 trigger overlay (all / general / savepoints / cameras / kill / audio / logic / water / fx /
+streaming) · F3 solids · F4 labels
 (off / selected / nearby / all) · P pick (Shift+P filter) · F5 HUD · F6 savepoints · F7 god · F8 kill · F9 flip ·
 F10 hidden · F11 diagnostics · Insert free camera · + / − / 0 zoom · [ ] \ time scale · middle mouse teleport ·
 ` console · Ctrl+Z / Ctrl+Y undo / redo · Ctrl+P palette.
+
+## Level atlas
+
+The game only has the levels it has streamed in. The atlas (`data\atlas\*.tsv`, copied to `<game>\_mod\atlas\`)
+is a static index of all 253 level files, so the editor knows every level from the first frame:
+
+- Hidden: "All levels (atlas)" lists objects switched off in the level files: switched on later by the game (and by
+  what), never switched on by anything, or unclear
+- Inspector ATLAS section and FSM Graph: signal wires that never connect, PlayMaker states no event in the game
+  leads to, events nothing sends
+- Spawn points: savepoints of areas not discovered yet (marked "atlas"; never written to `spawns.cache`)
+- Console: `atlas` (status), `atlas find <text>`, `atlas level <n|name>`, `atlas check` (finds every atlas object of
+  the loaded levels in play and maps it back); Ctrl+P "Hidden: all levels (atlas)" switches the Hidden list
+
+It holds names, paths, positions and statuses only (no meshes, textures, audio or code). It records the size of
+every level file and switches itself off on another game build. How it is made: `tools\atlas\README.md`.
 
 ## Cheat Engine
 
@@ -151,7 +174,8 @@ sh build/build_loader.sh                        # bin/version.dll
 
 - `bin\` — prebuilt `version.dll`, `InsideDev.dll`, `InsideDev.Mcp.dll`
 - `src\InsideDev\` — the editor; `src\mcp\` — MCP server and stdio launcher; `src\loader\` — the proxy loader
-- `build\` — build scripts; `tools\` — MCP launcher, Cheat Engine table; `mods\` — example mods
+- `build\` — build scripts; `tools\` — MCP launcher, Cheat Engine table, atlas generator; `mods\` — example mods
+- `data\atlas\` — the level atlas
 - `docs\screenshots\` — the screenshots above
 
 ## Removed features
