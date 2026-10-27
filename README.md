@@ -15,6 +15,7 @@ with Cheat Engine.
 | `bin\InsideDev.dll` | `<game>\_mod\` | the editor |
 | `bin\InsideDev.Mcp.dll` | `<game>\_mod\` | optional: MCP server for AI assistants (see "AI assistants (MCP)") |
 | `bin\InsideDev.Play.dll` | `<game>\_mod\` | optional: MCP character control and world tools, needs `InsideDev.Mcp.dll` (see "MCP character control") |
+| `bin\InsideDev.ReplayLab.dll`, `bin\InsideDev.Det.dll` | `<game>\_mod\` | optional: lab modules (see "Lab modules") |
 | `bin\InsideReadback.dll` | `<game>\INSIDE_Data\Plugins\` (with the game closed) | optional: faster frame capture for MultiCam (see "MultiCam") |
 | `tools\mcp\InsideDev.McpStdio.exe` | anywhere | optional: stdio launcher for MCP clients that start a local program |
 | `tools\mcp\clients\` | (reference) | optional: example MCP client configurations |
@@ -48,6 +49,7 @@ Nothing added in 0.7.0 runs until you call it or install the optional file that 
 | Step mode (game frozen between calls) | chosen by the first action call | `time {op:"step_mode"}` | `time {op:"realtime"}`, `restore` |
 | Notes hotkey (with Play) | Home | `play.notes_key=<KeyCode>` | `play.notes_key=none` |
 | Checkpoint jumps, save guard (with Play) | off | `play.cheats=1`, `play.save_guard=1` | |
+| Lab modules (`lab`, `det`) | not installed | copy the DLLs, then a `lab` or `det` command | `lab stop`, `det stop`; delete the DLLs |
 
 ### Game code (`<game>\GameCode\`)
 
@@ -302,6 +304,24 @@ Windows volume mixer.
 
 Reference: [docs/AUDIO.md](docs/AUDIO.md).
 
+## Lab modules
+
+Two optional DLLs for measuring how the game behaves under recording and replay. Copy them to `<game>\_mod\` only if you
+want them; nothing runs until one of their commands is called, and they work in the console, the file bridge and the
+MCP `command` tool.
+
+- `InsideDev.ReplayLab.dll` (`lab help`, `lab list`, `lab l1` ... `lab l12`, `lab status`, `lab stop`, `lab out <dir>`):
+  twelve tests, each measuring one engine behaviour the recorder and the replay depend on (write order, skinning and
+  blur, physics at time scale 0, particles, Wwise output capture, random generators, forced cullers, update callbacks,
+  static shadows, shader time, ropes, camera-driven transforms). Each restores what it changed and writes a verdict,
+  `result.json`, a log and grabs to `<game>\_mod\replay_tests\<test>\`. The audio test L5 has stages that need InsideMuter
+  and the user's OK with headphones on; its passing stages write the flag files that unlock the muted capture paths.
+- `InsideDev.Det.dll` (`det ...`): the input replay determinism test at ChickenGun. It records the input of a run per
+  logic step, feeds it back in later runs and logs the scene per step to `<game>\_mod\det\<name>\`;
+  `tools\det_compare.py` compares runs.
+
+Reference: [docs/LAB.md](docs/LAB.md).
+
 ## Debugger
 
 The loader enables Mono's debugger agent on 127.0.0.1:55555, so dnSpy can attach (Debug → Attach → Unity (Connect));
@@ -325,6 +345,7 @@ with a complete `GameCode\` (see "Game code").
 GAME=/path/to/INSIDE sh build/build_mod.sh      # bin/InsideDev.dll
 GAME=/path/to/INSIDE sh build/build_mcp.sh      # bin/InsideDev.Mcp.dll + tools/mcp/InsideDev.McpStdio.exe
 GAME=/path/to/INSIDE sh build/build_play.sh     # bin/InsideDev.Play.dll (after build_mcp.sh)
+GAME=/path/to/INSIDE sh build/build_lab.sh      # bin/InsideDev.ReplayLab.dll + bin/InsideDev.Det.dll
 sh build/build_loader.sh                        # bin/version.dll
 sh build/build_readback.sh                      # bin/InsideReadback.dll (MinGW-w64 gcc, CC=...)
 sh build/build_muter.sh                         # tools/muter/InsideMuter.exe
@@ -337,6 +358,7 @@ sh build/build_muter.sh                         # tools/muter/InsideMuter.exe
 - `src\readback\`: the native readback plugin for MultiCam; `specs\`: example MultiCam specs
 - `src\muter\`: InsideMuter
 - `src\play\`: MCP character control and world tools
+- `src\replaylab\`, `src\det\`: the lab modules
 - `build\` — build scripts; `tools\` — MCP launcher, Cheat Engine table, atlas generator; `mods\` — example mods
 - `data\atlas\` — the level atlas
 - `docs\screenshots\` — the screenshots above
