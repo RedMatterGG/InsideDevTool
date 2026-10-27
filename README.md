@@ -14,6 +14,7 @@ with Cheat Engine.
 | `bin\version.dll` | game folder (next to `INSIDE.exe`) | proxy loader: forwards the real `version.dll`, boots InsideDev once the game's code has loaded |
 | `bin\InsideDev.dll` | `<game>\_mod\` | the editor |
 | `bin\InsideDev.Mcp.dll` | `<game>\_mod\` | optional: MCP server for AI assistants (see "AI assistants (MCP)") |
+| `bin\InsideDev.Play.dll` | `<game>\_mod\` | optional: MCP character control and world tools, needs `InsideDev.Mcp.dll` (see "MCP character control") |
 | `bin\InsideReadback.dll` | `<game>\INSIDE_Data\Plugins\` (with the game closed) | optional: faster frame capture for MultiCam (see "MultiCam") |
 | `tools\mcp\InsideDev.McpStdio.exe` | anywhere | optional: stdio launcher for MCP clients that start a local program |
 | `tools\mcp\clients\` | (reference) | optional: example MCP client configurations |
@@ -43,6 +44,10 @@ Nothing added in 0.7.0 runs until you call it or install the optional file that 
 | MCP server | on when `InsideDev.Mcp.dll` is installed, as before | `mcp on` | `mcp off` (saved as `mcp.enabled`) |
 | MCP token, tool allowlist | none, every tool | `mcp.token`, `mcp.tools` | |
 | MCP restore of the game | 600 s after the last tool call, 60 s after the last session closed | `mcp.idle_restore_s`, `mcp.restore_on_close_s` | `0` |
+| MCP character control | idle until a client calls a play tool | install `InsideDev.Play.dll` | `restore` tool, the MCP restore, or remove the DLL |
+| Step mode (game frozen between calls) | chosen by the first action call | `time {op:"step_mode"}` | `time {op:"realtime"}`, `restore` |
+| Notes hotkey (with Play) | Home | `play.notes_key=<KeyCode>` | `play.notes_key=none` |
+| Checkpoint jumps, save guard (with Play) | off | `play.cheats=1`, `play.save_guard=1` | |
 
 ### Game code (`<game>\GameCode\`)
 
@@ -119,6 +124,9 @@ streaming) · F3 solids · F4 labels
 F10 hidden · F11 diagnostics · Insert free camera · + / − / 0 zoom · [ ] \ time scale · middle mouse teleport ·
 ` console · Ctrl+Z / Ctrl+Y undo / redo · Ctrl+P palette.
 
+With `InsideDev.Play.dll`: Home flags a moment for the AI assistant (MCP `notes`; `play.notes_key` remaps it, `none`
+switches it off).
+
 ## Level atlas
 
 The game only has the levels it has streamed in. The atlas (`data\atlas\*.tsv`, copied to `<game>\_mod\atlas\`)
@@ -181,6 +189,7 @@ Client setup examples:
 
 ```
 Claude Code:     claude mcp add --transport http inside http://127.0.0.1:47811/mcp
+                 claude mcp add --transport http inside-play http://127.0.0.1:47811/mcp/play    (character control)
 Claude Desktop:  claude_desktop_config.json ->
                  { "mcpServers": { "inside": { "command": "C:\\path\\to\\InsideDev.McpStdio.exe" } } }   (escape \ as \\)
                  add "args": ["--profile", "play"] for the play profile
@@ -189,6 +198,38 @@ Other clients:   HTTP url http://127.0.0.1:47811/mcp, or the stdio command above
 
 Ready-made files for Claude Code, Claude Desktop, Cursor, VS Code, Codex and Gemini CLI are in `tools\mcp\clients\`.
 Full reference (every endpoint, setting, error code and dev tool): [docs/MCP.md](docs/MCP.md).
+
+## MCP character control
+
+`InsideDev.Play.dll` lets an AI assistant play INSIDE through MCP. It reads the world as JSON (the boy or the huddle,
+nearby objects with ids, kinds and actions, hazards, the checkpoint, a slice of the level geometry), presses the game's
+own controls for an exact number of logic steps, walks to a point, uses objects, waits for conditions, respawns at
+checkpoints, goes through menus, reads playbooks and records and replays input tracks. It is a feature on its own: it
+needs `InsideDev.Mcp.dll` and nothing else (no recorder, no MultiCam). Input goes into the game's input system, not
+the Windows keyboard, so the game window does not need focus.
+
+<a href="docs/screenshots/mcp-observe.jpg"><img width="100%" src="docs/screenshots/mcp-observe.jpg" alt="MCP play: what the agent sees (observe with object ids, geometry slice)"></a>
+
+- Install: `bin\InsideDev.Mcp.dll` and `bin\InsideDev.Play.dll` to `<game>\_mod\` (or `ext load` in the console while the
+  game runs). Connect the client to `http://127.0.0.1:47811/mcp/play` (stdio: `--profile play`).
+- Play tools (14): `observe`, `act`, `move_to`, `interact`, `wait_until`, `time`, `checkpoint`, `menu`, `screenshot`,
+  `guide`, `notes`, `restore`, `input_track`, `geometry`. Loop: `observe` -> `act` / `move_to` / `interact` ->
+  `wait_until` -> `observe`. Object ids die on every load: observe again after a load or death.
+- Clock: the first action call switches to step mode, in which the game is frozen between calls and runs only inside a
+  call, for exactly the steps the call asks for. `time {op:"realtime"}` lets it run normally, `restore` puts back the
+  clock, the input (your pad and keyboard work again) and every change the tools made.
+- The dev profile gains world tools: `level`, `stream`, `save`, `ui`, `camera`, `logic`, `body`, `hazard`, `audio`,
+  `render`, `reflect`, `state_diff`, `run_scenario`, and the shared `observe`, `time`, `wait_until`, `restore`,
+  `geometry`, `input_track` (33 dev tools, 40 on `/mcp/all`).
+- Without an MCP client: the console command `ctl` drives the boy (`ctl run right 1.2`, `ctl seq "R1.2 J R0.4+J"`,
+  `ctl status`, `ctl stop`), also through the file bridge and `POST /cmd`.
+- Off by default: `play.cheats` (checkpoint jumps), `play.save_guard` (save backups and confirms before save-writing
+  loads). Loads through the tools can write `INSIDE.sav` like normal play.
+- Pitfalls: a minimized game window pauses the game, so calls that need frames wait or time out; after a load, wait for
+  the requested checkpoint (`wait_until`, `level {op:"wait_ready"}`) before acting; the MCP restore after 600 s without
+  a tool call stops input track recordings; in step mode music-timed places drift from the music.
+
+Full reference with every parameter, workflows and pitfalls: [docs/PLAY.md](docs/PLAY.md).
 
 ## Scene recorder
 
@@ -283,6 +324,7 @@ with a complete `GameCode\` (see "Game code").
 ```
 GAME=/path/to/INSIDE sh build/build_mod.sh      # bin/InsideDev.dll
 GAME=/path/to/INSIDE sh build/build_mcp.sh      # bin/InsideDev.Mcp.dll + tools/mcp/InsideDev.McpStdio.exe
+GAME=/path/to/INSIDE sh build/build_play.sh     # bin/InsideDev.Play.dll (after build_mcp.sh)
 sh build/build_loader.sh                        # bin/version.dll
 sh build/build_readback.sh                      # bin/InsideReadback.dll (MinGW-w64 gcc, CC=...)
 sh build/build_muter.sh                         # tools/muter/InsideMuter.exe
@@ -294,6 +336,7 @@ sh build/build_muter.sh                         # tools/muter/InsideMuter.exe
 - `src\InsideDev\` — the editor; `src\mcp\` — MCP server and stdio launcher; `src\loader\` — the proxy loader
 - `src\readback\`: the native readback plugin for MultiCam; `specs\`: example MultiCam specs
 - `src\muter\`: InsideMuter
+- `src\play\`: MCP character control and world tools
 - `build\` — build scripts; `tools\` — MCP launcher, Cheat Engine table, atlas generator; `mods\` — example mods
 - `data\atlas\` — the level atlas
 - `docs\screenshots\` — the screenshots above
