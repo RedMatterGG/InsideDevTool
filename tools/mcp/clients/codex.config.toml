@@ -1,0 +1,24 @@
+# Codex CLI: merge into %USERPROFILE%\.codex\config.toml
+# stdio entries work before the game starts (only inside_status until the game answers).
+# A tool call can take up to 90 s through the stdio program: keep tool_timeout_sec above that.
+
+[mcp_servers.inside-play]
+command = 'C:\path\to\InsideDevTool\tools\mcp\InsideDev.McpStdio.exe'
+args = ["--profile", "play"]
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+
+[mcp_servers.inside-dev]
+command = 'C:\path\to\InsideDevTool\tools\mcp\InsideDev.McpStdio.exe'
+args = ["--profile", "dev"]
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+
+# With mcp.token set in the game, add to an entry:
+# env = { INSIDEDEV_MCP_TOKEN = "<token>" }
+
+# Streamable HTTP instead of stdio, for Codex versions that accept url entries:
+# [mcp_servers.inside-play-http]
+# url = "http://127.0.0.1:47811/mcp/play"
+# bearer_token_env_var = "INSIDEDEV_MCP_TOKEN"
+# tool_timeout_sec = 120

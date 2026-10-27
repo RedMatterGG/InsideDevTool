@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "inside-play": {
+      "httpUrl": "http://127.0.0.1:47811/mcp/play",
+      "timeout": 120000
+    },
+    "inside-dev-stdio": {
+      "command": "C:\\path\\to\\InsideDevTool\\tools\\mcp\\InsideDev.McpStdio.exe",
+      "args": ["--profile", "dev"],
+      "timeout": 120000
+    }
+  }
+}

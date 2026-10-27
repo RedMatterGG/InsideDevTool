@@ -16,6 +16,7 @@ with Cheat Engine.
 | `bin\InsideDev.Mcp.dll` | `<game>\_mod\` | optional: MCP server for AI assistants (see "AI assistants (MCP)") |
 | `bin\InsideReadback.dll` | `<game>\INSIDE_Data\Plugins\` (with the game closed) | optional: faster frame capture for MultiCam (see "MultiCam") |
 | `tools\mcp\InsideDev.McpStdio.exe` | anywhere | optional: stdio launcher for MCP clients that start a local program |
+| `tools\mcp\clients\` | (reference) | optional: example MCP client configurations |
 | `tools\muter\InsideMuter.exe` | `<game>\_mod\muter\` | optional, **mutes the game while it runs**: only for silent audio captures (see "Game audio capture") |
 | `specs\*.json` | anywhere | optional: example MultiCam specs |
 | `tools\cheatengine\InsideDev.CT` | anywhere | optional: Cheat Engine table |
@@ -39,6 +40,9 @@ Nothing added in 0.7.0 runs until you call it or install the optional file that 
 | Game audio capture (`acap`) | off; output `audible` (the sound plays normally) | `acap start <name>`, `srec record start ... audio=on` | `acap stop` |
 | Muted capture output | off | `acap output muted` (needs InsideMuter and a lab flag file) | `acap output audible` (saved as `acap.output`) |
 | InsideMuter | not running | start `InsideMuter.exe` (it then **mutes the game**) | it exits 10 s after the game; unmute INSIDE in the Windows volume mixer |
+| MCP server | on when `InsideDev.Mcp.dll` is installed, as before | `mcp on` | `mcp off` (saved as `mcp.enabled`) |
+| MCP token, tool allowlist | none, every tool | `mcp.token`, `mcp.tools` | |
+| MCP restore of the game | 600 s after the last tool call, 60 s after the last session closed | `mcp.idle_restore_s`, `mcp.restore_on_close_s` | `0` |
 
 ### Game code (`<game>\GameCode\`)
 
@@ -145,15 +149,33 @@ so an AI assistant or any MCP client can look at and edit the live game. Tested 
 standard protocol (versions 2024-11-05 to 2025-11-25), so other MCP clients should work too.
 
 - Endpoint: `http://127.0.0.1:47811/mcp` (Streamable HTTP). It listens on this computer only, never on the network.
+- Profiles (tool sets) by path: `/mcp` and `/mcp/dev` = dev (the editor tools below plus `jobs`), `/mcp/play` = play,
+  `/mcp/all` = both. The play and world tools come from `InsideDev.Play.dll`; without it the play profile only has
+  `screenshot`.
 - For clients that start a local program (stdio), point them at `tools\mcp\InsideDev.McpStdio.exe` (needs .NET
   Framework 4.x, built into Windows). It can be connected before the game is started: until INSIDE is running it
   offers only `inside_status`, and it tells the client when the game's tools appear or go away.
+  Options: `--profile play|dev|all` (default dev), `--port <n>`, `--url <endpoint>`, `--token <t>`.
 - Tools: `game_state`, `screenshot` (returns the image), `show_panel` (open a panel, move it to a dock, resize the
   dock), `find_objects`, `inspect`, `select`, `set_active`, `fsm_graph`, `fsm_find`, `fsm` (send event / force
   state / variables), `signal`, `log`, and `command` (any InsideDev bridge/console command, e.g. `help`, `near 10`,
   `history`, `undo`). Edits are recorded in History.
+- Jobs: a tool that runs over many frames holds the control lane as a job; a second one gets `busy` at once. `jobs`
+  (dev) lists, awaits and cancels jobs; requests with a progress token get progress over SSE; `notifications/cancelled`
+  stops a call. Every result is one JSON object with `ok` first (`error.code`, `hint`, `warnings` when they apply).
+- `screenshot` modes: preview (inline image), `marked` (with the ids of `observe`, needs Play) and `full` (file only,
+  resource `inside://shots/<file>`; the newest 200 are kept in `_mod\shots\`).
+- Plain endpoints for scripts without an MCP client: `POST /cmd` (one console command as the text body, the reply as
+  text), `GET /state` (the observe JSON, needs Play), `GET /ping`.
+- Restore: after a client has used the server, the game is put back 600 s after the last tool call
+  (`mcp.idle_restore_s`) and 60 s after the last session closed (`mcp.restore_on_close_s`); `0` switches either off.
+  Restore cancels the running job and undoes what the tools changed (panels opened by `show_panel`; with Play also the
+  clock, the input and the world tools' changes).
+- Access: `mcp.token` in `<game>\_mod\editor.cfg` requires `Authorization: Bearer <token>`; `mcp.tools` is an allowlist
+  (`tool`, `profile:*`, `profile:tool`, `*`; empty = every tool). Changing calls are logged to `_mod\mcp_audit.jsonl`.
 - In game: `mcp` (status), `mcp on|off`, `mcp port <n>`, `mcp selftest` then `mcp test` (a real HTTP session
   against the endpoint). Settings > Extensions shows the endpoint.
+  Also `mcp jobs`, `mcp providers`, `mcp restore`.
 
 Client setup examples:
 
@@ -161,8 +183,12 @@ Client setup examples:
 Claude Code:     claude mcp add --transport http inside http://127.0.0.1:47811/mcp
 Claude Desktop:  claude_desktop_config.json ->
                  { "mcpServers": { "inside": { "command": "C:\\path\\to\\InsideDev.McpStdio.exe" } } }   (escape \ as \\)
+                 add "args": ["--profile", "play"] for the play profile
 Other clients:   HTTP url http://127.0.0.1:47811/mcp, or the stdio command above (optional --port <n>)
 ```
+
+Ready-made files for Claude Code, Claude Desktop, Cursor, VS Code, Codex and Gemini CLI are in `tools\mcp\clients\`.
+Full reference (every endpoint, setting, error code and dev tool): [docs/MCP.md](docs/MCP.md).
 
 ## Scene recorder
 
@@ -250,8 +276,9 @@ postfx, gamecode, screenshot, …). Layout from scripts: `ui put <panel> left|ri
 
 ## Building
 
-Needs a .NET SDK (Roslyn `csc`), Mono's `mcs` for the stdio launcher and MinGW-w64 for the loader. `GAME` is the INSIDE
-folder with a complete `GameCode\` (see "Game code").
+Needs a .NET SDK (Roslyn `csc`) and MinGW-w64 for the loader. The stdio launcher and InsideMuter also need the .NET
+Framework 4.x reference assemblies (found automatically on Windows; set `NETFX` elsewhere). `GAME` is the INSIDE folder
+with a complete `GameCode\` (see "Game code").
 
 ```
 GAME=/path/to/INSIDE sh build/build_mod.sh      # bin/InsideDev.dll

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "inside-play": {
+      "command": "C:\\path\\to\\InsideDevTool\\tools\\mcp\\InsideDev.McpStdio.exe",
+      "args": ["--profile", "play"]
+    },
+    "inside-dev": {
+      "command": "C:\\path\\to\\InsideDevTool\\tools\\mcp\\InsideDev.McpStdio.exe",
+      "args": ["--profile", "dev"]
+    }
+  }
+}

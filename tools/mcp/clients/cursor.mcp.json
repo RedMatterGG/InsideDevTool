@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "inside-play": {
+      "url": "http://127.0.0.1:47811/mcp/play"
+    },
+    "inside-dev-stdio": {
+      "command": "C:\\path\\to\\InsideDevTool\\tools\\mcp\\InsideDev.McpStdio.exe",
+      "args": ["--profile", "dev"]
+    }
+  }
+}
