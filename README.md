@@ -7,6 +7,29 @@ with Cheat Engine.
 > Unofficial fan-made tool, not affiliated with or endorsed by Playdead. INSIDE is a trademark of Playdead.
 > This repository contains no game files or game code; you need your own copy of the game.
 
+## What's new in 0.7.0
+
+Every new part is off until you use it, and the defaults change nothing for an existing install: the game sound is never
+muted, nothing records, no camera moves, no new hotkey acts unless you install the module that has it.
+
+- **MCP character control** (`InsideDev.Play.dll`): an AI assistant plays the game through MCP. It sees the scene as data
+  (the boy, nearby objects with ids and actions, hazards, the checkpoint), moves with exact logic steps, walks to points,
+  uses objects, waits for conditions, handles checkpoints and menus, reads playbooks and records input tracks. It needs
+  only the MCP server.
+- **MCP server**: play / dev / all profiles, jobs with progress and cancel, one JSON result shape, a tool allowlist and
+  token, plain `/cmd`, `/state`, `/ping` endpoints for scripts, an automatic restore of the game.
+- **Scene recorder** (`srec`): records what moves in a scene into a take folder and plays it back in a frozen scene you can
+  fly through.
+- **MultiCam** (`mcam`): films one scene with many virtual cameras at once, or records it once and films every camera from
+  the recording; the Python compositor makes angle videos, layouts and cuts.
+- **Game audio capture** (`acap`): writes the game's sound output to WAV with sync markers. The optional InsideMuter
+  program is for silent captures only.
+- **Lab modules** (`InsideDev.ReplayLab.dll`, `InsideDev.Det.dll`): measurements of how the engine behaves under
+  recording and replay, and an input replay determinism test.
+- **Python tools and guide playbooks**: command-line control, recording and take tools, and playbooks for the MCP
+  `guide` tool.
+- **For AI agents**: [docs/AGENTS.md](docs/AGENTS.md) is the entry point; every feature has its own reference in `docs\`.
+
 ## Requirements and install
 
 | File in this repo | Copy to | What it is |
@@ -93,6 +116,14 @@ this project does not describe how to obtain them: dump them yourself and place 
 <tr>
 <td width="50%" valign="top"><a href="docs/screenshots/atlas-hidden.jpg"><img width="100%" src="docs/screenshots/atlas-hidden.jpg" alt="Level atlas: switched-off objects in every level"></a><br><b>Level atlas: switched-off objects in every level</b></td>
 <td width="50%" valign="top"><a href="docs/screenshots/atlas-inspector.jpg"><img width="100%" src="docs/screenshots/atlas-inspector.jpg" alt="Level atlas in the Inspector: dead wires, who switches an object on"></a><br><b>Level atlas in the Inspector: dead wires, who switches an object on</b></td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="docs/screenshots/mcp-observe.jpg"><img width="100%" src="docs/screenshots/mcp-observe.jpg" alt="MCP play: what the agent sees (observe with object ids, geometry slice)"></a><br><b>MCP play: what the agent sees (observe with object ids, geometry slice)</b></td>
+<td width="50%" valign="top"><a href="docs/screenshots/multicam-layout.jpg"><img width="100%" src="docs/screenshots/multicam-layout.jpg" alt="MultiCam: one recorded take, game camera plus three tracking cameras in one layout"></a><br><b>MultiCam: one recorded take, game camera plus three tracking cameras in one layout</b></td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="docs/screenshots/multicam-game-vs-director.jpg"><img width="100%" src="docs/screenshots/multicam-game-vs-director.jpg" alt="Game camera vs director camera at the same recorded moment"></a><br><b>Game camera vs director camera at the same recorded moment</b></td>
+<td width="50%" valign="top"></td>
 </tr>
 </table>
 
@@ -351,6 +382,13 @@ playbooks were written from the game's code and are mostly not verified in play.
 
 Reference: [docs/TOOLS.md](docs/TOOLS.md).
 
+## For AI agents
+
+[docs/AGENTS.md](docs/AGENTS.md) is the entry point for an AI agent: what each part does, how to switch it on and off,
+which document to read for a task, the common workflows and the pitfalls that cost the most time. Every feature has a
+full reference: [MCP.md](docs/MCP.md), [PLAY.md](docs/PLAY.md), [RECORD_REPLAY.md](docs/RECORD_REPLAY.md),
+[MULTICAM.md](docs/MULTICAM.md), [AUDIO.md](docs/AUDIO.md), [LAB.md](docs/LAB.md), [TOOLS.md](docs/TOOLS.md).
+
 ## Debugger
 
 The loader enables Mono's debugger agent on 127.0.0.1:55555, so dnSpy can attach (Debug → Attach → Unity (Connect));
@@ -392,7 +430,7 @@ sh build/build_muter.sh                         # tools/muter/InsideMuter.exe
 - `tools\*.py`: Python tools; `guide\`: playbooks for the MCP `guide` tool
 - `data\atlas\` — the level atlas
 - `docs\screenshots\` — the screenshots above
-- `docs\`: references and design notes
+- `docs\`: references and design notes (for AI agents start with `docs\AGENTS.md`)
 
 ## Removed features
 
