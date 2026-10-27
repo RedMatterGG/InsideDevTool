@@ -1,4 +1,4 @@
-# INSIDE runtime editor (InsideDev 0.6.0)
+# INSIDE runtime editor (InsideDev 0.7.0)
 
 An in-game editor and explorer for Playdead's INSIDE (Unity 5.0.4f1): browse and edit the live scene, see how
 objects, signals, PlayMaker state machines, code and audio are connected, record changes as mods, and inspect memory
@@ -420,7 +420,8 @@ sh build/build_muter.sh                         # tools/muter/InsideMuter.exe
 
 ## Folder layout
 
-- `bin\` — prebuilt `version.dll`, `InsideDev.dll`, `InsideDev.Mcp.dll`
+- `bin\` — prebuilt `version.dll`, `InsideDev.dll`, `InsideDev.Mcp.dll`, `InsideDev.Play.dll`, `InsideDev.ReplayLab.dll`,
+  `InsideDev.Det.dll`, `InsideReadback.dll`
 - `src\InsideDev\` — the editor; `src\mcp\` — MCP server and stdio launcher; `src\loader\` — the proxy loader
 - `src\readback\`: the native readback plugin for MultiCam; `specs\`: example MultiCam specs
 - `src\muter\`: InsideMuter

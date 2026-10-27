@@ -5,7 +5,7 @@
 set -e
 : "${GAME:?set GAME to the INSIDE folder}"
 G="$GAME/GameCode"; M="$GAME/INSIDE_Data/Managed"
-CSC=${CSC:-$(ls /usr/lib/dotnet/sdk/*/Roslyn/bincore/csc.dll 2>/dev/null | head -1)}
+CSC=${CSC:-$(ls /usr/lib/dotnet/sdk/*/Roslyn/bincore/csc.dll "/c/Program Files/dotnet/sdk/"*/Roslyn/bincore/csc.dll 2>/dev/null | tail -1)}
 for f in Assembly-CSharp.dll Assembly-CSharp-firstpass.dll UnityEngine.dll PlayMaker.dll; do
   [ -f "$G/$f" ] || { echo "missing $G/$f (see README: Game code)"; exit 1; }
 done
