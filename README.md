@@ -22,6 +22,15 @@ with Cheat Engine.
 Start the game normally; **F1** opens the editor. Settings, logs, mods and caches live in `<game>\_mod\`.
 To uninstall, delete `version.dll` from the game folder (and `_mod\` if you want the settings gone).
 
+### Switches and defaults
+
+Nothing added in 0.7.0 runs until you call it or install the optional file that has it. Settings are `key=value` lines in
+`<game>\_mod\editor.cfg`; the game reads the file once at start, so edit it with the game closed.
+
+| Feature | Default | On | Off |
+|---|---|---|---|
+| Scene recorder and viewer (`srec`) | off | `srec record start <dir>`, `srec load <dir>` | `srec record stop`, `srec end` |
+
 ### Game code (`<game>\GameCode\`)
 
 Players using the prebuilt DLLs in `bin\` need nothing extra: the editor reads the game's code from memory while the
@@ -146,6 +155,23 @@ Claude Desktop:  claude_desktop_config.json ->
 Other clients:   HTTP url http://127.0.0.1:47811/mcp, or the stdio command above (optional --port <n>)
 ```
 
+## Scene recorder
+
+The scene recorder writes what moves in a scene (transforms, bones, particles, lights, materials, the game camera and
+timed events) into a take folder (`scene.srec` plus CSV and JSON sidecars). The recording viewer then holds the frozen
+scene at any time of the recording while you fly the free camera, so a take can be scrubbed and looked at from any side.
+
+- Bridge commands (the file bridge or the MCP `command` tool): `srec record start <dir> [key=value ...]`,
+  `srec record stop [keep]`, `srec record status`, `srec event <name>`, `srec load <dir> [t=<time>]`, `srec play [speed]`,
+  `srec pause`, `srec seek <t|@event>`, `srec step next|back|<s>`, `srec end`, `srec objects [filter]`, `srec probe [n]`,
+  `srec status`.
+- Nothing records until `srec record start`; `srec end` releases the viewer (the scene stays at the last sample;
+  `restore=reload` on `srec load` reloads the savepoint instead).
+- Pitfalls: start a recording only after the load has finished (`state` shows the requested savepoint); a minimized
+  game window pauses the game; objects spawned at run time replay only in the game session that recorded them.
+
+Reference: [docs/RECORD_REPLAY.md](docs/RECORD_REPLAY.md); design notes: [docs/REPLAY_DESIGN.md](docs/REPLAY_DESIGN.md).
+
 ## Debugger
 
 The loader enables Mono's debugger agent on 127.0.0.1:55555, so dnSpy can attach (Debug → Attach → Unity (Connect));
@@ -177,6 +203,7 @@ sh build/build_loader.sh                        # bin/version.dll
 - `build\` — build scripts; `tools\` — MCP launcher, Cheat Engine table, atlas generator; `mods\` — example mods
 - `data\atlas\` — the level atlas
 - `docs\screenshots\` — the screenshots above
+- `docs\`: references and design notes
 
 ## Removed features
 
