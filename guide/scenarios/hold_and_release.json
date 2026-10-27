@@ -1,0 +1,12 @@
+{
+  "name": "hold right through waits",
+  "description": "Latch the stick right, let 90 steps pass, release, then check the body has stopped (vx near 0).",
+  "steps": [
+    {"do": "until", "until": {"controllable": true}, "within_s": 10},
+    {"do": "hold", "stick": [1, 0]},
+    {"do": "wait", "steps": 90},
+    {"do": "release"},
+    {"do": "wait", "seconds": 0.5},
+    {"do": "expect", "path": "body.vx", "cmp": "le", "value": 0.5, "tol": 0.1, "label": "stopped after release"}
+  ]
+}

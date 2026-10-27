@@ -15,11 +15,13 @@ with Cheat Engine.
 | `bin\InsideDev.dll` | `<game>\_mod\` | the editor |
 | `bin\InsideDev.Mcp.dll` | `<game>\_mod\` | optional: MCP server for AI assistants (see "AI assistants (MCP)") |
 | `bin\InsideDev.Play.dll` | `<game>\_mod\` | optional: MCP character control and world tools, needs `InsideDev.Mcp.dll` (see "MCP character control") |
+| `guide\` | `<game>\_mod\guide\` | optional: playbooks for the MCP `guide` tool (see "Python tools and guide playbooks") |
 | `bin\InsideDev.ReplayLab.dll`, `bin\InsideDev.Det.dll` | `<game>\_mod\` | optional: lab modules (see "Lab modules") |
 | `bin\InsideReadback.dll` | `<game>\INSIDE_Data\Plugins\` (with the game closed) | optional: faster frame capture for MultiCam (see "MultiCam") |
 | `tools\mcp\InsideDev.McpStdio.exe` | anywhere | optional: stdio launcher for MCP clients that start a local program |
 | `tools\mcp\clients\` | (reference) | optional: example MCP client configurations |
 | `tools\muter\InsideMuter.exe` | `<game>\_mod\muter\` | optional, **mutes the game while it runs**: only for silent audio captures (see "Game audio capture") |
+| `tools\*.py` | anywhere | optional: Python tools (see "Python tools and guide playbooks") |
 | `specs\*.json` | anywhere | optional: example MultiCam specs |
 | `tools\cheatengine\InsideDev.CT` | anywhere | optional: Cheat Engine table |
 | `mods\*.json` | `<game>\_mod\mods\` | optional: example mods (enable them in the Mods panel) |
@@ -322,6 +324,33 @@ MCP `command` tool.
 
 Reference: [docs/LAB.md](docs/LAB.md).
 
+## Python tools and guide playbooks
+
+`tools\*.py` need Python 3.9 or newer; run them from the repository folder as `python -I tools/<script>.py`. None of them
+starts or patches the game, and none has a built-in path of a particular machine (paths are arguments or environment
+variables: `INSIDE_GAME`, `INSIDE_BRIDGE`, `FFMPEG`, `INSIDE_LEVEL_INDEX`).
+
+| Script | What it does |
+|---|---|
+| `inside_ctl.py` | console and bridge commands from a command line (`POST /cmd`, the file bridge as fallback): `ctl` jobs, `state`, `seq`, `repl` |
+| `srec_tool.py` | reads and verifies `scene.srec` recordings, reports spec events and content checks (standard library only) |
+| `mcam_spec_check.py` | offline lint of MultiCam specs, segment table, cost and disk estimate (standard library only) |
+| `mcam_compose.py`, `mcam_take.py` | angle videos, layouts, director blocks and cuts from a take (H.265) |
+| `mcam_qa.py`, `mcam_track_check.py`, `fast_review.py` | take checks with exit codes, contact sheets, the replay golden test, subject tracking, review frames |
+| `mcam_previews.py` | stills of every camera of a replay spec at every beat, from a recording in the running game |
+| `mcam_audio.py` | fixes, aligns and checks captured WAV files, builds a take's sound track (never plays audio) |
+| `det_compare.py` | compares `det` runs by logic step (standard library only) |
+
+The compositor and QA need numpy, opencv-python, Pillow, numba, matplotlib and ffmpeg (NVENC / NVDEC by default;
+`--codec x265` and `--cpu` without an NVIDIA GPU).
+
+`guide\` holds Markdown playbooks for an AI that plays the game: every area (forest, farm, city, sewers, offices, mines,
+lab, huddle), the mechanics, safety rules, secrets, and two example scenarios for `run_scenario`. Copy it to
+`<game>\_mod\guide\` for the MCP `guide` tool; `play.guide_max` (`hint`, `steps`, `solution`) caps the spoilers. The
+playbooks were written from the game's code and are mostly not verified in play.
+
+Reference: [docs/TOOLS.md](docs/TOOLS.md).
+
 ## Debugger
 
 The loader enables Mono's debugger agent on 127.0.0.1:55555, so dnSpy can attach (Debug → Attach → Unity (Connect));
@@ -360,6 +389,7 @@ sh build/build_muter.sh                         # tools/muter/InsideMuter.exe
 - `src\play\`: MCP character control and world tools
 - `src\replaylab\`, `src\det\`: the lab modules
 - `build\` — build scripts; `tools\` — MCP launcher, Cheat Engine table, atlas generator; `mods\` — example mods
+- `tools\*.py`: Python tools; `guide\`: playbooks for the MCP `guide` tool
 - `data\atlas\` — the level atlas
 - `docs\screenshots\` — the screenshots above
 - `docs\`: references and design notes

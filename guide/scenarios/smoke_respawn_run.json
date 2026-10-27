@@ -1,0 +1,17 @@
+{
+  "name": "smoke: respawn, run, jump",
+  "description": "Respawn at the current checkpoint (no save write), run right 2 s, jump, land, check the body is alive. Works anywhere the boy can run right.",
+  "stop_on_fail": true,
+  "steps": [
+    {"do": "load", "mode": "reload_respawn", "label": "respawn here"},
+    {"do": "until", "until": {"controllable": true}, "within_s": 20},
+    {"do": "observe", "label": "start"},
+    {"do": "press", "stick": [1, 0], "steps": 120, "label": "run right 2 s"},
+    {"do": "press", "stick": [1, 0], "jump": true, "steps": 20, "label": "jump"},
+    {"do": "until", "until": {"grounded": true}, "within_s": 5},
+    {"do": "expect", "path": "body.dead", "value": false},
+    {"do": "expect", "path": "screen", "value": "in_world"},
+    {"do": "capture", "shot": "full"},
+    {"do": "note", "text": "smoke_respawn_run finished"}
+  ]
+}

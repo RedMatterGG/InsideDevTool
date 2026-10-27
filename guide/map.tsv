@@ -1,0 +1,85 @@
+# subscene	scene	group	level	savepoints	chapter_savepoints
+# generated from the game code (subscene index; 57/57 chapter checks OK)
+0	#gamestart_Gameplay	forest	level114	1	0
+1	#forestReveal_Gameplay	forest	level216	1	0
+2	#riverWithDog_Gameplay	forest	level222	1	0
+3	#SentryTruckChase_Gameplay	forest	level80	1	0
+4	#finalChase_Gameplay	forest	level78	1	0
+5	#lake_Gameplay	forest	level162	2	0
+6	#fields_Gameplay	farm	level150	1	0
+7	#chickenGun_Gameplay	farm	level171	1	0
+8	#pigJump_Gameplay	farm	level104	1	0
+9	#wormSwamp_Gameplay	farm	level158	1	0
+10	#pigFight_Gameplay	farm	level38	2	0
+11	#noMansLand_Gameplay	farm	level151	2	0
+12	#factoryWithCorpses_Gameplay	city	level210	1	0
+13	#3D_crane_Gameplay	city	level22	2	
+14	#pushDownSafe_Gameplay	city	level201	1	0
+15	#mindhatBasement_Gameplay	city	level119	2	0
+16	#Ruined_Structure_Gameplay	city	level165	0	
+17	#rooftops2New_Gameplay	city	level198	3	0
+18	#Old_Sentry_Room_Gameplay	city	level74	4	0,1,3
+19	#lineup_Gameplay	city	level32	3	
+20	#lineupHulvChase_Gameplay	city	level219	1	
+21	#mindHatWagon_Gameplay	city	level236	4	0
+22	#mindHatJumpIntoWater_Gameplay	city	level96	1	0
+23	#waterLockDoors_GamePlay	sewers	level51	2	0
+24	#hideInShadows_GamePlay	sewers	level202	3	0
+25	#sewerPoopWater2_GamePlay	sewers	level145	2	1
+26	#hulvesInSewer_GamePlay	sewers	level232	1	
+27	#dogChaseAndFenceSewers_GamePlay	sewers	level13	1	
+28	#stealSubmarine_Gameplay	sewers	level3	2	0,1
+29	#submarineBigRoom_GamePlay	sewers	level59	2	0
+30	#submergedChamber_GamePlay	sewers	level93	7	0,3,6
+31	#SubmarineSecret_Gameplay	sewers	level82	2	
+32	#SubmarineAndWaterHeight_GamePlay	sewers	level233	1	
+33	#SubmarineAndGirl_Gameplay	sewers	level178	3	1
+34	#forcePush_Logic	mines	level107	0	
+35	#beachToMines_Gameplay	mines	level10	1	0
+36	#cliffOpening_Gameplay	mines	level124	0	
+37	#albinosInMineWagon_Gameplay	mines	level224	3	
+38	#cargoLift_Gameplay	mines	level250	6	4
+39	#mindhatDetach_Gameplay	mines	level122	5	4
+40	#albinoPushBlock_Gameplay	mines	level92	2	
+41	#AlbinosInTank_Gameplay	mines	level67	3	
+42	#hulvSecretLadder_Gameplay	mines	level44	0	
+43	#HulvesAndTorchSecret_Gameplay	mines	level46	1	
+44	#mineExit_Gameplay	mines	level33	0	
+45	#shockwaveEntrance_Gameplay	mines	level41	0	
+46	#forcePushGetWagon_Gameplay	mines	level177	1	0
+47	#forcePushRotator_Gameplay	mines	level103	2	0
+48	#forcePushMovingCover_Gameplay	mines	level27	3	0
+49	#flushTunnel_Logic	lab	level61	0	
+50	#ElevatorRide_Gameplay	lab	level211	2	0
+51	#LabEntrance_Gameplay	lab	level18	1	0
+52	#EntranceLanding_Gameplay	lab	level54	1	
+53	#fixedJetCratesAndHatch_Gameplay	lab	level142	2	0,1
+54	#GirlInWater_Gameplay	lab	level112	2	1
+55	#GirlExplore_Gameplay	lab	level194	2	0
+56	#GirlInWaterPart2_Gameplay	lab	level60	1	0
+57	#diveToLab_Gameplay	lab	level218	1	0
+58	#labEntranceFlush2_Gameplay	lab	level84	2	0,1
+59	#rotateTheShadow_GamePlay	lab	level220	4	0,3
+60	#bigJumpInWater_Gameplay	lab	level72	0	
+61	#GetJetCrateFree_Gameplay	lab	level75	5	0
+62	#JetCrateToCeilingWater_Gameplay	lab	level69	2	0
+63	#CargoHall_Gameplay	lab	level76	3	0
+64	#WaterGuardStorage_Gameplay	offices	level85	1	0
+65	#AlbinosOnElevator_Gameplay	offices	level146	2	0
+66	#HuddleApproach_Gameplay	offices	level128	2	0
+67	#Courtyard_Exterior_Gameplay	offices	level5	1	
+68	#EducationRooms_Gameplay	offices	level57	2	0
+69	#waterOnCeilingAndSwing_Gameplay	offices	level91	3	0,2
+70	#HeadExplodeSecret_Gameplay	offices	level190	0	
+71	#HuddleChamber_Gameplay	offices	level153	1	0
+72	#HuddleVentCollapse_Gameplay	huddle	level47	1	0
+73	#huddleCafeteria_Gameplay	huddle	level196	1	
+74	#huddleCeoFallAndDogs_Gameplay	huddle	level214	2	0
+75	#huddleStickAndLift_Gameplay	huddle	level246	0	
+76	#huddleGarbageRoom_Gameplay	huddle	level63	1	0
+77	#huddleAndOven_Gameplay	huddle	level139	1	0
+78	#huddleAndPendulum_Gameplay	huddle	level43	1	0
+79	#huddleJetCrateAndHelper_Gameplay	huddle	level71	1	0
+80	#huddleTrap_Gameplay	huddle	level90	2	0,1
+81	#happyHuddle_Gameplay	huddle	level130	0	
+82	#huddleNorway_Gamelogic	huddle	level137	0	
