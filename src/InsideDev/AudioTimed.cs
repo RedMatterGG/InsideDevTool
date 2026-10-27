@@ -115,7 +115,7 @@ namespace InsideDev
         // LateUpdate: owners call checker.Update() in their Update, so the flag is visible now
         public static void LateUpdate()
         {
-            Scan();   // background refresh (every 3s) so TIMED firings are logged even when the tab is closed
+            if (DevCore.BackgroundOk) Scan();   // background refresh (every 60 s or after streaming) so TIMED firings are logged even when the tab is closed
             float now = Time.realtimeSinceStartup;
             foreach (var s in systems)
             {

@@ -30,6 +30,20 @@ namespace InsideDev
         float fps, fpsAcc; int fpsFrames;
         float nextBeat;
         public float unityUpdateRT = -100f; public bool fallbackUpdLogged;
+        public static bool quietBackground;   // set by the replay record pass: background scanners (object database, reference index, audio refs, hidden scans, code deps, spawn cache) wait until it ends
+        // Background scanners (object database, reference index, sound library, audio database and reference scan, hidden scans,
+        // code deps, spawn cache, live savepoints, timed-audio and catalog scans) cost 30-170 ms of main thread each: they wait while
+        // mcam, an srec recording or viewer, or the readback test runs, and until streaming has been quiet for Levels.BackgroundSettle
+        public static bool BackgroundOk
+        {
+            get
+            {
+                if (quietBackground || MultiCam.Running || MultiCamReadbackTest.running || SceneRecorder.active != null) return false;
+                var r = SceneReplayer.current;
+                if (r != null && r.active) return false;
+                return Time.realtimeSinceStartup - Levels.StreamChangedAt >= Levels.BackgroundSettle;
+            }
+        }
 
         public DevCore()
         {
@@ -67,7 +81,7 @@ namespace InsideDev
         {
             Perf.Run("Shockwave", Shockwave.LateUpdate);
             Perf.Run("AudioTimed", AudioTimed.LateUpdate);
-            Perf.Run("AudioCatalog", AudioCatalog.AutoRecord);
+            if (BackgroundOk) Perf.Run("AudioCatalog", AudioCatalog.AutoRecord);
             CameraControl.Apply();
             Perf.Run("RenderScale", RenderScale.Tick);
         }
@@ -87,8 +101,9 @@ namespace InsideDev
                 }
                 EditorInput.Poll();
                 EditorState.Tick();
+                bool capLock = MultiCamSession.active && MultiCamSession.locked;
                 if (EditorInput.Key(KeyCode.F1)) { panel = !panel; ui.focus = null; }
-                if (EditorInput.ctrl && (Input.GetKeyDown(KeyCode.P) || Input.GetKeyDown(KeyCode.K)) && (ui.focus == null || ui.focus == "palette_q")) { CommandPalette.Toggle(ui); if (CommandPalette.open) panel = true; }
+                if (EditorInput.ctrl && !capLock && (Input.GetKeyDown(KeyCode.P) || Input.GetKeyDown(KeyCode.K)) && (ui.focus == null || ui.focus == "palette_q")) { CommandPalette.Toggle(ui); if (CommandPalette.open) panel = true; }
                 if (EditorInput.ctrl && !InputCapture.keyboard && EditorInput.Key(KeyCode.Z)) DevLog.Write("[history] " + (EditorInput.shift ? ChangeRecorder.Redo() : ChangeRecorder.Undo()));
                 if (EditorInput.ctrl && !InputCapture.keyboard && EditorInput.Key(KeyCode.Y)) DevLog.Write("[history] " + ChangeRecorder.Redo());
                 if (EditorInput.Key(KeyCode.BackQuote)) { ShowTab(TabConsoleI); ui.focus = "con"; }
@@ -122,37 +137,38 @@ namespace InsideDev
                 CameraControl.Update(ui.mouseOverUI);
                 RenderHost.MarkUiBuild(panel);
                 Perf.editorOpen = panel;
-                Perf.Run("ObjectDatabase", () => ObjectDatabase.Tick(panel));
+                bool bg = BackgroundOk;
+                if (bg) Perf.Run("ObjectDatabase", () => ObjectDatabase.Tick(panel));
                 Perf.Run("Selection", Selection.Tick);
                 // browser-style history: Alt+Left / Alt+Right, or the mouse back / forward side buttons
-                if ((EditorInput.alt && EditorInput.Key(KeyCode.LeftArrow)) || Input.GetMouseButtonDown(3)) Selection.Back();
-                if ((EditorInput.alt && EditorInput.Key(KeyCode.RightArrow)) || Input.GetMouseButtonDown(4)) Selection.Forward();
+                if (!capLock && ((EditorInput.alt && EditorInput.Key(KeyCode.LeftArrow)) || Input.GetMouseButtonDown(3))) Selection.Back();
+                if (!capLock && ((EditorInput.alt && EditorInput.Key(KeyCode.RightArrow)) || Input.GetMouseButtonDown(4))) Selection.Forward();
                 Perf.Run("EventMonitor", EventMonitor.Tick);
-                Perf.Run("SoundLibrary", SoundLibrary.Tick);
+                if (bg) Perf.Run("SoundLibrary", SoundLibrary.Tick);
                 Perf.Run("ChangeRecorder", ChangeRecorder.Tick);
                 Perf.Run("Mods", Mods.Tick);
                 Perf.Run("AudioTrace", AudioTrace.Tick);
-                Perf.Run("AudioDb", AudioDb.Tick);
+                if (bg) Perf.Run("AudioDb", AudioDb.Tick);
                 Perf.Run("AudioRules", AudioRules.BootTick);
-                Perf.Run("HiddenScan", PassiveHidden.Tick);
-                Perf.Run("AudioRefScan", AudioRefScan.Tick);
-                Perf.Run("CodeDeps", CodeDeps.Tick);
+                if (bg) Perf.Run("HiddenScan", PassiveHidden.Tick);
+                if (bg) Perf.Run("AudioRefScan", AudioRefScan.Tick);
+                if (bg) Perf.Run("CodeDeps", CodeDeps.Tick);
                 Perf.Run("Logic", LogicPanel.Tick);
                 Perf.Run("ModifiedPanel", ModifiedPanel.Tick);
-                Perf.Run("ReferenceIndex", ReferenceIndex.Tick);
+                if (bg) Perf.Run("ReferenceIndex", ReferenceIndex.Tick);
                 Perf.Run("CustomSpawns", CustomSpawns.Tick);
                 Perf.Run("Gizmo", () => TransformGizmo.Update(ui.mouseOverUI));
                 Perf.Run("WorldPick", () => WorldPick.Update(ui.mouseOverUI, panel));
-                if (EditorInput.down[2] && !ui.mouseOverUI) TeleportToMouse();
+                if (EditorInput.down[2] && !ui.mouseOverUI && !capLock) TeleportToMouse();
                 Perf.Run("Overlay", overlay.Update);
                 Perf.Run("Levels", Levels.ScanStreaming);
-                Perf.Run("LiveSavepoints", RefreshLiveSavepoints);
+                if (bg) Perf.Run("LiveSavepoints", RefreshLiveSavepoints);
                 Perf.Run("Discovery", Discovery.Update);
                 Perf.Run("Bridge", () => Remote.Update(this));
                 Perf.Run("Extensions", () => { Extensions.LoadAll(this); Extensions.Tick(this); });
                 Perf.Run("AudioSpy", () => { if (AudioSpy.Instance == null || !(SoundEngine.GetImplementationDebug() is AudioSpy)) { if (Time.realtimeSinceStartup > nextAudioTry) { nextAudioTry = Time.realtimeSinceStartup + 2f; AudioSpy.Install(); } } });
-                Perf.Run("HiddenScan", TickHidden);
-                Perf.Run("SpawnCache", SpawnCache.Scan);
+                if (bg) Perf.Run("HiddenScan", TickHidden);
+                if (bg) Perf.Run("SpawnCache", SpawnCache.Scan);
             }
             catch (Exception e) { DevLog.Error("Update", e); }
         }
@@ -1173,7 +1189,12 @@ namespace InsideDev
     {
         static readonly CultureInfo IC = CultureInfo.InvariantCulture;
 
-        public static void Run(string line, DevCore root)
+        public static void Run(string line, DevCore root) { Run(line, root, true); }
+
+        // extensions: a word the console does not know goes to the loaded extensions' Command handlers (the way the
+        // bridge asks them), tokenised like the bridge (Words = Remote.Split: quotes group words); the bridge passes
+        // false because it asked them already
+        public static void Run(string line, DevCore root, bool extensions)
         {
             var a = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
             string c = a[0].ToLowerInvariant();
@@ -1306,7 +1327,13 @@ namespace InsideDev
                         break;
                     }
                 case "clear": lock (DevLog.Lines) DevLog.Lines.Clear(); break;
-                default: DevLog.Write("unknown command '" + c + "' — try help"); break;
+                default:
+                    {
+                        string reply = extensions ? Extensions.Command(Words(line), root) : null;
+                        if (reply != null) DevLog.Write(reply);
+                        else DevLog.Write("unknown command '" + c + "' — try help");
+                        break;
+                    }
             }
         }
 
@@ -1314,6 +1341,19 @@ namespace InsideDev
         {
             s = s.ToLowerInvariant();
             return s == "on" || s == "1" || s == "true" || s == "yes";
+        }
+
+        static List<string> Words(string line)
+        {
+            var r = new List<string>(); var sb = new System.Text.StringBuilder(); bool q = false;
+            foreach (char ch in line)
+            {
+                if (ch == '"') { q = !q; continue; }
+                if (!q && (ch == ' ' || ch == '	')) { if (sb.Length > 0) { r.Add(sb.ToString()); sb.Length = 0; } continue; }
+                sb.Append(ch);
+            }
+            if (sb.Length > 0) r.Add(sb.ToString());
+            return r;
         }
     }
 

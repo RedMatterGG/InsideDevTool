@@ -14,7 +14,9 @@ with Cheat Engine.
 | `bin\version.dll` | game folder (next to `INSIDE.exe`) | proxy loader: forwards the real `version.dll`, boots InsideDev once the game's code has loaded |
 | `bin\InsideDev.dll` | `<game>\_mod\` | the editor |
 | `bin\InsideDev.Mcp.dll` | `<game>\_mod\` | optional: MCP server for AI assistants (see "AI assistants (MCP)") |
+| `bin\InsideReadback.dll` | `<game>\INSIDE_Data\Plugins\` (with the game closed) | optional: faster frame capture for MultiCam (see "MultiCam") |
 | `tools\mcp\InsideDev.McpStdio.exe` | anywhere | optional: stdio launcher for MCP clients that start a local program |
+| `specs\*.json` | anywhere | optional: example MultiCam specs |
 | `tools\cheatengine\InsideDev.CT` | anywhere | optional: Cheat Engine table |
 | `mods\*.json` | `<game>\_mod\mods\` | optional: example mods (enable them in the Mods panel) |
 | `data\atlas\*.tsv` | `<game>\_mod\atlas\` | optional: level atlas (see "Level atlas") |
@@ -30,6 +32,9 @@ Nothing added in 0.7.0 runs until you call it or install the optional file that 
 | Feature | Default | On | Off |
 |---|---|---|---|
 | Scene recorder and viewer (`srec`) | off | `srec record start <dir>`, `srec load <dir>` | `srec record stop`, `srec end` |
+| MultiCam (`mcam`) | off | `mcam start\|take\|replay ...` | `mcam stop`, `mcam abort` |
+| Camera and frame helpers (`cam`, `hud`, `clean`, `gamma`, `seed`) | off | `cam pose ...`, `hud off`, `clean on`, `gamma <v>`, `seed <n>` | `cam off`, `hud on`, `clean off`, `gamma reset` (`seed` cannot be undone) |
+| Native readback plugin | not installed | copy `InsideReadback.dll` | delete it, or `output.readback: "readpixels"` in a spec |
 
 ### Game code (`<game>\GameCode\`)
 
@@ -172,6 +177,36 @@ scene at any time of the recording while you fly the free camera, so a take can 
 
 Reference: [docs/RECORD_REPLAY.md](docs/RECORD_REPLAY.md); design notes: [docs/REPLAY_DESIGN.md](docs/REPLAY_DESIGN.md).
 
+## MultiCam
+
+MultiCam films one scene with many cameras at once. A JSON spec describes the cameras (static, follow, orbit, rails,
+director shots, overview, event-driven), cues, slow motion, motion blur and the output; `mcam` runs it in the game and
+writes one video (or frame folder) per camera with pose and event logs. Replay mode records the scene once and then
+films every camera from the recording, one pass per camera, so every angle shows the same performance.
+
+<table>
+<tr>
+<td width="50%" valign="top"><a href="docs/screenshots/multicam-layout.jpg"><img width="100%" src="docs/screenshots/multicam-layout.jpg" alt="MultiCam: one recorded take, game camera plus three tracking cameras in one layout"></a><br><b>One recorded take, game camera plus three tracking cameras in one layout</b></td>
+<td width="50%" valign="top"><a href="docs/screenshots/multicam-game-vs-director.jpg"><img width="100%" src="docs/screenshots/multicam-game-vs-director.jpg" alt="Game camera vs director camera at the same recorded moment"></a><br><b>Game camera vs director camera at the same recorded moment</b></td>
+</tr>
+</table>
+
+- Commands: `mcam check <spec>`, `mcam preview <spec> <out> [t]`, `mcam rehearse <spec> <out>`, `mcam start <spec> <out>`,
+  `mcam take <spec> <out>` (record once, then every camera), `mcam replay`, `mcam golden`, `mcam status`, `mcam stop`,
+  `mcam abort`, `mcam show <camera> [t]`.
+- Helpers: `cam pose x y z yaw pitch [fov] [seconds] [roll]`, `cam json [name]` (prints the current view as a spec
+  camera), `cam off`; `clean on|off` (every editor overlay off for clean frames, and back); `hud on|off`;
+  `gamma <0..1>|reset`; `seed <n>` (repeatable game randomness).
+- A run saves and restores the session (input lock, overlays, vsync, resolution); the game stays frozen after a replay
+  run until `ts 1`. Video output (`output.format: "pipe"`) needs `ffmpeg` on PATH (or `output.ffmpeg`);
+  `bin\InsideReadback.dll` in `<game>\INSIDE_Data\Plugins\` makes the frame grabs of replay passes faster (without it
+  frames are read on the game thread).
+- Two example specs are in `specs\`; the offline checker and the compositor are Python tools (see "Python tools and
+  guide playbooks").
+
+Reference: [docs/MULTICAM.md](docs/MULTICAM.md) (schema of every spec field, workflows, pitfalls); short guide in Russian:
+[docs/MULTICAM_ru.md](docs/MULTICAM_ru.md); design notes: [docs/MULTICAM_DESIGN.md](docs/MULTICAM_DESIGN.md).
+
 ## Debugger
 
 The loader enables Mono's debugger agent on 127.0.0.1:55555, so dnSpy can attach (Debug → Attach → Unity (Connect));
@@ -194,12 +229,14 @@ folder with a complete `GameCode\` (see "Game code").
 GAME=/path/to/INSIDE sh build/build_mod.sh      # bin/InsideDev.dll
 GAME=/path/to/INSIDE sh build/build_mcp.sh      # bin/InsideDev.Mcp.dll + tools/mcp/InsideDev.McpStdio.exe
 sh build/build_loader.sh                        # bin/version.dll
+sh build/build_readback.sh                      # bin/InsideReadback.dll (MinGW-w64 gcc, CC=...)
 ```
 
 ## Folder layout
 
 - `bin\` — prebuilt `version.dll`, `InsideDev.dll`, `InsideDev.Mcp.dll`
 - `src\InsideDev\` — the editor; `src\mcp\` — MCP server and stdio launcher; `src\loader\` — the proxy loader
+- `src\readback\`: the native readback plugin for MultiCam; `specs\`: example MultiCam specs
 - `build\` — build scripts; `tools\` — MCP launcher, Cheat Engine table, atlas generator; `mods\` — example mods
 - `data\atlas\` — the level atlas
 - `docs\screenshots\` — the screenshots above

@@ -1,0 +1,24 @@
+{
+  "version": 2,
+  "name": "template_minimal",
+  "_about": "Smallest useful spec: films the scene where the game already is (no load), the gameplay camera plus one fixed angle, 5 game seconds in real time. Copy it, set the static pose (cam json prints the free camera as a camera object) and add setup/cues.",
+  "seconds": 5,
+  "setup": [
+    "god on",
+    "panel off",
+    "triggers off",
+    "labels off",
+    "savepoints off"
+  ],
+  "render": {"warmup": 1, "samples": 8},
+  "cameras": [
+    {"name": "game", "mode": "game"},
+    {"name": "wide", "mode": "static", "pos": [225, -219, -6], "yaw": 20, "pitch": -18, "fov": 45,
+     "_note": "ChickenGun outlet pose; replace with your own (z below -2, in front of the set)"}
+  ],
+  "compose": {
+    "layouts": [
+      {"name": "side_by_side", "width": 2560, "gap": 4, "rows": [[{"cam": "game"}, {"cam": "wide"}]]}
+    ]
+  }
+}

@@ -113,11 +113,21 @@ namespace InsideDev
         // entry for other channels (the Unity live link): same commands as the file bridge
         public static string RunCommand(string line, DevCore core) { lastCommandAt = Time.realtimeSinceStartup; return Run(line, core); }
 
+        // MultiCam runner: setup and cue commands pass the capture lock
+        static int internalDepth;
+        public static string RunInternal(string line, DevCore core)
+        {
+            internalDepth++;
+            try { return Run(line, core); }
+            finally { internalDepth--; }
+        }
+
         // ---------------------------------------------------------------- commands
         static string Run(string line, DevCore core)
         {
             var a = Split(line);
             if (a.Count == 0) return null;
+            if (internalDepth == 0 && MultiCam.Blocks(a)) return MultiCam.BusyText;
             string c = a[0].ToLowerInvariant();
             switch (c)
             {
@@ -430,6 +440,28 @@ namespace InsideDev
                         if (a.Count > 1 && a[1] == "all") return "restored " + TransformMemory.RestoreAll();
                         var go = Resolve(Rest(line)); if (go == null) return "not found";
                         return TransformMemory.Restore(go.transform) ? "restored " + go.name : "no remembered original for " + go.name;
+                    }
+                case "mcam": return MultiCam.Command(a, core);
+                case "srec": return SceneCommands.Command(a, core);
+                case "acap": return AudioCapture.Command(a, core);
+                case "hud": return MultiCam.Hud(a, core);
+                case "clean": return MultiCam.Clean(a, core);
+                case "gamma": return MultiCam.Gamma(a);
+                case "seed": return MultiCam.Seed(a);
+                case "cam":
+                    {
+                        // cam | cam pose x y z yaw pitch [fov] [seconds] [roll] | cam fov <deg> | cam roll <deg> | cam json [name] | cam off
+                        string sub = a.Count > 1 ? a[1].ToLowerInvariant() : "";
+                        if (sub == "off") { CameraControl.SetFree(false); return CameraControl.Describe(); }
+                        if (sub == "pose")
+                        {
+                            if (a.Count < 7) return "usage: cam pose x y z yaw pitch [fov] [seconds] [roll]";
+                            return CameraControl.Pose(new Vector3(F(a[2]), F(a[3]), F(a[4])), F(a[5]), F(a[6]), a.Count > 7 ? F(a[7]) : -1f, a.Count > 8 ? F(a[8]) : 0f, a.Count > 9 ? F(a[9]) : 0f);
+                        }
+                        if (sub == "fov") return a.Count > 2 ? CameraControl.SetFov(F(a[2])) : "usage: cam fov <degrees>";
+                        if (sub == "roll") return a.Count > 2 ? CameraControl.SetRoll(F(a[2])) : "usage: cam roll <degrees>";
+                        if (sub == "json") return CameraControl.Json(a.Count > 2 ? a[2] : null);
+                        return CameraControl.Describe();
                     }
                 case "freecam":
                     if (a.Count > 1) CameraControl.SetFree(On(a[1])); else CameraControl.ToggleFree();
@@ -1019,11 +1051,15 @@ namespace InsideDev
                            "        fsmgraph <obj> [fsmName] (opens the FSM Graph panel) | postfx [on|off|default <T> | set <T> <f> <v>] | fsmfind <text> | fsmset <obj>|<state>|<i>|<field>|<value> | sigs <obj> | sigwire|sigunwire <fsm obj>|<>in>|<sender>|<out>\n" +
                            "        mem [obj|on|off] | memwhat <hex> | memmethod <hex> | memread <hex> [n] | memjit <Type> <method> [+hex] | memexport (Cheat Engine)\n" +
                            "        audiolog [n] | waits | timed | timer <Type> <field> <s|mute|unmute|fire> | music\n" +
+                           "        " + MultiCam.Help + "\n" +
+                           "        srec status | objects [filter] | load <dir> | end | play [speed] [loop] | pause | seek <t> | step <dt> | probe [n] | probe camera [n] | record start <dir> [...] | record stop [keep]\n" +
+                           "        acap preflight | start <name> | mark <ascii> | stop | suspend on|off | status\n" +
+                           "        cam [pose x y z yaw pitch [fov] [s] [roll] | fov <deg> | roll <deg> | json [name] | off] | hud on|off | clean on|off | gamma <0..1>|reset | seed <n>\n" +
                            "        <obj> = name (nearest match), full/path, or #instanceID.  Quote names with spaces: \"My Obj\".\n" +
                            "plus every console command (tp, spawn, god, ts, kill, find, sel, flag, post, cue, shockwave, catalog...)";
                 default:
                     { var er = Extensions.Command(a, core); if (er != null) return er; }
-                    Commands.Run(line, core);
+                    Commands.Run(line, core, false);
                     return null;
             }
         }
@@ -1269,13 +1305,39 @@ namespace InsideDev
             var ch = G.MainCharacter; var o = ch != null ? ch.pos3 : Vector3.zero;
             if (q.IndexOf('/') >= 0)
             {
-                foreach (var t in all) if (t != null && Inspector.PathOf(t) == q) return t.gameObject;
-                foreach (var t in all) if (t != null && Inspector.PathOf(t).EndsWith(q, StringComparison.OrdinalIgnoreCase)) return t.gameObject;
+                string leaf = q.Substring(q.LastIndexOf('/') + 1);
+                foreach (var t in all) if (t != null && t.name.EndsWith(leaf, StringComparison.Ordinal) && Inspector.PathOf(t) == q) return t.gameObject;
+                foreach (var t in all) if (t != null && t.name.EndsWith(leaf, StringComparison.OrdinalIgnoreCase) && Inspector.PathOf(t).EndsWith(q, StringComparison.OrdinalIgnoreCase)) return t.gameObject;
             }
             Transform best = null; float bd = float.MaxValue;
             foreach (var t in all) if (t != null && t.name == q) { float d = (t.position - o).sqrMagnitude; if (d < bd) { bd = d; best = t; } }
             if (best == null) foreach (var t in all) if (t != null && t.name.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0) { float d = (t.position - o).sqrMagnitude; if (d < bd) { bd = d; best = t; } }
             return best != null ? best.gameObject : null;
+        }
+
+        // Pre-binds a command for repeated or timing-critical use (replay record cues, REPLAY_DESIGN 2.3.4): for
+        // `call <object> <Component> <method>` the object, component and method are resolved now and the returned delegate
+        // only invokes, with the same result text as the bridge. It returns null when the target is gone (the caller then runs
+        // the line through the bridge). Other verbs are not bound (null, `how` says why).
+        public static Func<string> Bind(string line, out string how)
+        {
+            var a = Split(line ?? "");
+            if (a.Count == 0) { how = "empty command"; return null; }
+            if (a[0].ToLowerInvariant() != "call") { how = "only 'call' commands are pre-bound"; return null; }
+            if (a.Count < 4) { how = "usage: call <object> <Component> <method>"; return null; }
+            var go = Resolve(a[1]); if (go == null) { how = "object '" + a[1] + "' not found"; return null; }
+            var comp = FindComp(go, a[2]); if (comp == null) { how = "component '" + a[2] + "' not found on " + go.name; return null; }
+            var mi = comp.GetType().GetMethod(a[3], BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
+            if (mi == null) { how = "no parameterless method " + a[3]; return null; }
+            string type = comp.GetType().Name, method = a[3];
+            bool returns = mi.ReturnType != typeof(void);
+            how = type + "." + method + " on " + Inspector.PathOf(go.transform) + " #" + go.GetInstanceID();
+            return () =>
+            {
+                if (comp == null) return null;
+                var r = mi.Invoke(comp, null);
+                return "called " + type + "." + method + (returns ? " -> " + Describe(r) : "");
+            };
         }
 
         static Component FindComp(GameObject go, string name)

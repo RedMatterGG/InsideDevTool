@@ -114,10 +114,13 @@ namespace InsideDev
         public static int StreamVersion;
         public static float StreamChangedAt;
         public static void Bump(string why) { StreamVersion++; StreamChangedAt = Time.realtimeSinceStartup; if (why == "level load") cullersAt = -100f; }
-        // true once when the version moved past 'seen' and streaming has been quiet for 'settle' seconds
+        // true once when the version moved past 'seen' and streaming has been quiet for 'settle' seconds (at least
+        // BackgroundSettle, so a level load triggers one scan at its end instead of one between every subscene), and never
+        // while mcam captures: the scans are 30-170 ms main-thread hitches that break 60 Hz record pacing; they run after it
+        public const float BackgroundSettle = 3f;
         public static bool Changed(ref int seen, float settle = 0.5f)
         {
-            if (seen == StreamVersion || Time.realtimeSinceStartup - StreamChangedAt < settle) return false;
+            if (seen == StreamVersion || Time.realtimeSinceStartup - StreamChangedAt < Math.Max(settle, BackgroundSettle) || MultiCam.Running) return false;
             seen = StreamVersion; return true;
         }
         public static readonly Dictionary<string, string> state = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -132,7 +135,7 @@ namespace InsideDev
             try
             {
                 // the culler list itself only changes with level loads; re-find it every 30 s or when one is gone
-                bool stale = Time.realtimeSinceStartup - cullersAt > 120f;   // level loads bump cullersAt via Bump()
+                bool stale = Time.realtimeSinceStartup - cullersAt > 120f && !MultiCam.Running;   // level loads bump cullersAt via Bump(); the timed re-find waits for mcam runs
                 foreach (var c in cullers) if (c == null) stale = true;
                 if (stale)
                 {

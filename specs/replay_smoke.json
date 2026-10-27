@@ -1,0 +1,59 @@
+{
+  "version": 2,
+  "name": "replay_smoke",
+  "_about": "Replay-mode smoke take (REPLAY_DESIGN 8.3 DOCS): 10 s of ChickenGun with suction on, recorded once in real time and replayed through two cameras (the game camera and a static player-side view of the outlet), speed 1, engine blur, no audio (audio.capture none). One session (mcam take), so the forced cullers and the keep-loaded set are handed from the record pass to the replay. The record pass also grabs every 10th game frame (record/game) for a first golden check.",
+  "_workflow": [
+    "python -I tools/mcam_spec_check.py specs/replay_smoke.json",
+    "mcam check C:/path/to/InsideDevTool/specs/replay_smoke.json",
+    "mcam take C:/path/to/InsideDevTool/specs/replay_smoke.json C:/path/to/out/replay_smoke",
+    "mcam golden C:/path/to/InsideDevTool/specs/replay_smoke.json C:/path/to/out/replay_smoke",
+    "python -I tools/mcam_qa.py replaydiff C:/path/to/out/replay_smoke --record C:/path/to/out/replay_smoke/record",
+    "python -I tools/mcam_compose.py angles C:/path/to/out/replay_smoke && python -I tools/mcam_compose.py layout C:/path/to/out/replay_smoke",
+    "python -I tools/mcam_qa.py qa C:/path/to/out/replay_smoke"
+  ],
+  "seconds": 10,
+  "preroll": 0.5,
+  "seed": 1,
+  "setup": [
+    "god on",
+    "panel off",
+    "triggers off",
+    "labels off",
+    "savepoints off",
+    "load 7 0",
+    "waitfor savepoint #chickenGun",
+    "waitfor streaming",
+    "wait 3",
+    "tp 221.0 -221.4 0.66",
+    "wait 2",
+    "call ChickenGunObject/ChickenGunVacuumLogic ChickenGunLogic OnElectricityOn",
+    "call _SaveLogic/ChickensLoaded ChickenSpawner DoSpawn",
+    "wait 1"
+  ],
+  "cues": [
+    {"at": 1.0, "cmd": "call ChickenGunObject/ChickenGunVacuumLogic ChickenGunLogic ToggleSuctionOn", "label": "suction on"}
+  ],
+  "timing": {"fps": 30, "segments": [{"from": 0, "speed": 1, "label": "real"}]},
+  "output": {"format": "jpg", "jpeg": 90},
+  "session": {"res": [2560, 1440]},
+  "post": {"brightness": 0.55, "blacklift": 0.006, "postGamma": 0.03, "inWhiteScale": 0.95},
+  "tracks": ["HayBaleHolder/HayBale"],
+  "replay": {
+    "record": {"clock": "real", "res": [0, 0], "captureGame": true, "captureEvery": 10},
+    "play": {"look": "game", "motionBlur": "game", "warmup": 16, "cullers": "camera"},
+    "audio": {"capture": "none"}
+  },
+  "cameras": [
+    {"name": "game", "mode": "game", "label": "Game camera"},
+    {"name": "outlet", "mode": "static", "label": "Outlet", "pos": [225, -219, -6], "yaw": 20, "pitch": -18, "fov": 45}
+  ],
+  "compose": {
+    "fps": 30,
+    "labels": {"show": true, "names": {"game": "Game camera", "outlet": "Outlet"}},
+    "angles": {"cams": "all", "speed": "meta"},
+    "layouts": [
+      {"name": "pair", "width": 2560, "gap": 4, "rows": [[{"cam": "game"}, {"cam": "outlet"}]]}
+    ],
+    "encode": {"codec": "nvenc", "cq": 20, "bits": 10}
+  }
+}

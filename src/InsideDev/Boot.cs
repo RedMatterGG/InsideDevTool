@@ -154,10 +154,11 @@ namespace InsideDev
 
         public static float TimeScale
         {
-            get { try { return GameManager.TimeScale; } catch { return Time.timeScale; } }
+            get { if (Time.timeScale == 0f) return 0f; try { return GameManager.TimeScale; } catch { return Time.timeScale; } }
             set
             {
                 value = Mathf.Clamp(value, 0f, 10f);
+                MultiCamFreeze.Release("time scale set to " + value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
                 try { GameManager.TimeScale = value; } catch { }
                 Time.timeScale = value;
             }
