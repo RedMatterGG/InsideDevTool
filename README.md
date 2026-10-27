@@ -16,6 +16,7 @@ with Cheat Engine.
 | `bin\InsideDev.Mcp.dll` | `<game>\_mod\` | optional: MCP server for AI assistants (see "AI assistants (MCP)") |
 | `bin\InsideReadback.dll` | `<game>\INSIDE_Data\Plugins\` (with the game closed) | optional: faster frame capture for MultiCam (see "MultiCam") |
 | `tools\mcp\InsideDev.McpStdio.exe` | anywhere | optional: stdio launcher for MCP clients that start a local program |
+| `tools\muter\InsideMuter.exe` | `<game>\_mod\muter\` | optional, **mutes the game while it runs**: only for silent audio captures (see "Game audio capture") |
 | `specs\*.json` | anywhere | optional: example MultiCam specs |
 | `tools\cheatengine\InsideDev.CT` | anywhere | optional: Cheat Engine table |
 | `mods\*.json` | `<game>\_mod\mods\` | optional: example mods (enable them in the Mods panel) |
@@ -35,6 +36,9 @@ Nothing added in 0.7.0 runs until you call it or install the optional file that 
 | MultiCam (`mcam`) | off | `mcam start\|take\|replay ...` | `mcam stop`, `mcam abort` |
 | Camera and frame helpers (`cam`, `hud`, `clean`, `gamma`, `seed`) | off | `cam pose ...`, `hud off`, `clean on`, `gamma <v>`, `seed <n>` | `cam off`, `hud on`, `clean off`, `gamma reset` (`seed` cannot be undone) |
 | Native readback plugin | not installed | copy `InsideReadback.dll` | delete it, or `output.readback: "readpixels"` in a spec |
+| Game audio capture (`acap`) | off; output `audible` (the sound plays normally) | `acap start <name>`, `srec record start ... audio=on` | `acap stop` |
+| Muted capture output | off | `acap output muted` (needs InsideMuter and a lab flag file) | `acap output audible` (saved as `acap.output`) |
+| InsideMuter | not running | start `InsideMuter.exe` (it then **mutes the game**) | it exits 10 s after the game; unmute INSIDE in the Windows volume mixer |
 
 ### Game code (`<game>\GameCode\`)
 
@@ -207,6 +211,30 @@ films every camera from the recording, one pass per camera, so every angle shows
 Reference: [docs/MULTICAM.md](docs/MULTICAM.md) (schema of every spec field, workflows, pitfalls); short guide in Russian:
 [docs/MULTICAM_ru.md](docs/MULTICAM_ru.md); design notes: [docs/MULTICAM_DESIGN.md](docs/MULTICAM_DESIGN.md).
 
+## Game audio capture
+
+`acap` writes the game's own sound output (Wwise) to a WAV file with sync markers: on its own (`acap start <name>`,
+`acap mark <label>`, `acap stop`) or as part of a recording (`srec record start <dir> audio=on`, a MultiCam replay spec
+with `replay.audio.capture: "record"`).
+
+- Default output `audible`: the game sound plays normally while it is captured, at the game's own volume. Nothing is
+  muted and the master volume is never raised.
+- Output `muted` (opt-in, `acap output muted`, saved as `acap.output` in editor.cfg): for captures while the speakers or
+  headphones must stay silent. The master volume is held at 0 and opened only inside a capture window, and only while
+  the InsideMuter heartbeat proves every INSIDE audio session is muted in Windows. A capture path is unlocked only by a
+  flag file that a passing lab audio stage writes (`acap_suspend_ok.json`, `acap_muteronly_ok.json`), and it should be run
+  only with the explicit OK of the person wearing the headphones. `acap output audible` switches back.
+- `acap status` and `acap preflight` show the output, the game volume and why a capture would be refused.
+
+**InsideMuter** (`tools\muter\InsideMuter.exe`) is off by default and never starts by itself. While it runs, it **mutes
+the sound of every running INSIDE.exe in Windows** (it calls mute on the game's audio sessions every 50 ms and never
+changes a volume) and writes a heartbeat file every 250 ms. Copy it to `<game>\_mod\muter\` and start it there before
+the game (the core reads `_mod\muter\heartbeat.json` by default), or start it anywhere with `--heartbeat <path>`. It exits
+10 s after the last INSIDE.exe has ended. The mute stays on the game's audio session after it exits: unmute INSIDE in the
+Windows volume mixer.
+
+Reference: [docs/AUDIO.md](docs/AUDIO.md).
+
 ## Debugger
 
 The loader enables Mono's debugger agent on 127.0.0.1:55555, so dnSpy can attach (Debug → Attach → Unity (Connect));
@@ -230,6 +258,7 @@ GAME=/path/to/INSIDE sh build/build_mod.sh      # bin/InsideDev.dll
 GAME=/path/to/INSIDE sh build/build_mcp.sh      # bin/InsideDev.Mcp.dll + tools/mcp/InsideDev.McpStdio.exe
 sh build/build_loader.sh                        # bin/version.dll
 sh build/build_readback.sh                      # bin/InsideReadback.dll (MinGW-w64 gcc, CC=...)
+sh build/build_muter.sh                         # tools/muter/InsideMuter.exe
 ```
 
 ## Folder layout
@@ -237,6 +266,7 @@ sh build/build_readback.sh                      # bin/InsideReadback.dll (MinGW-
 - `bin\` — prebuilt `version.dll`, `InsideDev.dll`, `InsideDev.Mcp.dll`
 - `src\InsideDev\` — the editor; `src\mcp\` — MCP server and stdio launcher; `src\loader\` — the proxy loader
 - `src\readback\`: the native readback plugin for MultiCam; `specs\`: example MultiCam specs
+- `src\muter\`: InsideMuter
 - `build\` — build scripts; `tools\` — MCP launcher, Cheat Engine table, atlas generator; `mods\` — example mods
 - `data\atlas\` — the level atlas
 - `docs\screenshots\` — the screenshots above

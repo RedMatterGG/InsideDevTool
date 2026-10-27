@@ -86,6 +86,7 @@ namespace InsideDev
             int c = key.IndexOf(':');
             string kind = key.Substring(0, c), name = key.Substring(c + 1);
             uint id = Id(name);
+            Action apply = null;
             switch (kind)
             {
                 case "mute": if (value != null && value != "false") mute.Add(id); else mute.Remove(id); break;
@@ -93,16 +94,17 @@ namespace InsideDev
                 case "replace": if (value != null) replace[id] = new KeyValuePair<uint, string>(Id(value), value); else replace.Remove(id); break;
                 case "switch": if (value != null) forceSwitch[id] = Id(value); else forceSwitch.Remove(id); break;
                 case "state":
-                    if (value != null) { forceState[id] = Id(value); Apply(() => SoundEngineInner.SetStateID(id, Id(value))); }
-                    else { forceState.Remove(id); uint g; if (gameState.TryGetValue(id, out g)) Apply(() => SoundEngineInner.SetStateID(id, g)); }
+                    if (value != null) { forceState[id] = Id(value); apply = () => SoundEngineInner.SetStateID(id, Id(value)); }
+                    else { forceState.Remove(id); uint g; if (gameState.TryGetValue(id, out g)) apply = () => SoundEngineInner.SetStateID(id, g); }
                     break;
                 case "rtpc":
-                    if (value != null) { float v = float.Parse(value, NumberStyles.Float, IC); forceRtpc[id] = v; Apply(() => SoundEngineInner.SetRTPCValueID(id, v, null, 0f)); }
-                    else { forceRtpc.Remove(id); float g; if (gameRtpc.TryGetValue(id, out g)) Apply(() => SoundEngineInner.SetRTPCValueID(id, g, null, 0f)); }
+                    if (value != null) { float v = float.Parse(value, NumberStyles.Float, IC); forceRtpc[id] = v; apply = () => SoundEngineInner.SetRTPCValueID(id, v, null, 0f); }
+                    else { forceRtpc.Remove(id); float g; if (gameRtpc.TryGetValue(id, out g)) apply = () => SoundEngineInner.SetRTPCValueID(id, g, null, 0f); }
                     break;
             }
             Version++;
             SyncNative();
+            if (apply != null) Apply(apply);
             DevLog.Write("[audio rules] " + key + (value != null ? " = " + value : " removed") + "  (" + rules.Count + " active)");
         }
 
