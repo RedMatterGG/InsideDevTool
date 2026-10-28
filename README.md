@@ -113,18 +113,6 @@ this project does not describe how to obtain them: dump them yourself and place 
 <td width="50%" valign="top"><a href="docs/screenshots/cheats-memory.jpg"><img width="100%" src="docs/screenshots/cheats-memory.jpg" alt="Cheats + Cheat Engine memory"></a><br><b>Cheats + Cheat Engine memory</b></td>
 <td width="50%" valign="top"><a href="docs/screenshots/settings.jpg"><img width="100%" src="docs/screenshots/settings.jpg" alt="Settings (post effects, game code, extensions)"></a><br><b>Settings (post effects, game code, extensions)</b></td>
 </tr>
-<tr>
-<td width="50%" valign="top"><a href="docs/screenshots/atlas-hidden.jpg"><img width="100%" src="docs/screenshots/atlas-hidden.jpg" alt="Level atlas: switched-off objects in every level"></a><br><b>Level atlas: switched-off objects in every level</b></td>
-<td width="50%" valign="top"><a href="docs/screenshots/atlas-inspector.jpg"><img width="100%" src="docs/screenshots/atlas-inspector.jpg" alt="Level atlas in the Inspector: dead wires, who switches an object on"></a><br><b>Level atlas in the Inspector: dead wires, who switches an object on</b></td>
-</tr>
-<tr>
-<td width="50%" valign="top"><a href="docs/screenshots/mcp-observe.jpg"><img width="100%" src="docs/screenshots/mcp-observe.jpg" alt="MCP play: what the agent sees (observe with object ids, geometry slice)"></a><br><b>MCP play: what the agent sees (observe with object ids, geometry slice)</b></td>
-<td width="50%" valign="top"><a href="docs/screenshots/multicam-layout.jpg"><img width="100%" src="docs/screenshots/multicam-layout.jpg" alt="MultiCam: one recorded take, game camera plus three tracking cameras in one layout"></a><br><b>MultiCam: one recorded take, game camera plus three tracking cameras in one layout</b></td>
-</tr>
-<tr>
-<td width="50%" valign="top"><a href="docs/screenshots/multicam-game-vs-director.jpg"><img width="100%" src="docs/screenshots/multicam-game-vs-director.jpg" alt="Game camera vs director camera at the same recorded moment"></a><br><b>Game camera vs director camera at the same recorded moment</b></td>
-<td width="50%" valign="top"></td>
-</tr>
 </table>
 
 ## Panels
@@ -243,7 +231,7 @@ checkpoints, goes through menus, reads playbooks and records and replays input t
 needs `InsideDev.Mcp.dll` and nothing else (no recorder, no MultiCam). Input goes into the game's input system, not
 the Windows keyboard, so the game window does not need focus.
 
-<a href="docs/screenshots/mcp-observe.jpg"><img width="100%" src="docs/screenshots/mcp-observe.jpg" alt="MCP play: what the agent sees (observe with object ids, geometry slice)"></a>
+<a href="docs/screenshots/mcp-observe.jpg"><img width="100%" src="docs/screenshots/mcp-observe.jpg" alt=""></a>
 
 - Install: `bin\InsideDev.Mcp.dll` and `bin\InsideDev.Play.dll` to `<game>\_mod\` (or `ext load` in the console while the
   game runs). Connect the client to `http://127.0.0.1:47811/mcp/play` (stdio: `--profile play`).
