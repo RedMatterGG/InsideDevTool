@@ -20,6 +20,9 @@ namespace InsideDev.McpExt
         public int maxWidth = 960;
         // hide InsideDev panels, HUD and overlays for this capture
         public bool clean = true;
+        // full / path: return once the file is written, without the decode and the black check (2560x1440: the managed
+        // inflate of the black check was most of the call)
+        public bool fast;
         // marks to draw (mode marked); null = ask McpShot.MarkSource
         public List<ShotMark> marks;
     }
@@ -122,6 +125,12 @@ namespace InsideDev.McpExt
             r.mode = mode;
             byte[] px = null;
             int w = 0, h = 0;
+            if (req != null && req.fast && (mode == "full" || mode == "path"))
+            {
+                r.width = r.srcWidth; r.height = r.srcHeight; r.png = null;
+                r.note = "fast: not decoded, black not checked";
+                return;
+            }
             try
             {
                 px = Png.DecodeRgb(png, out w, out h);

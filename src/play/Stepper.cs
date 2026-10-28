@@ -52,18 +52,28 @@ namespace InsideDev.Play
         public static void Register()
         {
             PlayRegistry.Add(PlayShared.Def("time", "Game clock", PlayShared.Both, Owner,
-                "Game clock. The game runs in realtime until the first action call; from then on it is in step mode: frozen between calls, running only inside act, move_to, interact, wait_until and time step. op realtime lets it run (speed scales it). Mines shockwave, lineup and lab lift / water lock run on the music clock: step-mode runs there are paced to real time (the music pauses while frozen), slow motion desyncs them; act / move_to / interact take when to wait for a safe phase inside the call.",
-                Schema.Obj().Enum("op", "state, step_mode, realtime, pause, resume, step, speed or rng_seed.", "state",
-                        "state", "step_mode", "realtime", "pause", "resume", "step", "speed", "rng_seed")
+                "Game clock. The game runs in realtime until the first action call; from then on it is in step mode: frozen between calls, running only inside act, move_to, interact, wait_until and time step. op realtime lets it run (speed scales it). Mines shockwave, lineup and lab lift / water lock run on the music clock: step-mode runs there are paced to real time (the music pauses while frozen), slow motion desyncs them; act / move_to / interact take when to wait for a safe phase inside the call. op vsync {on:false}: no vSync in realtime; state has fps. op record films the window in real time (ffmpeg, NVENC); record_stop ends it.",
+                Schema.Obj().Enum("op", "state, step_mode, realtime, pause, resume, step, speed, rng_seed, vsync, record or record_stop.", "state",
+                        "state", "step_mode", "realtime", "pause", "resume", "step", "speed", "rng_seed", "vsync", "record", "record_stop")
                     .Int("steps", "op step: logic steps to run (1/60 s each), then freeze.", 1, 1, 600)
                     .Num("speed", "op speed / realtime: game speed while running.", 1, 0.05, 4)
                     .Int("seed", "op rng_seed: PDRandom.seed, RandomGenerator.ResetAll, UnityEngine.Random.seed.", 0, 0, 2147483647)
-                    .Enum("observe", "op step: observation in the result.", "concise", "concise", "none").Build(),
+                    .Enum("observe", "op step: observation in the result.", "concise", "concise", "none")
+                    .Bool("on", "op vsync: true = the game's own vSync, false = off while an agent holds the clock (restore puts it back).", true)
+                    .Int("record_fps", "op record: frames per second of the video.", 30, 5, 60)
+                    .Int("cq", "op record: NVENC constant quality (lower is better and larger; 16 is near lossless for review).", 16, 0, 51)
+                    .Bool("raise", "op record: lift the game window to the top without taking focus (the capture records what is on screen).", false)
+                    .Str("file", "op record: file name in _mod/recordings (default <date>_<time>.mkv).")
+                    .Str("ffmpeg", "op record: ffmpeg.exe (default INSIDEDEV_FFMPEG, _mod/ffmpeg/ffmpeg.exe, C:/ffmpeg/bin/ffmpeg.exe, PATH).")
+                    .Num("review_fps", "op record_stop: also cut JPG review frames at this rate into <file>_frames (0 = none).", 0, 0, 30).Build(),
                 Schema.Obj().Enum("mode", "Clock mode.", null, "step", "realtime").Bool("frozen", "The game is held at time scale 0 now.")
                     .Num("speed", "Realtime speed.", 0, 4).Num("scale", "Time.timeScale.", 0, 100).Num("game_scale", "GameManager.TimeScale.", 0, 100)
                     .Int("capture_fps", "Time.captureFramerate (60 while stepping).", 0, 1000).Int("frame", "Time.frameCount.", 0, long.MaxValue)
                     .Int("step", "LogicManager.stepCount.", 0, long.MaxValue).Num("music_s", "Music position (s).", -1, 1e6)
                     .Bool("loading", "A load is in progress.").Bool("paused", "The game itself is paused (menu, focus).")
+                    .Num("fps", "Rendered frames per second over the last second.", 0, 10000).Num("frame_ms_max", "Longest frame of the last second (ms).", 0, 100000)
+                    .Bool("vsync_off", "op vsync {on:false} is in force.")
+                    .OutObj("record", "Real-time recording (op record).", Schema.Obj().Bool("on", "").Str("file", "").Num("seconds", "", 0, 1e7).Str("problem", "").Str("frames_dir", ""))
                     .Int("steps_run", "op step: steps actually run.", 0, 100000).Arr("warnings", "music_timed, focus, loading ...", Schema.Str(), 0, 20)
                     .Prop("observe", null, Observer.ConciseRef())
                     .Prop("changes", null, ChangeLog.Ref()).BuildOutput()), Handle);
@@ -74,6 +84,18 @@ namespace InsideDev.Play
         {
             string op = PlayShared.Str(a, "op", "state");
             if (op == "state") return ToolResult.Ok(ctx.Main(() => State()));
+            if (op == "record")
+            {
+                Recorder.Start(a);
+                return ToolResult.Ok(ctx.Main(() => State()));
+            }
+            if (op == "record_stop")
+            {
+                var stopped = Recorder.Stop(PlayShared.Num(a, "review_fps", 0));
+                var st = ctx.Main(() => State());
+                foreach (var k in stopped.order) st["stop_" + k] = stopped[k];
+                return ToolResult.Ok(st);
+            }
             if (op == "rng_seed")
             {
                 int seed = PlayShared.Int(a, "seed", 0);
@@ -100,6 +122,7 @@ namespace InsideDev.Play
                     case "pause": w.AddRange(clock.Freeze()); break;
                     case "resume": w.AddRange(clock.Unfreeze()); break;
                     case "speed": w.AddRange(clock.SetSpeed(speed)); break;
+                    case "vsync": w.Add(host.SetVsyncOff(!PlayShared.Bool(a, "on", true))); break;
                     default: throw new McpException(McpErr.BadArgs, "op: unknown " + op);
                 }
                 var s = State();
@@ -206,6 +229,11 @@ namespace InsideDev.Play
             o["running"] = clock.Running;
             o["freeze_pending"] = clock.WantFrozen && !clock.Frozen && !clock.Running;
             o["vsync"] = (double)QualitySettings.vSyncCount;
+            o["vsync_off"] = host.VsyncOff;
+            o["vsync_always_off"] = host.VsyncAlways;
+            o["fps"] = PlayShared.R(meter.Fps(host.NowMs), 1);
+            o["frame_ms_max"] = PlayShared.R(meter.MaxMs(host.NowMs), 1);
+            o["record"] = Recorder.StateObj();
             o["run_in_background"] = Application.runInBackground;
             o["recording"] = host.Recording;
             o["pacing"] = host.PacingNow ? "real_time_60" : "none";
@@ -236,7 +264,13 @@ namespace InsideDev.Play
             clock.Tick();
             FocusGuard.Tick(clock.Touched && !host.External);
             host.Pace();
+            host.HoldVsyncOff();
+            host.HoldVsyncAlways();
+            meter.Add(host.NowMs);
+            Recorder.Prime();
         }
+
+        static readonly FrameMeter meter = new FrameMeter();
 
         internal static void Seed(int seed)
         {
@@ -281,6 +315,43 @@ namespace InsideDev.Play
     // The game behind StepClock (main thread except NowMs). Load phases: loadStarted (or GameManager.IsLoading seen)
     // -> loading; loadFinished -> fading in until the fader is done and GameInput is enabled again (15 s cap), because
     // FadeAndReload's fade-in and the startup title run on scaled time after state = Playing and hang at timeScale 0.
+    // rendered frame times of the last ~2 s (main thread adds, any thread reads under the lock)
+    internal sealed class FrameMeter
+    {
+        readonly double[] t = new double[512];
+        int n, head;
+
+        public void Add(double ms)
+        {
+            lock (t) { t[head] = ms; head = (head + 1) % t.Length; if (n < t.Length) n++; }
+        }
+
+        public double Fps(double now)
+        {
+            lock (t)
+            {
+                int c = 0;
+                for (int i = 0; i < n; i++) if (now - t[(head - 1 - i + t.Length) % t.Length] <= 1000) c++; else break;
+                return c;
+            }
+        }
+
+        public double MaxMs(double now)
+        {
+            lock (t)
+            {
+                double max = 0;
+                for (int i = 0; i + 1 < n; i++)
+                {
+                    double a = t[(head - 1 - i + t.Length) % t.Length], b = t[(head - 2 - i + t.Length) % t.Length];
+                    if (now - a > 1000) break;
+                    max = Math.Max(max, a - b);
+                }
+                return max;
+            }
+        }
+    }
+
     internal sealed class GameClockHost : IClockHost
     {
         public const int StepFps = 60, LateFadeMs = 15000;
@@ -553,6 +624,72 @@ namespace InsideDev.Play
             }
             Application.runInBackground = true;
             Restorer.Register("time", "game clock (step mode, pause, speed, capture / vSync, runInBackground)", Stepper.Clock.Reset);
+        }
+
+        // time {op:"vsync", on:false}: vSync stays off in realtime while an agent holds the clock (a step-mode run already
+        // turns it off for its frames; a recorder or MultiCam keeps its own pacing and the flag waits for it to end).
+        // Saved once; on:true or restore (key "vsync") puts the game's own values back.
+        bool vsyncOff, vsyncSaved;
+        int vsyncSavedReal, vsyncSavedVirtual;
+
+        public bool VsyncOff { get { return vsyncOff; } }
+
+        public string SetVsyncOff(bool off)
+        {
+            if (off)
+            {
+                if (!vsyncSaved)
+                {
+                    vsyncSaved = true;
+                    vsyncSavedReal = steppingSaved ? prevVsyncReal : QualitySettings.vSyncCount;
+                    vsyncSavedVirtual = vsyncSavedReal;
+                    if (steppingSaved) vsyncSavedVirtual = prevVsyncVirtual;
+                    else { try { vsyncSavedVirtual = FramerateController.GetVirtualVSyncCount(); } catch { } }
+                }
+                vsyncOff = true;
+                if (steppingSaved) { prevVsyncReal = 0; prevVsyncVirtual = 0; }
+                HoldVsyncOff();
+                Restorer.Register("vsync", "vSync off in realtime (time op vsync)", () => SetVsyncOff(false));
+                return "vsync: off while the agent holds the clock (the game's own value " + vsyncSavedReal + " comes back with on:true or restore)";
+            }
+            if (!vsyncSaved) return "vsync: the game's own (" + QualitySettings.vSyncCount + ")";
+            vsyncOff = false;
+            vsyncSaved = false;
+            if (steppingSaved) { prevVsyncReal = vsyncSavedReal; prevVsyncVirtual = vsyncSavedVirtual; }
+            else if (!recording && !External)
+            {
+                try { FramerateController.SetVSyncCount(vsyncSavedVirtual); } catch { }
+                QualitySettings.vSyncCount = vsyncSavedReal;
+            }
+            return "vsync: back to the game's own " + vsyncSavedReal;
+        }
+
+        // main thread, every frame: loads and the game's own code may set vSync again
+        public void HoldVsyncOff()
+        {
+            if (!vsyncOff || steppingSaved || recording || External || QualitySettings.vSyncCount == 0) return;
+            try { FramerateController.SetVSyncCount(0); } catch { }
+            QualitySettings.vSyncCount = 0;
+        }
+
+        // main thread, every frame: editor.cfg play.vsync_off (default 1, a development tool) keeps vSync off from the start,
+        // after every load and between agent calls; play.vsync_off = 0 leaves the game's own vSync. Step-mode runs, a scene
+        // recorder or MultiCam keep their own pacing.
+        int alwaysCheck;
+        bool alwaysOff;
+
+        public bool VsyncAlways { get { return alwaysOff; } }
+
+        public void HoldVsyncAlways()
+        {
+            if (--alwaysCheck <= 0)
+            {
+                alwaysCheck = 120;
+                try { alwaysOff = EditorState.Get("play.vsync_off", true); } catch { alwaysOff = false; }
+            }
+            if (!alwaysOff || steppingSaved || recording || External || QualitySettings.vSyncCount == 0) return;
+            try { FramerateController.SetVSyncCount(0); } catch { }
+            QualitySettings.vSyncCount = 0;
         }
 
         public string Untouch()

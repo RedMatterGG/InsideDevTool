@@ -14,10 +14,25 @@ namespace InsideDev
         public Color color;
         public bool trigger;
         public string kind;      // short category label
+        // cached per entry, refreshed every few frames (staggered) instead of asking the engine every frame
+        public GameObject go;
+        public Transform t;
+        public int shape;        // 0 local box (box / capsule), 1 sphere, 2 world bounds
+        public Vector3 lc, ls;   // local centre and size of the box
+        public float lr;         // sphere radius (local)
+        public readonly Vector3[] w = new Vector3[8];   // world corners, or w[0] = sphere centre
+        public float wr;         // sphere radius (world)
+        public Bounds b;
+        public bool alive, active, on;
+        public int checkAt;
     }
 
     // World overlay: trigger/collider wireframes, labels, savepoint markers.
-    // Drawn from OnGUI (Repaint) in screen space so it works regardless of Playdead's custom render pipeline.
+    // Drawn at the end of the frame in screen space so it works regardless of Playdead's custom render pipeline.
+    // Cost: it is rebuilt every frame, so nothing per collider may ask the engine every frame. Each entry keeps its
+    // object, shape, world corners and bounds and asks the engine (alive, active, enabled, transform) only every
+    // CheckEvery frames, staggered; frustum culling and the projection run in C# from one view-projection matrix per
+    // frame (WorldToScreenPoint per line end was 24 engine calls per box). A rescan classifies new colliders only.
     public class Overlay
     {
         public bool showTriggers = true;
@@ -55,9 +70,16 @@ namespace InsideDev
         public List<DevCore.HiddenEntry> hiddenEntries;
 
         public readonly List<ColliderEntry> entries = new List<ColliderEntry>();
+        readonly Dictionary<int, ColliderEntry> known = new Dictionary<int, ColliderEntry>();
         float nextRefresh; int seenStream = -1;
         Plane[] planes;
         Camera cam;
+        Matrix4x4 vp;
+        Rect pr;
+        float sh;
+        readonly Vector4[] fpl = new Vector4[6];
+        readonly Vector3[] proj = new Vector3[8];
+        const int CheckEvery = 8;
 
         public int visibleTriggers, visibleSolids;
 
@@ -89,29 +111,96 @@ namespace InsideDev
         void Refresh()
         {
             entries.Clear();
-            if (!showTriggers && !showSolids) return;
+            if (!showTriggers && !showSolids) { known.Clear(); return; }
             var all = UObj.FindObjectsOfType(typeof(Collider));
             var sb = new StringBuilder();
+            var seen = new HashSet<int>();
             foreach (var o in all)
             {
                 var c = o as Collider;
                 if (c == null) continue;
                 bool trig = c.isTrigger;
                 if (trig ? !showTriggers : !showSolids) continue;
-                var e = new ColliderEntry { col = c, name = c.gameObject.name, trigger = trig };
-                sb.Length = 0; typeNames.Clear();
-                foreach (var mb in c.GetComponents<MonoBehaviour>())
+                int id = c.GetInstanceID();
+                seen.Add(id);
+                ColliderEntry e;
+                if (!known.TryGetValue(id, out e) || e.col != c || e.trigger != trig)
                 {
-                    if (mb == null) continue;
-                    string tn = mb.GetType().Name;
-                    typeNames.Add(tn);
-                    if (sb.Length > 0) sb.Append(", ");
-                    sb.Append(tn);
+                    e = new ColliderEntry { col = c, go = c.gameObject, t = c.transform, trigger = trig };
+                    e.name = e.go.name;
+                    sb.Length = 0; typeNames.Clear();
+                    foreach (var mb in c.GetComponents<MonoBehaviour>())
+                    {
+                        if (mb == null) continue;
+                        string tn = mb.GetType().Name;
+                        typeNames.Add(tn);
+                        if (sb.Length > 0) sb.Append(", ");
+                        sb.Append(tn);
+                    }
+                    e.types = sb.ToString();
+                    Classify(e, typeNames);
+                    Shape(e);
+                    e.checkAt = 0;
+                    known[id] = e;
                 }
-                e.types = sb.ToString();
-                Classify(e, typeNames);
                 entries.Add(e);
             }
+            var gone = new List<int>();
+            foreach (var k in known.Keys) if (!seen.Contains(k)) gone.Add(k);
+            foreach (var k in gone) known.Remove(k);
+        }
+
+        static void Shape(ColliderEntry e)
+        {
+            var box = e.col as BoxCollider;
+            if (box != null) { e.shape = 0; e.lc = box.center; e.ls = box.size; return; }
+            var sph = e.col as SphereCollider;
+            if (sph != null) { e.shape = 1; e.lc = sph.center; e.lr = sph.radius; return; }
+            var cap = e.col as CapsuleCollider;
+            if (cap != null)
+            {
+                var size = new Vector3(cap.radius * 2, cap.radius * 2, cap.radius * 2);
+                size[cap.direction] = Mathf.Max(cap.height, cap.radius * 2);
+                e.shape = 0; e.lc = cap.center; e.ls = size;
+                return;
+            }
+            e.shape = 2;
+        }
+
+        // engine reads for one entry: alive, active, enabled, world geometry and bounds
+        void Check(ColliderEntry e, int f)
+        {
+            e.checkAt = f + CheckEvery + (e.GetHashCode() & 3);
+            var c = e.col;
+            e.alive = c != null;
+            if (!e.alive) return;
+            e.active = e.go.activeInHierarchy;
+            if (!e.active) return;
+            e.on = c.enabled;
+            var t = e.t;
+            if (e.shape == 0)
+            {
+                Vector3 h = e.ls * 0.5f;
+                for (int i = 0; i < 8; i++)
+                    e.w[i] = t.TransformPoint(e.lc + new Vector3((i & 1) != 0 ? h.x : -h.x, (i & 2) != 0 ? h.y : -h.y, (i & 4) != 0 ? h.z : -h.z));
+                var bb = new Bounds(e.w[0], Vector3.zero);
+                for (int i = 1; i < 8; i++) bb.Encapsulate(e.w[i]);
+                e.b = bb;
+                return;
+            }
+            if (e.shape == 1)
+            {
+                Vector3 s = t.lossyScale;
+                e.wr = e.lr * Mathf.Max(Mathf.Abs(s.x), Mathf.Max(Mathf.Abs(s.y), Mathf.Abs(s.z)));
+                e.w[0] = t.TransformPoint(e.lc);
+                e.b = new Bounds(e.w[0], Vector3.one * e.wr * 2f);
+                return;
+            }
+            Bounds b;
+            try { b = c.bounds; } catch { e.alive = false; return; }
+            if (!e.on && b.size == Vector3.zero) b = new Bounds(t.position, t.lossyScale);
+            e.b = b;
+            for (int i = 0; i < 8; i++) e.w[i] = new Vector3((i & 1) != 0 ? b.max.x : b.min.x, (i & 2) != 0 ? b.max.y : b.min.y, (i & 4) != 0 ? b.max.z : b.min.z);
         }
 
         // category of one trigger collider, same rules as the overlay colours (for picking)
@@ -177,27 +266,30 @@ namespace InsideDev
             cam = G.Cam();
             if (cam == null) return;
             planes = GeometryUtility.CalculateFrustumPlanes(cam);
+            vp = cam.projectionMatrix * cam.worldToCameraMatrix;
+            pr = cam.pixelRect;
+            sh = Screen.height;
+            FrustumPlanes();
 
             var labels = new List<KeyValuePair<Vector3, ColliderEntry>>();
             Vector3 camPos = cam.transform.position;
+            int f = Time.frameCount;
             foreach (var e in entries)
             {
-                var c = e.col;
-                if (c == null || !c.gameObject.activeInHierarchy) continue;
-                if (!c.enabled && !showDisabled) continue;
+                if (f >= e.checkAt) Check(e, f);
+                if (!e.alive || !e.active) continue;
+                if (!e.on && !showDisabled) continue;
                 if (e.trigger && triggerFilter != 0 && e.kind != triggerFilterKinds[triggerFilter]) continue;
-                Bounds b;
-                try { b = c.bounds; } catch { continue; }
-                if (!c.enabled && b.size == Vector3.zero) { var tt = c.transform; b = new Bounds(tt.position, tt.lossyScale); }
-                if (!GeometryUtility.TestPlanesAABB(planes, b)) continue;
+                var b = e.b;
+                if (!InFrustum(b)) continue;
                 if ((b.center - camPos).magnitude > maxDistance + b.extents.magnitude) continue;
                 if (e.trigger) visibleTriggers++; else visibleSolids++;
-                int hop = ScopeHop(c.gameObject, b);
-                float a = c.enabled ? e.color.a : 0.3f;
+                int hop = ScopeHop(e.go, b);
+                float a = e.on ? e.color.a : 0.3f;
                 if (hop < 0) a *= 0.18f; else inScopeCount++;
                 curColor = new Color(e.color.r, e.color.g, e.color.b, a);
-                DrawCollider(c, b);
-                if (showLabels && e.trigger && LabelWanted(c, b, hop)) labels.Add(new KeyValuePair<Vector3, ColliderEntry>(b.center, e));
+                DrawEntry(e);
+                if (showLabels && e.trigger && LabelWanted(e.col, b, hop)) labels.Add(new KeyValuePair<Vector3, ColliderEntry>(b.center, e));
             }
             if (showLinks) DrawLinks();
             DrawAudioEmitters();
@@ -454,66 +546,63 @@ namespace InsideDev
             }
         }
 
-        void DrawCollider(Collider c, Bounds b)
+        void DrawEntry(ColliderEntry e)
         {
-            var t = c.transform;
-            var box = c as BoxCollider;
-            if (box != null) { LocalBox(t, box.center, box.size); return; }
-            var sph = c as SphereCollider;
-            if (sph != null)
+            if (e.shape == 1)
             {
-                Vector3 s = t.lossyScale;
-                float r = sph.radius * Mathf.Max(Mathf.Abs(s.x), Mathf.Max(Mathf.Abs(s.y), Mathf.Abs(s.z)));
-                Vector3 ctr = t.TransformPoint(sph.center);
-                Circle(ctr, r, Vector3.right, Vector3.up);
-                Circle(ctr, r, Vector3.right, Vector3.forward);
-                Circle(ctr, r, Vector3.up, Vector3.forward);
+                Circle(e.w[0], e.wr, Vector3.right, Vector3.up);
+                Circle(e.w[0], e.wr, Vector3.right, Vector3.forward);
+                Circle(e.w[0], e.wr, Vector3.up, Vector3.forward);
                 return;
             }
-            var cap = c as CapsuleCollider;
-            if (cap != null)
+            for (int i = 0; i < 8; i++) proj[i] = Project(e.w[i]);
+            for (int i = 0; i < 8; i++)
+                for (int bit = 1; bit < 8; bit <<= 1)
+                    if ((i & bit) == 0) Seg(proj[i], proj[i | bit]);
+        }
+
+        // world -> screen like Camera.WorldToScreenPoint (z = depth in front of the camera; <= 0 behind it)
+        Vector3 Project(Vector3 p)
+        {
+            float x = vp.m00 * p.x + vp.m01 * p.y + vp.m02 * p.z + vp.m03;
+            float y = vp.m10 * p.x + vp.m11 * p.y + vp.m12 * p.z + vp.m13;
+            float w = vp.m30 * p.x + vp.m31 * p.y + vp.m32 * p.z + vp.m33;
+            if (w <= 1e-5f) return new Vector3(0f, 0f, -1f);
+            return new Vector3((x / w * 0.5f + 0.5f) * pr.width + pr.x, (y / w * 0.5f + 0.5f) * pr.height + pr.y, w);
+        }
+
+        void Seg(Vector3 sa, Vector3 sb)
+        {
+            if (sa.z <= 0 || sb.z <= 0) return;
+            d.Line(new Vector2(sa.x, sh - sa.y), new Vector2(sb.x, sh - sb.y), curColor);
+        }
+
+        // view-projection frustum planes (left, right, bottom, top, near, far) as (normal, d)
+        void FrustumPlanes()
+        {
+            var r0 = new Vector4(vp.m00, vp.m01, vp.m02, vp.m03);
+            var r1 = new Vector4(vp.m10, vp.m11, vp.m12, vp.m13);
+            var r2 = new Vector4(vp.m20, vp.m21, vp.m22, vp.m23);
+            var r3 = new Vector4(vp.m30, vp.m31, vp.m32, vp.m33);
+            fpl[0] = r3 + r0; fpl[1] = r3 - r0; fpl[2] = r3 + r1; fpl[3] = r3 - r1; fpl[4] = r3 + r2; fpl[5] = r3 - r2;
+        }
+
+        bool InFrustum(Bounds b)
+        {
+            Vector3 mn = b.min, mx = b.max;
+            for (int i = 0; i < 6; i++)
             {
-                Vector3 size = new Vector3(cap.radius * 2, cap.radius * 2, cap.radius * 2);
-                size[cap.direction] = Mathf.Max(cap.height, cap.radius * 2);
-                LocalBox(t, cap.center, size);
-                return;
+                var pl = fpl[i];
+                float px = pl.x >= 0 ? mx.x : mn.x, py = pl.y >= 0 ? mx.y : mn.y, pz = pl.z >= 0 ? mx.z : mn.z;
+                if (pl.x * px + pl.y * py + pl.z * pz + pl.w < 0) return false;
             }
-            WorldBox(b.min, b.max);
+            return true;
         }
 
         // ---------------------------------------------------------------- primitives
         void Line(Vector3 a, Vector3 b)
         {
-            Vector3 sa = RenderScale.W2S(cam, a);
-            Vector3 sb = RenderScale.W2S(cam, b);
-            if (sa.z <= 0 || sb.z <= 0) return;
-            d.Line(new Vector2(sa.x, Screen.height - sa.y), new Vector2(sb.x, Screen.height - sb.y), curColor);
-        }
-
-        readonly Vector3[] corners = new Vector3[8];
-        void LocalBox(Transform t, Vector3 center, Vector3 size)
-        {
-            Vector3 h = size * 0.5f;
-            for (int i = 0; i < 8; i++)
-            {
-                var l = new Vector3((i & 1) != 0 ? h.x : -h.x, (i & 2) != 0 ? h.y : -h.y, (i & 4) != 0 ? h.z : -h.z);
-                corners[i] = t.TransformPoint(center + l);
-            }
-            Edges();
-        }
-
-        void WorldBox(Vector3 min, Vector3 max)
-        {
-            for (int i = 0; i < 8; i++)
-                corners[i] = new Vector3((i & 1) != 0 ? max.x : min.x, (i & 2) != 0 ? max.y : min.y, (i & 4) != 0 ? max.z : min.z);
-            Edges();
-        }
-
-        void Edges()
-        {
-            for (int i = 0; i < 8; i++)
-                for (int bit = 1; bit < 8; bit <<= 1)
-                    if ((i & bit) == 0) Line(corners[i], corners[i | bit]);
+            Seg(Project(a), Project(b));
         }
 
         void Circle(Vector3 c, float r, Vector3 ax, Vector3 ay)

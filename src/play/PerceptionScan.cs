@@ -9,10 +9,14 @@ using UObj = UnityEngine.Object;
 namespace InsideDev.Play
 {
     // PerceptionScan.cs (owner OBSERVE): what is around the body.
-    //   Component caches: one Object.FindObjectsOfType per game type (active objects only), refreshed round-robin one
-    //   type every other frame while an agent is active, only when the game advanced 30+ steps since that type's last
-    //   scan or a load changed the epoch (a frozen game rescans nothing); observe first rescans types older than 120
-    //   steps or from another epoch, 3 types per main-thread item. Scan cost per type is kept for observe full (perf).
+    //   Component caches: ONE Object.FindObjectsOfType(MonoBehaviour) pass fills every type at once (active objects
+    //   only; each concrete class is matched to the tracked types once and remembered), a separate FindObjectsOfType only
+    //   for a tracked type that is not a MonoBehaviour. A per-type pass walked all ~25 000 scene objects for each of ~40
+    //   types, one every other frame for 90 s after any agent call: ~6.5 ms of every frame and a GC every few seconds.
+    //   No background refresh by default (one pass is ~20 ms at 25 000 objects, a dropped frame each time): observe
+    //   rescans inline what is older than 120 steps or from another epoch, while the game waits for the agent anyway.
+    //   editor.cfg play.perception_bg_s = N > 0 refreshes stale caches in the background every N s of real time (never
+    //   while the real-time recorder films). The pass cost is kept for observe full (perf).
     //   Objects: cached interactables + grabbable rigidbodies from one Physics.OverlapSphere (BoyGrabState.IsGrabCollider)
     //   + ledges from the boy's status (edges below the boy = drops, obstructionPlateau = a climbable top). Every Device
     //   subclass comes from one Device scan plus the non-Device classes of DeviceKinds.ScanTypes (PerceptionKinds.cs):
@@ -69,8 +73,14 @@ namespace InsideDev.Play
 
         static readonly Dictionary<Type, TypeCache> caches = new Dictionary<Type, TypeCache>();
         static readonly List<TypeCache> order = new List<TypeCache>();
-        static int rr, lastTickScan = -100000;
+        static int lastTickScan = -100000;
+        static float lastFullAt = -100f;
+        static double lastFullMs;
         const int StaleSteps = 30;
+        static int bgCheck;
+        static float bgSeconds;
+        static readonly Dictionary<Type, int[]> matches = new Dictionary<Type, int[]>();
+        static readonly List<int> loose = new List<int>();
 
         static void InitCaches()
         {
@@ -86,6 +96,7 @@ namespace InsideDev.Play
             var c = new TypeCache { type = t };
             caches[t] = c;
             order.Add(c);
+            if (!typeof(MonoBehaviour).IsAssignableFrom(t)) loose.Add(order.Count - 1);
         }
 
         static bool Stale(TypeCache c) { return Stale(c, StaleSteps); }
@@ -98,16 +109,59 @@ namespace InsideDev.Play
 
         static void Scan(TypeCache c)
         {
+            ScanAll();
+        }
+
+        static void ScanAll()
+        {
             var sw = Stopwatch.StartNew();
-            UObj[] found;
-            try { found = UObj.FindObjectsOfType(c.type); }
-            catch { found = null; }
-            c.items = found ?? new UObj[0];
-            c.epoch = Observer.Epoch;
-            c.step = LogicManager.stepCount;
-            c.frame = Time.frameCount;
-            c.invalid = false;
-            c.ms = sw.Elapsed.TotalMilliseconds;
+            UObj[] all;
+            try { all = UObj.FindObjectsOfType(typeof(MonoBehaviour)); }
+            catch { all = null; }
+            var lists = new List<UObj>[order.Count];
+            if (all != null)
+            {
+                foreach (var o in all)
+                {
+                    if (o == null) continue;
+                    var ct = o.GetType();
+                    int[] idx;
+                    if (!matches.TryGetValue(ct, out idx)) { idx = Match(ct); matches[ct] = idx; }
+                    for (int k = 0; k < idx.Length; k++)
+                    {
+                        int i = idx[k];
+                        if (lists[i] == null) lists[i] = new List<UObj>();
+                        lists[i].Add(o);
+                    }
+                }
+            }
+            foreach (int i in loose)
+            {
+                UObj[] found;
+                try { found = UObj.FindObjectsOfType(order[i].type); }
+                catch { found = null; }
+                if (found != null) lists[i] = new List<UObj>(found);
+            }
+            double ms = sw.Elapsed.TotalMilliseconds;
+            for (int i = 0; i < order.Count; i++)
+            {
+                var c = order[i];
+                c.items = lists[i] != null ? lists[i].ToArray() : new UObj[0];
+                c.epoch = Observer.Epoch;
+                c.step = LogicManager.stepCount;
+                c.frame = Time.frameCount;
+                c.invalid = false;
+                c.ms = ms / Math.Max(1, order.Count);
+            }
+            lastFullMs = ms;
+            lastFullAt = Time.realtimeSinceStartup;
+        }
+
+        static int[] Match(Type ct)
+        {
+            var l = new List<int>();
+            for (int i = 0; i < order.Count; i++) if (order[i].type.IsAssignableFrom(ct)) l.Add(i);
+            return l.ToArray();
         }
 
         // a cache from an older epoch is rescanned inline while this frame's inline budget (8 ms) lasts; beyond it the
@@ -128,7 +182,7 @@ namespace InsideDev.Play
             {
                 int f = Time.frameCount;
                 if (f != inlineFrame) { inlineFrame = f; inlineMs = 0; }
-                if (inlineMs < InlineBudgetMs) { Scan(c); inlineMs += c.ms; }
+                if (inlineMs < InlineBudgetMs) { ScanAll(); inlineMs += lastFullMs; }
                 else scanPendingFrame = f;
             }
             return c.items;
@@ -149,13 +203,11 @@ namespace InsideDev.Play
         internal static bool RefreshSome(int n)
         {
             InitCaches();
-            int done = 0;
             foreach (var c in order)
             {
                 if (!Stale(c, ObserveStaleSteps)) continue;
-                if (done >= n) return true;
-                Scan(c);
-                done++;
+                ScanAll();
+                return false;
             }
             return false;
         }
@@ -168,14 +220,13 @@ namespace InsideDev.Play
         static void TickRefresh()
         {
             InitCaches();
-            int f = Time.frameCount;
-            if (f - lastTickScan < 2) return;
-            for (int i = 0; i < order.Count; i++)
+            if (--bgCheck <= 0) { bgCheck = 120; try { bgSeconds = EditorState.Get("play.perception_bg_s", 0f); } catch { bgSeconds = 0f; } }
+            if (bgSeconds <= 0f || Time.realtimeSinceStartup - lastFullAt < bgSeconds || Recorder.On) return;
+            foreach (var c in order)
             {
-                rr = (rr + 1) % order.Count;
-                if (!Stale(order[rr])) continue;
-                Scan(order[rr]);
-                lastTickScan = f;
+                if (!Stale(c)) continue;
+                ScanAll();
+                lastTickScan = Time.frameCount;
                 return;
             }
         }
@@ -193,7 +244,8 @@ namespace InsideDev.Play
                 if (c.ms > worst) { worst = c.ms; worstName = c.type.Name; }
                 if (Stale(c)) stale++;
             }
-            o["scan_ms_total"] = PlayShared.R(total, 2);
+            o["scan_ms_total"] = PlayShared.R(lastFullMs, 2);
+            o["scan_pass"] = "one FindObjectsOfType(MonoBehaviour) for all types";
             o["scan_ms_worst"] = PlayShared.R(worst, 2);
             o["scan_worst_type"] = worstName;
             o["stale_types"] = (double)stale;

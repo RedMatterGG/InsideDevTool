@@ -125,7 +125,9 @@ claude mcp add inside-play -- "C:\path\to\InsideDevTool\tools\mcp\InsideDev.McpS
 - `then:"run"` on `act` or `wait_until` leaves the game running after that one call (step mode stays chosen).
 - The game is never frozen while it loads. A freeze asked for during a load is applied once the game is ready
   (`freeze_deferred` warning), so after a checkpoint load in step mode the game runs until it is playable, then stops.
-- Step mode sets `captureFramerate` 60 and vSync 0 while a run is active and puts them back after it.
+- Step mode sets `captureFramerate` 60 and vSync 0 while a run is active and puts them back after it. In realtime vSync
+  stays off too while `editor.cfg` has `play.vsync_off` = 1 (the default from 0.8.0, a development tool); `play.vsync_off=0`
+  leaves the game's own vSync, and `time {op:"vsync", on:false}` then holds it off while an agent holds the clock (4.5).
 - In places that run on the music clock (mines shockwave, the lineup, lab lift and water lock) a step-mode run is paced
   to real time (60 Hz wall clock), because the music pauses while the game is frozen. Slow motion (`speed` other than 1)
   desyncs these places. `observe`, `time` and every action result warn `music_timed: <what>`. To act at a safe moment,
@@ -187,6 +189,33 @@ Every result is `structuredContent` with `ok` first (a compact JSON copy is the 
 - Arguments are checked strictly against the tool's input schema (`bad_args` with the path, for example
   `inputs[2].stick: expected 2 numbers`). A string where a number, boolean, array or object is expected is parsed when
   possible and reported in `warnings` as `coerced: ...`.
+
+### 4.5 Speed: frame meter, vSync and real-time recording
+
+vSync is off from the start by default (`play.vsync_off` = 1 in `editor.cfg`); the recorder and the fast screenshot run
+only when called, and `restore` stops a recording.
+
+| Need | Use | Why |
+|---|---|---|
+| know how fast the game renders | `time {op:"state"}`: `fps`, `frame_ms_max` | frames of the last second and the longest of them |
+| realtime without the 30 fps drop | `time {op:"vsync", on:false}` (console `vsync off`) | with vSync on, a frame a little over 16.7 ms halves the rate; restore key `vsync` |
+| watch or review a pass | `time {op:"record"}` ... `time {op:"record_stop", review_fps:5}` (console `rec start`, `rec stop 5`) | real-time video of the game window; no per-step screenshots |
+| one still, quickly | `screenshot {mode:"path", fast:true}` | skips the decode for the black check |
+
+The recorder runs ffmpeg with `ddagrab` (DXGI Desktop Duplication: the GPU copies the screen, the game's main thread does
+nothing) on the game window's client area and encodes with `hevc_nvenc` (`preset p6`, `tune hq`, constant quality `cq`,
+default 16) into `<game>\_mod\recordings\<date>_<time>.mkv`. The window and its monitor are found from inside the game
+in physical pixels; the DXGI output is the first one of the default graphics adapter with the monitor's size. Desktop
+duplication records what is on the screen: a window over the game is recorded too, so `raise:true` lifts the game window
+to the top without taking focus. ffmpeg comes from the `ffmpeg` argument, then the `INSIDEDEV_FFMPEG` environment
+variable, then `<game>\_mod\ffmpeg\ffmpeg.exe`, `C:/ffmpeg/bin/ffmpeg.exe` and `PATH`. A pass recorded this way runs
+in realtime: drive it with `act {hold:true, then:"run"}` and wall-clock waits, or let a person play.
+
+```json
+{"op": "vsync", "on": false}
+{"op": "record", "record_fps": 30, "cq": 16, "raise": true}
+{"op": "record_stop", "review_fps": 5}
+```
 
 ## 5. First steps
 
@@ -455,16 +484,25 @@ The game clock.
 
 | Parameter | Type | Default | Values | Meaning |
 |---|---|---|---|---|
-| `op` | enum | `state` | `state`, `step_mode`, `realtime`, `pause`, `resume`, `step`, `speed`, `rng_seed` | |
+| `op` | enum | `state` | `state`, `step_mode`, `realtime`, `pause`, `resume`, `step`, `speed`, `rng_seed`, `vsync`, `record`, `record_stop` | |
 | `steps` | integer | 1 | 1..600 | op step: logic steps to run, then freeze (switches a realtime clock to step mode) |
 | `speed` | number | 1 | 0.05..4 | op speed / realtime: game speed while running (stored only in step mode) |
 | `seed` | integer | 0 | 0..2147483647 | op rng_seed: sets `PDRandom.seed`, `RandomGenerator.ResetAll`, `UnityEngine.Random.seed` |
 | `observe` | enum | `concise` | `concise`, `none` | op step only |
+| `on` | boolean | true | | op vsync: true = the game's own vSync, false = off in realtime while an agent holds the clock |
+| `record_fps` | integer | 30 | 5..60 | op record: frames per second of the video |
+| `cq` | integer | 16 | 0..51 | op record: NVENC constant quality (lower is better and larger) |
+| `raise` | boolean | false | | op record: lift the game window to the top without taking focus |
+| `file` | string | `<date>_<time>.mkv` | | op record: file name in `<game>\_mod\recordings` |
+| `ffmpeg` | string | | | op record: path of `ffmpeg.exe` |
+| `review_fps` | number | 0 | 0..30 | op record_stop: also cut JPG review frames at this rate into `<file>_frames` |
 
 Returns `mode`, `frozen`, `speed`, `scale`, `game_scale`, `capture_fps`, `frame`, `step`, `music_s`, `loading`,
-`paused`, `running`, `freeze_pending`, `vsync`, `run_in_background`, `recording`, `pacing` (`real_time_60` or `none`),
-`warnings`; op step adds `steps_run`, `frames_run`, `stop`, `detail`, `changes`, `observe`; op rng_seed adds `seed`.
-`state` and `rng_seed` take no lane.
+`paused`, `running`, `freeze_pending`, `vsync`, `vsync_off`, `fps`, `frame_ms_max`, `run_in_background`, `recording`,
+`pacing` (`real_time_60` or `none`), `record {on, file, seconds, rect, problem, frames_dir}`, `warnings`; op step adds
+`steps_run`, `frames_run`, `stop`, `detail`, `changes`, `observe`; op rng_seed adds `seed`; op record_stop adds
+`stop_file`, `stop_mb`, `stop_seconds`, `stop_clean` and `stop_frames_dir`. `state`, `rng_seed`, `record` and `record_stop`
+take no lane (a recording runs next to any action).
 
 ```json
 {"op": "realtime", "speed": 1}
@@ -529,6 +567,7 @@ label, kind (button, slider, toggle, chapter, confirm, key, other), enabled, sel
 | `mode` | enum | `preview` | `preview`, `marked`, `full`, `path` | preview = inline PNG; marked = preview with the latest observe ids drawn; full / path = file only |
 | `max_width` | integer | 960 | 0..4096 | scale down to this width (0 = no scaling) |
 | `clean` | boolean | true | | hide InsideDev panels, HUD and overlays for the shot |
+| `fast` | boolean | false | | full / path: return once the file is written, without decoding it for the `black` check |
 
 The result is a JSON text block `{ok, mode, width, height, src_width, src_height, path, uri, black, frame, marks[{id,
 label, x, y}], camera {name, x, y, z, pitch, yaw, roll, fov}, boy {x, y, on_screen}, note}` plus the image. Image
@@ -911,6 +950,8 @@ clock (section 13) restarts with each one. Commands through the console or the f
 | job | the running action, ctl job or track playback is cancelled (not a MultiCam capture) |
 | `input` | held input and a grab grip released; the agent core removed (human control), `runInBackground` as before |
 | `time` | realtime, speed 1, unfrozen; `captureFramerate`, vSync and `runInBackground` as before |
+| `vsync` | the game's own vSync after `time {op:"vsync", on:false}` |
+| `record` | a running recording stopped (the file stays) |
 | `input_track` | playback cancelled, recording stopped (the track stays in memory) |
 | `camera` | a camera override released |
 | others | stream pins, god, air, hazards, menu lock, title hide, overlay text, render and audio changes, reflect writes with `restore_on_end` (dev tools) |

@@ -1,4 +1,4 @@
-# INSIDE runtime editor (InsideDev 0.7.0)
+# INSIDE runtime editor (InsideDev 0.8.0)
 
 An in-game editor and explorer for Playdead's INSIDE (Unity 5.0.4f1): browse and edit the live scene, see how
 objects, signals, PlayMaker state machines, code and audio are connected, record changes as mods, and inspect memory
@@ -6,6 +6,58 @@ with Cheat Engine.
 
 > Unofficial fan-made tool, not affiliated with or endorsed by Playdead. INSIDE is a trademark of Playdead.
 > This repository contains no game files or game code; you need your own copy of the game.
+
+## What's new in 0.8.0: the editor and its AI tools no longer slow the game down
+
+InsideDev used to cost the game most of its frame time. Every slowdown was found with measurements, not guesses, and
+rewritten at its cause. Same place in the game, fresh start each time, laptop with a Core i7-11370H and an RTX 3070 Laptop
+GPU at 2560x1440:
+
+| | 0.7.0 | 0.8.0 |
+|---|---|---|
+| Game fps with the default overlays (trigger boxes, labels) | 45 to 106 | **146 to 174** |
+| InsideDev's own time per frame while an AI agent works (`perf`) | 7.2 ms, peaks 21 ms | **0.57 ms**, peaks 6.7 ms |
+| Trigger and collider overlay per frame | about 13 to 17 ms | **about 3 ms** |
+| Agent perception scans per frame, for 90 s after every tool call | 6.6 ms | **0.13 ms** |
+| A 53 s test pass filmed for review | over 15 min (a screenshot every few steps) | **53 s** (real-time H.265 video) |
+| One screenshot written to a file | 2.0 to 3.1 s | **0.6 s** with `fast:true` |
+| vSync | on: a frame a little over 16.7 ms halved the game to about 30 fps | **off from the start** |
+
+**How they were found.** The built-in profiler (console `perf`) splits InsideDev's time per subsystem, and the Play
+extension's ticks now appear in it one by one (`play.perception`, `play.stepper`, `play.changelog` ...). Every overlay was
+switched off and on alone on a fresh start, and every fix was measured again in the game.
+
+**What was wrong, and the fix:**
+
+- **Agent perception scanned the whole scene one game type at a time, every other frame.** For 90 s after any MCP call
+  the caches behind `observe` ran `FindObjectsOfType` for one of about 40 game types every other frame, and every such call
+  walks all ~25 000 objects of the loaded levels: 6.6 ms of every frame, plus a garbage collection every few seconds on a
+  450 MB heap with pauses up to 0.8 s. Now one `FindObjectsOfType(MonoBehaviour)` pass fills every type at once (each
+  concrete class is matched to the tracked types once and remembered), and nothing runs in the background: `observe`
+  refreshes what is stale when it is called, while the game waits for the agent anyway.
+- **The trigger and collider overlay was rebuilt from nothing every frame.** For every collider of every loaded level it
+  asked the engine, every frame, whether the object was active and enabled and where its bounds were, then projected each
+  box with 24 `Camera.WorldToScreenPoint` calls (120 for a sphere), and it re-read every collider's components every 10 s.
+  Now each collider keeps its object, shape, world corners and bounds and asks the engine only every 8 frames, staggered;
+  frustum culling and the projection run in C# from one view-projection matrix per frame, and a rescan classifies new
+  colliders only. The same projection now draws savepoints, links and hidden markers.
+- **vSync halved the frame rate.** A frame a little longer than 16.7 ms waited for the next screen refresh, so the game
+  sat at 30 to 37 fps. InsideDev is a development tool, so it keeps vSync off from the start (`play.vsync_off=0` in
+  `editor.cfg` gives the game its own vSync back).
+- **Screenshots were the filming method.** Every one is a PNG the game encodes on its main thread and the server decodes
+  again to check for a black frame. Passes are now filmed as video instead, and a single shot can skip the decode.
+
+**New:**
+
+- **Real-time recorder**: `time {op:"record"}` and `{op:"record_stop", review_fps}`, console `rec start` / `rec stop`.
+  ffmpeg's `ddagrab` (DXGI Desktop Duplication: the graphics card copies the screen) and NVENC H.265 (`preset p6`,
+  `tune hq`, `cq 16`, about 18 Mbit/s at 2560x1440 30 fps) film the game window, so the game's main thread does no capture
+  work. The window and its monitor are found from inside the game; `raise` lifts the window to the top without taking
+  focus; `record_stop` can cut JPG review frames. No library was added to the tool: ffmpeg 6.1 or later is an external
+  program (on `PATH`, in `<game>\_mod\ffmpeg\` or at `INSIDEDEV_FFMPEG`), and the encoder needs an NVIDIA GPU.
+- **Frame meter**: `time {op:"state"}` reports `fps` and `frame_ms_max`, the longest frame of the last second.
+- **vSync switch**: console `vsync off|on|status`, `time {op:"vsync"}`.
+- **Fast screenshots**: `screenshot {mode:"path", fast:true}` returns once the file is written.
 
 ## What's new in 0.7.0
 
@@ -55,7 +107,8 @@ To uninstall, delete `version.dll` from the game folder (and `_mod\` if you want
 
 ### Switches and defaults
 
-Nothing added in 0.7.0 runs until you call it or install the optional file that has it. Settings are `key=value` lines in
+Nothing added in 0.7.0 or 0.8.0 runs until you call it or install the optional file that has it, except that vSync is
+off from the start in 0.8.0 (a development tool; `play.vsync_off=0` keeps the game's own). Settings are `key=value` lines in
 `<game>\_mod\editor.cfg`; the game reads the file once at start, so edit it with the game closed.
 
 | Feature | Default | On | Off |
@@ -74,6 +127,10 @@ Nothing added in 0.7.0 runs until you call it or install the optional file that 
 | Step mode (game frozen between calls) | chosen by the first action call | `time {op:"step_mode"}` | `time {op:"realtime"}`, `restore` |
 | Notes hotkey (with Play) | Home | `play.notes_key=<KeyCode>` | `play.notes_key=none` |
 | Checkpoint jumps, save guard (with Play) | off | `play.cheats=1`, `play.save_guard=1` | |
+| vSync off (with Play) | on: vSync off from the start | `play.vsync_off=1` | `play.vsync_off=0` (then `vsync off` / `time {op:"vsync", on:false}` holds it off while an agent holds the clock) |
+| Real-time recorder (with Play, needs ffmpeg with ddagrab and an NVIDIA GPU) | off | `time {op:"record"}`, `rec start` | `time {op:"record_stop"}`, `rec stop`, `restore`, game quit |
+| Fast screenshot (no black check) | off | `screenshot {mode:"path", fast:true}` | leave `fast` out |
+| Background refresh of agent perception (with Play) | off: refreshed when `observe` runs | `play.perception_bg_s=<seconds>` | `0` |
 | Lab modules (`lab`, `det`) | not installed | copy the DLLs, then a `lab` or `det` command | `lab stop`, `det stop`; delete the DLLs |
 
 ### Game code (`<game>\GameCode\`)

@@ -136,7 +136,8 @@ namespace InsideDev.McpExt
                 description = "Capture the game screen. preview = inline PNG (default 960 px wide, about 700 image tokens); marked = preview with observe ids drawn on objects; full or path = PNG file only. The JSON text has ok, mode, width, height, src_width, src_height, path, black (an almost black frame), frame and marks [{id, label, x, y}] (pixels in the image). No structuredContent, so clients that pass only structured results still get the image.",
                 inputSchema = Schema.Obj().Enum("mode", "preview, marked, full or path.", "preview", "preview", "marked", "full", "path")
                     .Int("max_width", "Scale down to at most this width (preview / marked). 0 = no scaling.", 960, 0, 4096)
-                    .Bool("clean", "Hide InsideDev panels, HUD and overlays for the shot.", true).Build() }.ReadOnly());
+                    .Bool("clean", "Hide InsideDev panels, HUD and overlays for the shot.", true)
+                    .Bool("fast", "full / path: return once the file is written, without decoding it for the black check (much faster at high resolutions; for many frames use time {op:\"record\"}).", false).Build() }.ReadOnly());
             l.Add(T("find_objects", "Find objects",
                 "Smart search over loaded objects by name, ranked by match and what the object does. Returns up to limit rows.",
                 Schema.Obj().Str("query", "Words to match against object names.")

@@ -466,7 +466,8 @@ namespace InsideDev.McpExt
             {
                 mode = HostText.Str(a, "mode", "preview"),
                 maxWidth = Math.Max(0, HostText.Int(a, "max_width", 960)),
-                clean = HostText.Bool(a, "clean", true)
+                clean = HostText.Bool(a, "clean", true),
+                fast = HostText.Bool(a, "fast", false)
             };
             var r = McpShot.Capture(ctx, req);
             if (r.error != null)

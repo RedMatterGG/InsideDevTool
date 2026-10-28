@@ -10,7 +10,7 @@ namespace InsideDev
     // Entry point called once by the version.dll proxy (via mono_runtime_invoke on the main thread).
     public static class Boot
     {
-        public const string Version = "0.7.0";
+        public const string Version = "0.8.0";
         static GameObject host;
 
         static DevCore core;

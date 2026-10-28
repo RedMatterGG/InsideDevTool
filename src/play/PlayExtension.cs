@@ -8,7 +8,7 @@ namespace InsideDev.Play
     // world tools (docs/MCP_PLAY_DESIGN.md). Hot-loadable with "ext load" after InsideDev.Mcp.dll. Start calls every
     // module's static Register() in a fixed order; modules add tools, resources, prompts, instruction paragraphs and
     // per-frame ticks to PlayRegistry. The extension is one IMcpToolProvider registered with McpRegistry.
-    // Bridge / console: play [status|tools|restore]
+    // Bridge / console: play [status|tools|restore], rec start|stop|status (Recorder.cs), vsync off|on|status (Stepper.cs)
     public sealed class PlayExtension : IInsideDevExtension, IMcpToolProvider, IDisposable
     {
         public string Name { get { return "Play (MCP play/world tools: " + PlayRegistry.ToolCount + ", problems: " + PlayRegistry.Problems.Count + ")"; } }
@@ -62,6 +62,15 @@ namespace InsideDev.Play
 
         public string Command(List<string> a, DevCore core)
         {
+            if (a.Count > 0 && a[0].ToLowerInvariant() == "rec") return Recorder.Command(a);
+            if (a.Count > 0 && a[0].ToLowerInvariant() == "vsync")
+            {
+                string v = a.Count > 1 ? a[1].ToLowerInvariant() : "status";
+                if (v == "off") return Stepper.Host.SetVsyncOff(true);
+                if (v == "on") return Stepper.Host.SetVsyncOff(false);
+                var s = Stepper.State();
+                return "vsync " + s["vsync"] + (Stepper.Host.VsyncOff ? " (held off)" : "") + ", fps " + s["fps"] + ", longest frame " + s["frame_ms_max"] + " ms   (vsync off | on)";
+            }
             if (a.Count == 0 || a[0].ToLowerInvariant() != "play") return null;
             string sub = a.Count > 1 ? a[1].ToLowerInvariant() : "status";
             if (sub == "tools")
@@ -202,12 +211,22 @@ namespace InsideDev.Play
         // throws is reported once in DevLog and keeps running.
         public static void OnTick(string name, Action fn) { ticks.Add(new TickEntry { name = name, fn = fn }); }
 
+        // every tick shows in the bridge command perf as play.<name> (part of Extensions); off when the core's Perf is not
+        // there (offline tests)
+        public static bool timed = true;
+
+        static void Timed(TickEntry t)
+        {
+            try { Perf.RunNested("play." + t.name, t.fn); }
+            catch (Exception) { timed = false; t.fn(); }
+        }
+
         public static void RunTicks()
         {
             for (int i = 0; i < ticks.Count; i++)
             {
                 var t = ticks[i];
-                try { t.fn(); }
+                try { if (timed) Timed(t); else t.fn(); }
                 catch (Exception e)
                 {
                     if (t.failed) continue;
