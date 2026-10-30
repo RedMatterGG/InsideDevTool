@@ -241,7 +241,7 @@ namespace InsideDev.Play
             return d;
         }
 
-        static string FindFfmpeg(string given)
+        internal static string FindFfmpeg(string given)
         {
             var tried = new List<string>();
             foreach (var c in new[] { given, Environment.GetEnvironmentVariable("INSIDEDEV_FFMPEG"), Path.Combine(ModDir(), "ffmpeg/ffmpeg.exe"), "C:/ffmpeg/bin/ffmpeg.exe" })

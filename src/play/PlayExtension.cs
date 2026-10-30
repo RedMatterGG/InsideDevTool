@@ -23,7 +23,7 @@ namespace InsideDev.Play
             M("Saves", Saves.Register), M("GuideBook", GuideBook.Register), M("Notes", Notes.Register),
             M("NavGeometry", NavGeometry.Register), M("WorldCamera", WorldCamera.Register), M("WorldLogic", WorldLogic.Register),
             M("Hazards", Hazards.Register), M("AudioRender", AudioRender.Register), M("Reflect", Reflect.Register),
-            M("StateDiff", StateDiff.Register), M("ActTrack", ActTrack.Register),
+            M("StateDiff", StateDiff.Register), M("ActTrack", ActTrack.Register), M("CamPath", CamPath.Register),
         };
 
         static KeyValuePair<string, Action> M(string name, Action register) { return new KeyValuePair<string, Action>(name, register); }
@@ -63,6 +63,8 @@ namespace InsideDev.Play
         public string Command(List<string> a, DevCore core)
         {
             if (a.Count > 0 && a[0].ToLowerInvariant() == "rec") return Recorder.Command(a);
+            if (a.Count > 0 && a[0].ToLowerInvariant() == "campath") return CamPath.Command(a);
+            if (a.Count > 0 && a[0].ToLowerInvariant() == "grec") return GameRec.Command(a);
             if (a.Count > 0 && a[0].ToLowerInvariant() == "vsync")
             {
                 string v = a.Count > 1 ? a[1].ToLowerInvariant() : "status";

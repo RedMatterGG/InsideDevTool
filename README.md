@@ -1,4 +1,4 @@
-# INSIDE runtime editor (InsideDev 0.8.0)
+# INSIDE runtime editor (InsideDev 0.9.0)
 
 An in-game editor and explorer for Playdead's INSIDE (Unity 5.0.4f1): browse and edit the live scene, see how
 objects, signals, PlayMaker state machines, code and audio are connected, record changes as mods, and inspect memory
@@ -6,6 +6,34 @@ with Cheat Engine.
 
 > Unofficial fan-made tool, not affiliated with or endorsed by Playdead. INSIDE is a trademark of Playdead.
 > This repository contains no game files or game code; you need your own copy of the game.
+
+## What's new in 0.9.0: film a planned camera over live play, from the game's own picture
+
+Two console commands of the Play extension turn a camera plan into a real film of the running game. Both run only when
+called and are stopped by `restore` or a game quit; nothing changes for anyone who does not use them.
+
+- **Live director camera (`campath`).** The main game camera follows a pose path planned in advance (`mcam passes` writes
+  one for every camera of a MultiCam spec, or any script can write the two CSV files) while the game itself plays. Every
+  frame is the game's own picture: live particles, shaders animated by time, mod effects and temporal anti-aliasing,
+  which a replay of a recording cannot fully rebuild. The pose goes on the camera in `Camera.onPreCull`, after the game's
+  camera script, so the game's camera logic, its culling and the input are untouched. In director mode the plan also
+  drives the clock: the game is held still during the plan's pauses and runs at the plan's speed otherwise, with the drift
+  corrected (measured under 0.04 s). `campath mount` rides the camera on a transform, for example the boy's head for a
+  first-person pass, with optional smoothing of the head bob, a level horizon and timed looks at points or objects.
+- **Video of the game's own frames (`grec`).** At the end of every n-th rendered frame the back buffer is copied on the
+  GPU by the native `InsideReadback` plugin; a background thread hands the frames to a separate ffmpeg process that
+  encodes them with NVENC H.265. Windows over the game, focus changes and other programs never reach the file, unlike the
+  desktop recorder of 0.8.0. 2560x1440 at 30 fps: 3222 frames grabbed, 0 dropped (laptop, RTX 3070 Laptop GPU).
+- **Input tracks wait for the director camera.** While `campath` holds the game still, an `input_track` playback no longer
+  ends as `stalled`.
+
+**Where the work runs.** The heavy part of `grec` runs off the game's main thread: the copy happens on the GPU on the
+render thread, the hand-over on a background thread, the encoding in a separate ffmpeg process on the video engine of the
+graphics card, so Windows spreads it over other CPU cores and the game keeps its frame time. Anything that touches game
+objects (the camera pose, state, input) still runs on the game's main thread, as Unity 5.0 requires. Nothing is pinned to
+a particular CPU core.
+
+How to use them: [docs/PLAY.md](docs/PLAY.md) section 4.6 and workflow 7.7.
 
 ## What's new in 0.8.0: the editor and its AI tools no longer slow the game down
 
@@ -107,7 +135,7 @@ To uninstall, delete `version.dll` from the game folder (and `_mod\` if you want
 
 ### Switches and defaults
 
-Nothing added in 0.7.0 or 0.8.0 runs until you call it or install the optional file that has it, except that vSync is
+Nothing added in 0.7.0, 0.8.0 or 0.9.0 runs until you call it or install the optional file that has it, except that vSync is
 off from the start in 0.8.0 (a development tool; `play.vsync_off=0` keeps the game's own). Settings are `key=value` lines in
 `<game>\_mod\editor.cfg`; the game reads the file once at start, so edit it with the game closed.
 
@@ -129,6 +157,8 @@ off from the start in 0.8.0 (a development tool; `play.vsync_off=0` keeps the ga
 | Checkpoint jumps, save guard (with Play) | off | `play.cheats=1`, `play.save_guard=1` | |
 | vSync off (with Play) | on: vSync off from the start | `play.vsync_off=1` | `play.vsync_off=0` (then `vsync off` / `time {op:"vsync", on:false}` holds it off while an agent holds the clock) |
 | Real-time recorder (with Play, needs ffmpeg with ddagrab and an NVIDIA GPU) | off | `time {op:"record"}`, `rec start` | `time {op:"record_stop"}`, `rec stop`, `restore`, game quit |
+| Live director camera (with Play) | off | `campath load <dir>` then `campath arm` or `campath start` | `campath stop`, `restore`, end of the path |
+| Game-render video (with Play, needs `InsideReadback.dll`, ffmpeg and an NVIDIA GPU) | off | `grec start <file.mkv>` | `grec stop`, `restore`, game quit |
 | Fast screenshot (no black check) | off | `screenshot {mode:"path", fast:true}` | leave `fast` out |
 | Background refresh of agent perception (with Play) | off: refreshed when `observe` runs | `play.perception_bg_s=<seconds>` | `0` |
 | Lab modules (`lab`, `det`) | not installed | copy the DLLs, then a `lab` or `det` command | `lab stop`, `det stop`; delete the DLLs |

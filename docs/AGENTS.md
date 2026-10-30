@@ -26,7 +26,7 @@ Contents
 |---|---|---|---|
 | Editor (core) | `bin\InsideDev.dll` in `<game>\_mod\` | the in-game editor, console and file bridge; the `srec`, `mcam`, `acap`, `cam`, `hud`, `clean`, `gamma`, `seed` commands | README.md, [RECORD_REPLAY.md](RECORD_REPLAY.md), [MULTICAM.md](MULTICAM.md), [AUDIO.md](AUDIO.md) |
 | MCP server | `bin\InsideDev.Mcp.dll` in `<game>\_mod\` | MCP on `http://127.0.0.1:47811` with the dev, play and all profiles; plain `POST /cmd`, `GET /state`, `GET /ping` | [MCP.md](MCP.md) |
-| Character control | `bin\InsideDev.Play.dll` in `<game>\_mod\` (needs the MCP server) | the 14 play tools (`observe`, `act`, `move_to`, `interact`, `wait_until`, `time`, `checkpoint`, `menu`, `screenshot`, `guide`, `notes`, `restore`, `input_track`, `geometry`), the dev world tools and the `ctl` console commands | [PLAY.md](PLAY.md) |
+| Character control | `bin\InsideDev.Play.dll` in `<game>\_mod\` (needs the MCP server) | the 14 play tools (`observe`, `act`, `move_to`, `interact`, `wait_until`, `time`, `checkpoint`, `menu`, `screenshot`, `guide`, `notes`, `restore`, `input_track`, `geometry`), the dev world tools, the `ctl` console commands, the live director camera `campath` and the game-render video `grec` | [PLAY.md](PLAY.md) |
 | Scene recorder and viewer | core | `srec record`, `srec load` and the recording viewer | [RECORD_REPLAY.md](RECORD_REPLAY.md), design notes [REPLAY_DESIGN.md](REPLAY_DESIGN.md) |
 | MultiCam | core (+ optional `bin\InsideReadback.dll` in `<game>\INSIDE_Data\Plugins\`) | multi-camera capture, replay passes from a recording, specs in `specs\` | [MULTICAM.md](MULTICAM.md), design notes [MULTICAM_DESIGN.md](MULTICAM_DESIGN.md) |
 | Game audio capture | core (+ optional `tools\muter\InsideMuter.exe`) | `acap` WAV capture with sync markers; InsideMuter mutes the game in Windows while it runs | [AUDIO.md](AUDIO.md) |
@@ -96,6 +96,8 @@ MCP).
 | Audio capture | off, output `audible` (the sound plays) | `acap start`, `srec record ... audio=on` | `acap stop` |
 | Muted capture output | off | `acap output muted` (only with the user's OK, section 5) | `acap output audible` |
 | InsideMuter | not running | the user starts `InsideMuter.exe` (it mutes the game) | it exits 10 s after the game |
+| Live director camera (Play) | off | `campath load <dir>`, `campath arm` / `start` | `campath stop`, `restore` |
+| Game-render video (Play, needs `InsideReadback.dll`, ffmpeg, NVIDIA) | off | `grec start <file.mkv>` | `grec stop`, `restore` |
 | Lab modules | not installed | copy the DLLs, `lab ...`, `det ...` | `lab stop`, `det stop`, delete the DLLs |
 
 ---
@@ -139,6 +141,10 @@ stop keep`, `srec load <dir>`, `srec seek`, fly the free camera, `srec end`; off
 (record once, film every camera from the recording), then `python -I tools/mcam_compose.py all <take>` and
 `python -I tools/mcam_qa.py qa <take>` ([MULTICAM.md](MULTICAM.md) sections 2, 3, 18).
 
+**Film a planned camera over live play.** Record the take as an input track and with `srec`, plan it with
+`mcam passes <spec> <dir>`, reset to the same checkpoint, `grec start <file.mkv>`, `campath load <dir>\passes director`,
+`campath arm`, play the track; `grec stop` when the path ends ([PLAY.md](PLAY.md) sections 4.6 and 7.7).
+
 **Capture the game's sound.** `acap preflight`, then `srec record start <dir> audio=on` (or `acap start <name>`), stop,
 then `python -I tools/mcam_audio.py align <dir>` ([AUDIO.md](AUDIO.md) section 3).
 
@@ -171,6 +177,8 @@ then `python -I tools/mcam_audio.py align <dir>` ([AUDIO.md](AUDIO.md) section 3
   capture (`mcam stop` does).
 - **The free camera blocks the body.** While it is on (Insert, `cam pose`, `srec load`, dev `camera pose`) the boy gets
   no input; release it first.
+- **`grec` follows rendered frames, not time.** The file is written at 60 / `every` fps; with vSync off (the default)
+  the game renders faster and the video plays slow. `vsync on` before a real-time film.
 - **After a MultiCam replay run** the game stays frozen (`ts 1` resumes) unless the spec says `restore: "reload"`.
 - **Updating a DLL.** `ext load` loads new DLLs only; replacing a loaded one needs a game restart.
 - **Paths.** Bridge and `mcam` / `srec` paths should be absolute; relative paths resolve against the game's working

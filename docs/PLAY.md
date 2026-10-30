@@ -217,6 +217,67 @@ in realtime: drive it with `act {hold:true, then:"run"}` and wall-clock waits, o
 {"op": "record_stop", "review_fps": 5}
 ```
 
+### 4.6 Live director passes: `campath` and `grec`
+
+Two console commands of Play (reachable from the console, `POST /cmd`, the file bridge and the dev `command` tool). Both
+are off until called; `restore` stops both (restore keys `campath`, `grec`).
+
+- `campath` puts the main game camera on a pose path planned in advance while the game itself runs. Every frame is the
+  game's own picture: live particles, shaders animated by time, mod effects, temporal anti-aliasing. The pose is set in
+  `Camera.onPreCull`, after the game's camera script, so only the rendered view changes: the game's camera logic, its
+  culling probe and the input stay as they are.
+- `grec` films the game's own frames into an H.265 file. At the end of every n-th rendered frame the native
+  `InsideReadback` plugin copies the back buffer on the GPU (render thread); a background thread hands the frames to a
+  separate ffmpeg process that encodes them with `hevc_nvenc`. Windows over the game, focus and other programs never reach
+  the file (the recorder of section 4.5 films the desktop instead).
+
+| Command | Does |
+|---|---|
+| `campath load <dir> [camera] [offset_s] [rt]` | reads `<dir>\poses.csv` and `<dir>\meta.csv` and keeps one camera's poses (default `director`); `offset_s` shifts the plan's game time; `rt`: the pose is looked up by game time, with no pauses or slow motion |
+| `campath arm` | starts with the first logic step of the next `input_track` playback |
+| `campath start` | starts at once |
+| `campath status` | `idle`, `armed` or `running` with output seconds, game time against plan time, `paused` or the speed |
+| `campath stop` | stops; the field of view, the near plane, the game speed and a freeze it made are put back |
+| `campath mount <transform path\|off> [lx ly lz] [rx ry rz] [fov] [near] [smooth] [into_scene_deg] [level] [hide] [tau_h tau_v tau_yaw tau_pitch] [pitch_max]` | the camera rides a transform (position and rotation every frame) and the plan keeps only the clock. Defaults: offsets 0, `fov` 60, `near` 0.03, `smooth` 0 (0..1), `into_scene_deg` 0, `level` 0 (0..1), `hide` 0, `tau_*` 0 s, `pitch_max` 89. `hide 1` collapses the transform while mounted (the boy's head for a first-person view); `tau_*` > 0 smooth position, yaw and pitch with those time constants and keep the roll at 0; `into_scene_deg` turns the view up to that angle toward +z (into the level), fading out while the view looks down 18 to 38 degrees; `level` takes that share of the roll out |
+| `campath look add <t0> <t1> <ease_s> <x> <y> <z>`, `campath look add <t0> <t1> <ease_s> @<transform path>`, `campath look clear` | while mounted, the view turns to a point or a transform between plan seconds `t0` and `t1`, eased in and out |
+| `grec start <file.mkv> [every] [cq]` | records every `every`-th rendered frame (default 2) with constant quality `cq` (default 16); give an absolute path |
+| `grec stop` | stops; the file is complete when `grec status` says `done` |
+| `grec status` | phase (`opening`, `recording`, `draining`, `closing`, `done`, `failed`), file, grabs, written, dropped, size and pixel format, seconds, error |
+
+**Clock of `campath`.** Output time runs with the wall clock at 30 poses a second. In director mode (without `rt`) the game
+is driven toward the plan's game time: frozen while the plan's speed is below the stepper's minimum (a paused tour),
+otherwise realtime at the plan's speed with a drift correction between 0.5x and 2x of it. An `input_track` playback waits
+while campath holds the game frozen. The path stops by itself at its last pose.
+
+**Plan files.** `mcam passes <spec> <out>` writes them for every camera of a spec into `<out>\passes\`
+([MULTICAM.md](MULTICAM.md) section 18.4); any script can write them too. `poses.csv`: a header with `step`, `camera`,
+`x`, `y`, `z` (adjacent), `fov` (vertical, degrees), `qx`, `qy`, `qz`, `qw` (adjacent) and an optional `near` (0 keeps
+the camera's); one row per camera and output step (30 a second). `meta.csv`: `step`, `game_time`, `speed`. A still
+camera for four seconds of a test looks like this (rows for steps 1 to 120 repeat the pose):
+
+```
+poses.csv
+step,camera,x,y,z,pitch,yaw,roll,fov,qx,qy,qz,qw,near
+0,director,412.0,-8.5,-9.0,8,0,0,40,0.069756,0,0,0.997564,0.1
+meta.csv
+step,game_time,rate,group,frame,sub,captured,speed,real_time,fixed_steps,segment
+0,0.000000,30,1,0,0,1,1,0.000000,0,0
+```
+
+**Frame rate of `grec`.** The file is written at 60 / `every` frames a second (30 for the default) and gets one frame per
+`every` rendered frames, so it plays at game speed only while the game renders 60 frames a second. vSync is off by default
+(section 4.5) and the game then renders faster: turn it on for a real-time file (`time {op:"vsync", on:true}`, console
+`vsync on`) and keep the frame time under 16.7 ms.
+
+**Needs.** `grec` needs `InsideReadback.dll` in `<game>\INSIDE_Data\Plugins\` (the optional MultiCam plugin), ffmpeg
+(the same lookup as the recorder: `INSIDEDEV_FFMPEG`, `<game>\_mod\ffmpeg\ffmpeg.exe`, `C:/ffmpeg/bin/ffmpeg.exe`,
+`PATH`) and an NVIDIA GPU. It cannot run together with a MultiCam run (`InsideReadback busy`): the plugin serves one owner.
+
+**Where the work runs.** Only the frame trigger runs on the game's main thread; the copy runs on the render thread on the
+GPU, the hand-over on the background thread `grec pump`, the encoding in the ffmpeg process on NVENC. Windows schedules
+these on other CPU cores, so the game's frame time stays free (2560x1440, 30 fps file: 3222 grabs, 0 dropped on a laptop
+RTX 3070). `campath` works inside the frame on the main thread, because it moves a game object (the camera).
+
 ## 5. First steps
 
 The loop: `observe` -> `act` / `move_to` / `interact` -> `wait_until` -> read `outcome`, `changes`, `observe` -> repeat.
@@ -745,6 +806,21 @@ check `observe.checkpoint` against the target:
 {"name": "wait_until", "arguments": {"any": [{"ready": true}], "timeout_s": 45}}
 ```
 
+### 7.7 Film a planned camera over live play
+
+1. Rehearse and record the take as an input track from a checkpoint (section 8). Record it once more with the scene
+   recorder (`srec record start <dir> spec=<spec> clock=fixed:60`) while the track plays.
+2. Plan the cameras: `mcam passes <spec> <dir>` writes `<dir>\passes\poses.csv` and `meta.csv` (no rendering).
+3. Reset to the same start: the same checkpoint, loaded once; release the free camera (`cam off`), it blocks the input.
+4. `time {op:"vsync", on:true}`, then `grec start <dir>\director.mkv`; wait until `grec status` says `recording`.
+5. `campath load <dir>\passes director`, `campath arm`, then `input_track {op:"play", name:"<track>", lockstep:true,
+   then:"run", wait:false}`. Read `grec status` right after `campath status` turns `running`: that grab count is the number of
+   frames before the first pose.
+6. When `campath status` is back to `idle`: `grec stop`, wait for `done`, then `restore`.
+
+A second camera of the same plan is the same run with another camera name; `rt` keeps the game at speed 1 for cameras that
+should not pause it.
+
 ## 8. Input tracks (rehearse, then take)
 
 Purpose: rehearse a scene in step mode (as slowly as needed), keep the exact input of every logic step, then play that
@@ -952,6 +1028,8 @@ clock (section 13) restarts with each one. Commands through the console or the f
 | `time` | realtime, speed 1, unfrozen; `captureFramerate`, vSync and `runInBackground` as before |
 | `vsync` | the game's own vSync after `time {op:"vsync", on:false}` |
 | `record` | a running recording stopped (the file stays) |
+| `campath` | the director camera stopped; field of view, near plane, game speed and freeze put back |
+| `grec` | a game-render video stopped and its file closed |
 | `input_track` | playback cancelled, recording stopped (the track stays in memory) |
 | `camera` | a camera override released |
 | others | stream pins, god, air, hazards, menu lock, title hide, overlay text, render and audio changes, reflect writes with `restore_on_end` (dev tools) |
@@ -1018,6 +1096,10 @@ action runs.
   `checkpoint next / prev / goto` write the spawn. Back up the save first if it matters (the dev `save {op:"backup"}` or
   a copy of the file). Tools never call Steam achievements directly, but the game's own code can award them during play,
   as for a person.
+- **Director camera and the free camera.** `cam pose` (the free camera) takes the input away from the boy, so an input
+  track played under it drives nothing: `cam off` before a `campath` run.
+- **`grec` speed.** The file runs at 60 / `every` frames a second; with vSync off the game renders faster and the video
+  plays slow. Turn vSync on for a real-time film (section 4.6).
 - **Updating Play.** `ext load` does not replace a loaded DLL: restart the game after copying a new one.
 
 ## 16. Settings

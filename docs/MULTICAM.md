@@ -1160,7 +1160,7 @@ The `replay` block (all keys in Section 19):
 | `mcam record <spec> <out>` | Record pass only. Writes `<out>/record/`. |
 | `mcam replay <spec> <out> [cams=a,b] [range=t0:t1]` | Load the recording (`replay.source` or `<out>/record`), plan, one pass per camera (directors after their sources). Writes the v2 take layout in `<out>`. |
 | `mcam take <spec> <out> [cams=a,b] [range=t0:t1]` | Record pass and replay passes in one session (no reload between them). |
-| `mcam passes <spec> <out> [cams=a,b] [range=t0:t1]` | Plan only: event times from the recording, segments, renders, copies, time and disk per camera. |
+| `mcam passes <spec> <out> [cams=a,b] [range=t0:t1]` | Plan only: event times from the recording, segments, renders, copies, time and disk per camera. Writes `<out>/passes/poses.csv` and `meta.csv`, which the Play command `campath` can fly over live play while `grec` films the game's own frames ([PLAY.md](PLAY.md) section 4.6). |
 | `mcam golden <spec> <out> [every]` | Golden test (Section 18.2 step 4); also writes `golden/noise/` (renders of one frozen frame, for the noise floor). |
 | `mcam status [json]` / `mcam stop` / `mcam abort` | As v2; states `recording` (t, samples, objects, MB, fps, drift) and `replay pass i/n <camera> step j/m eta`. Abort also stops a sound capture first. |
 | `srec load <dir>` / `srec play [speed] [loop]` / `srec pause` / `srec seek <t>` / `srec step <dt>` / `srec end` | Recording viewer: the scene follows the recording while you fly the free camera (no capture). |

@@ -261,6 +261,7 @@ namespace InsideDev.Play
             else if (LoadingNow()) { end = "loading"; detail = "a load started"; }
             else if (DeadNow()) { end = "died"; detail = "the body died"; }
             else if (step != p.lastStep) { p.lastStep = step; p.idleFrames = 0; }
+            else if (CamPath.Pausing) p.idleFrames = 0;
             else if (++p.idleFrames >= StallFrames) { end = "stalled"; detail = "no logic step for " + StallFrames + " frames (paused, menu or window focus)"; }
             if (end != null) { Finish(p, end, detail); return; }
             if (step < p.nextProgress) return;

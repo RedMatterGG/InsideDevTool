@@ -818,7 +818,7 @@ namespace InsideDev.McpExt
     // hashes.txt), so a client can tell which build answers. The core's Boot.Version is reported next to it, unchanged.
     public static class McpBuild
     {
-        public const string Version = "0.8.0";
+        public const string Version = "0.9.0";
         static readonly Dictionary<string, string> ids = new Dictionary<string, string>();
 
         // the build id of an assembly file ("unknown" when it has no file or cannot be read); cached per path
