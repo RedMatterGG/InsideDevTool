@@ -302,7 +302,7 @@ namespace InsideDev.Play
 
         static void PreCull(Camera cam)
         {
-            if (!running || cam == null || cam != Camera.main) return;
+            if (!running || Pano.Capturing || cam == null || cam != Camera.main) return;
             if (mountPath.Length > 0)
             {
                 if (mount == null) mount = Find(mountPath);

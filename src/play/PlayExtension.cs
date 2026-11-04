@@ -8,7 +8,8 @@ namespace InsideDev.Play
     // world tools (docs/MCP_PLAY_DESIGN.md). Hot-loadable with "ext load" after InsideDev.Mcp.dll. Start calls every
     // module's static Register() in a fixed order; modules add tools, resources, prompts, instruction paragraphs and
     // per-frame ticks to PlayRegistry. The extension is one IMcpToolProvider registered with McpRegistry.
-    // Bridge / console: play [status|tools|restore], rec start|stop|status (Recorder.cs), vsync off|on|status (Stepper.cs)
+    // Bridge / console: play [status|tools|restore], rec start|stop|status (Recorder.cs), vsync off|on|status (Stepper.cs),
+    // pano <file> ... | status (Pano.cs)
     public sealed class PlayExtension : IInsideDevExtension, IMcpToolProvider, IDisposable
     {
         public string Name { get { return "Play (MCP play/world tools: " + PlayRegistry.ToolCount + ", problems: " + PlayRegistry.Problems.Count + ")"; } }
@@ -65,6 +66,7 @@ namespace InsideDev.Play
             if (a.Count > 0 && a[0].ToLowerInvariant() == "rec") return Recorder.Command(a);
             if (a.Count > 0 && a[0].ToLowerInvariant() == "campath") return CamPath.Command(a);
             if (a.Count > 0 && a[0].ToLowerInvariant() == "grec") return GameRec.Command(a);
+            if (a.Count > 0 && a[0].ToLowerInvariant() == "pano") return Pano.Command(a, core);
             if (a.Count > 0 && a[0].ToLowerInvariant() == "vsync")
             {
                 string v = a.Count > 1 ? a[1].ToLowerInvariant() : "status";
