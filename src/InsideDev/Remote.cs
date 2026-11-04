@@ -632,6 +632,8 @@ namespace InsideDev
                         // perf | perf reset | perf enable <subsystem>
                         if (a.Count > 1 && a[1] == "reset") { Perf.Reset(); return "perf stats reset"; }
                         if (a.Count > 2 && a[1] == "enable") return Perf.Enable(a[2], true) ? a[2] + " re-enabled" : "no subsystem " + a[2];
+                        if (a.Count > 1 && a[1] == "hide") return a.Count > 2 ? Perf.Hide(a[2], a.Count > 3 ? a[3] : "") : "perf hide <root>[,<root>...] [name part | mesh:<mesh name prefix>]";
+                        if (a.Count > 1 && a[1] == "show") return Perf.Show();
                         return Perf.Report();
                     }
                 case "history": return ChangeRecorder.Dump(a.Count > 1 ? int.Parse(a[1]) : 30);

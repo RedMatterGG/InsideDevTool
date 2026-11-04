@@ -153,18 +153,33 @@ namespace InsideDev.McpExt
             try { RestoreNow("last MCP session closed " + grace + " s ago"); } catch (Exception e) { DevLog.Error("[mcp] restore after the last session", e); }
         }
 
+        static readonly Action pumpStep = MainQueue.Pump;
+        static readonly Action logStep = DrainLog;
+        static readonly Action discoveryStep = Discover;
+        static readonly Action sweepStep = HostJobs.Sweep;
+
+        static void DrainLog()
+        {
+            foreach (var line in HostLog.Drain()) DevLog.Write("[mcp] " + line);
+        }
+
+        static void Discover()
+        {
+            try { HostDiscovery.Check(); } catch (Exception e) { DevLog.Error("[mcp] provider discovery", e); }
+        }
+
         public void Tick(DevCore core)
         {
             ticks++;
-            foreach (var line in HostLog.Drain()) DevLog.Write("[mcp] " + line);
+            Perf.RunNested("mcp.log", logStep);
             try { captureBusy = MultiCam.Capturing; } catch { captureBusy = false; }
             if (ticks % 30 == 0) { try { ReadSettings(); } catch { } }
-            MainQueue.Pump();
+            Perf.RunNested("mcp.pump", pumpStep);
             CheckClosed();
-            if (ticks % 15 == 0) { try { HostDiscovery.Check(); } catch (Exception e) { DevLog.Error("[mcp] provider discovery", e); } }
+            if (ticks % 15 == 0) Perf.RunNested("mcp.discovery", discoveryStep);
             if (ticks % 60 == 0)
             {
-                HostJobs.Sweep();
+                Perf.RunNested("mcp.sweep", sweepStep);
                 if (HostDispatch.IdleRestoreDue(HostSettings.IdleRestoreS)) RestoreNow("no tool call for " + HostSettings.IdleRestoreS + " s");
             }
         }

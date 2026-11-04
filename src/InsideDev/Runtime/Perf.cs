@@ -64,7 +64,7 @@ namespace InsideDev
             {
                 // a garbage collection ran inside this subsystem's call: its pause is charged here but is caused by
                 // every allocation in the process (game + mod)
-                gcPauses++; if (ms > gcMaxMs) gcMaxMs = ms;
+                gcPauses++; if (ms > gcMaxMs) gcMaxMs = ms; if (ms > gcMaxSinceReset) gcMaxSinceReset = ms;
                 if (ms > 30 && gcLogs++ < 30) DevLog.Write("[perf] " + ms.ToString("0.0") + " ms in " + name + " included a garbage collection (GC #" + GC.CollectionCount(0) + ", heap " + (GC.GetTotalMemory(false) >> 20) + " MB)");
             }
             else { long d = GC.GetTotalMemory(false) - mem0; if (d > 0) s.allocBytes += d; s.allocCalls++; }
@@ -85,7 +85,57 @@ namespace InsideDev
             return true;
         }
 
-        public static void Reset() { foreach (var s in order) { s.allocBytes = s.allocCalls = 0; s.calls = 0; s.totalMs = s.maxMs = 0; s.winCount = s.wi = 0; s.openMs = s.closedMs = 0; s.openCalls = s.closedCalls = 0; } fc = fi = 0; }
+        static readonly List<Renderer> hiddenRenderers = new List<Renderer>();
+
+        public static string Hide(string roots, string part)
+        {
+            bool byMesh = part.StartsWith("mesh:", StringComparison.Ordinal);
+            string want = byMesh ? part.Substring(5) : part;
+            int off = 0, kept = 0, shadows = 0, found = 0;
+            long verts = 0;
+            var meshes = new HashSet<int>();
+            var mats = new HashSet<int>();
+            var missing = new List<string>();
+            foreach (var raw in roots.Split(','))
+            {
+                string rn = raw.Trim();
+                if (rn.Length == 0) continue;
+                var go = GameObject.Find(rn);
+                if (go == null) { missing.Add(rn); continue; }
+                found++;
+                foreach (var r in go.GetComponentsInChildren<Renderer>(false))
+                {
+                    if (!r.enabled) continue;
+                    var mf = r.GetComponent<MeshFilter>();
+                    var mesh = mf != null ? mf.sharedMesh : null;
+                    if (want.Length > 0)
+                    {
+                        bool match = byMesh ? mesh != null && mesh.name.StartsWith(want, StringComparison.Ordinal) : r.gameObject.name.IndexOf(want, StringComparison.OrdinalIgnoreCase) >= 0;
+                        if (!match) { kept++; continue; }
+                    }
+                    r.enabled = false;
+                    hiddenRenderers.Add(r);
+                    off++;
+                    if (r.shadowCastingMode != UnityEngine.Rendering.ShadowCastingMode.Off) shadows++;
+                    if (mesh != null && meshes.Add(mesh.GetInstanceID())) verts += mesh.vertexCount;
+                    foreach (var m in r.sharedMaterials) if (m != null) mats.Add(m.GetInstanceID());
+                }
+            }
+            return "perf hide: " + off + " renderer(s) off under " + found + " root(s)" + (missing.Count > 0 ? " (not found: " + string.Join(", ", missing.ToArray()) + ")" : "") +
+                   (want.Length > 0 ? ", " + kept + " not matching '" + part + "' kept" : "") + "; " + shadows + " shadow caster(s), " + meshes.Count + " mesh(es) with " + verts + " vertices, " +
+                   mats.Count + " material(s); lights untouched; " + hiddenRenderers.Count + " hidden in total (perf show restores)";
+        }
+
+        public static string Show()
+        {
+            int n = 0;
+            foreach (var r in hiddenRenderers) if (r != null) { r.enabled = true; n++; }
+            hiddenRenderers.Clear();
+            return "perf show: " + n + " renderer(s) back on";
+        }
+
+        static int gcAtReset = -1, gcPausesAtReset; static float resetAt; static double gcMaxSinceReset;
+        public static void Reset() { foreach (var s in order) { s.allocBytes = s.allocCalls = 0; s.calls = 0; s.totalMs = s.maxMs = 0; s.winCount = s.wi = 0; s.openMs = s.closedMs = 0; s.openCalls = s.closedCalls = 0; } fc = fi = 0; gcAtReset = GC.CollectionCount(0); gcPausesAtReset = gcPauses; gcMaxSinceReset = 0; resetAt = Time.realtimeSinceStartup; }
 
         public static double FrameAvg { get { double s = 0; for (int i = 0; i < fc; i++) s += frames[i]; return fc > 0 ? s / fc : 0; } }
         public static double FrameMax { get { double m = 0; for (int i = 0; i < fc; i++) if (frames[i] > m) m = frames[i]; return m; } }
@@ -95,6 +145,7 @@ namespace InsideDev
             var sb = new StringBuilder();
             sb.Append("InsideDev cost per frame (last ").Append(fc).Append(" frames): avg ").Append(FrameAvg.ToString("0.000")).Append(" ms, max ").Append(FrameMax.ToString("0.00")).Append(" ms   editor ").Append(editorOpen ? "OPEN" : "closed").Append('\n');
             sb.Append("  garbage collections: ").Append(GC.CollectionCount(0)).Append(" since start (").Append((GC.CollectionCount(0) / Math.Max(1f, Time.realtimeSinceStartup / 60f)).ToString("0.0")).Append("/min), ").Append(gcPauses).Append(" ran inside mod calls (max ").Append(gcMaxMs.ToString("0.0")).Append(" ms), heap ").Append(GC.GetTotalMemory(false) >> 20).Append(" MB\n");
+            if (gcAtReset >= 0) sb.Append("  since perf reset ").Append((Time.realtimeSinceStartup - resetAt).ToString("0.0")).Append(" s ago: ").Append(GC.CollectionCount(0) - gcAtReset).Append(" garbage collection(s), ").Append(gcPauses - gcPausesAtReset).Append(" inside mod calls (max ").Append(gcMaxSinceReset.ToString("0.0")).Append(" ms)\n");
             var l = new List<Sub>(order);
             l.Sort((a, b) => b.Avg.CompareTo(a.Avg));
             sb.Append("  subsystem                avg ms    max(win)   max(all)  closed avg  open avg   fails  alloc KB/call\n");
