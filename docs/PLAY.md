@@ -238,7 +238,7 @@ are off until called; `restore` stops both (restore keys `campath`, `grec`).
 | `campath start` | starts at once |
 | `campath status` | `idle`, `armed` or `running` with output seconds, game time against plan time, `paused` or the speed |
 | `campath stop` | stops; the field of view, the near plane, the game speed and a freeze it made are put back |
-| `campath mount <transform path\|off> [lx ly lz] [rx ry rz] [fov] [near] [smooth] [into_scene_deg] [level] [hide] [tau_h tau_v tau_yaw tau_pitch] [pitch_max]` | the camera rides a transform (position and rotation every frame) and the plan keeps only the clock. Defaults: offsets 0, `fov` 60, `near` 0.03, `smooth` 0 (0..1), `into_scene_deg` 0, `level` 0 (0..1), `hide` 0, `tau_*` 0 s, `pitch_max` 89. `hide 1` collapses the transform while mounted (the boy's head for a first-person view); `tau_*` > 0 smooth position, yaw and pitch with those time constants and keep the roll at 0; `into_scene_deg` turns the view up to that angle toward +z (into the level), fading out while the view looks down 18 to 38 degrees; `level` takes that share of the roll out |
+| `campath mount <transform path\|off> [lx ly lz] [rx ry rz] [fov] [near] [smooth] [into_scene_deg] [level] [hide] [tau_h tau_v tau_yaw tau_pitch] [pitch_max] [free_up free_down]` | the camera rides a transform (position and rotation every frame) and the plan keeps only the clock. Defaults: offsets 0, `fov` 60, `near` 0.03, `smooth` 0 (0..1), `into_scene_deg` 0, `level` 0 (0..1), `hide` 0, `tau_*` 0 s, `pitch_max` 89, `free_up` and `free_down` 0 (no extra limit; section 4.8). `hide 1` collapses the transform while mounted (the boy's head for a first-person view); `tau_*` > 0 smooth position, yaw and pitch with those time constants and keep the roll at 0; `into_scene_deg` turns the view up to that angle toward +z (into the level), fading out while the view looks down 18 to 38 degrees; `level` takes that share of the roll out |
 | `campath look add <t0> <t1> <ease_s> <x> <y> <z>`, `campath look add <t0> <t1> <ease_s> @<transform path>`, `campath look clear` | while mounted, the view turns to a point or a transform between plan seconds `t0` and `t1`, eased in and out |
 | `grec start <file.mkv> [every] [cq]` | records every `every`-th rendered frame (default 2) with constant quality `cq` (default 16); give an absolute path |
 | `grec stop` | stops; the file is complete when `grec status` says `done` |
@@ -277,6 +277,117 @@ step,game_time,rate,group,frame,sub,captured,speed,real_time,fixed_steps,segment
 GPU, the hand-over on the background thread `grec pump`, the encoding in the ffmpeg process on NVENC. Windows schedules
 these on other CPU cores, so the game's frame time stays free (2560x1440, 30 fps file: 3222 grabs, 0 dropped on a laptop
 RTX 3070). `campath` works inside the frame on the main thread, because it moves a game object (the camera).
+
+### 4.7 360 degree panorama: `pano`
+
+One console command of Play (console, `POST /cmd`, the file bridge, the dev `command` tool, `tools\inside_ctl.py`) writes one
+equirectangular PNG. It is off until you call it, keeps nothing running afterwards and never touches the sound.
+
+The six cube faces are six ordinary game frames: the free camera is put at the eye, looking along the face, with a field of
+view of 90 degrees over the shorter side of the game view; the next frame runs the whole game path at that pose (streaming,
+culling, lighting, fog, water, the post chain) and the centre square of its picture is read. A worker thread then builds the
+panorama off the main thread. While it runs, `pano` switches editor overlays off (`clean on`, put back afterwards), turns off
+barrel distortion, chromatic aberration, motion blur and the temporal history at the start of each face, and suspends a running
+`campath`; all of it comes back after the capture.
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `<file.png>` | required | absolute path; `.png` is added if missing. An existing file is replaced. `<file>.json` is written next to it |
+| `size=<n>` or a bare number | 4096 | panorama width, 256..16384, rounded down to a multiple of 4; the height is half of it |
+| `x y z` or `eye=x,y,z` | the boy's head bone + 0.10 m | the eye. Give it whenever there is no boy, or he is not where you want the eye |
+| `noVignette` (or `vignette=0`) | vignette kept | leaves the screen-space vignette out |
+| `lens` | off | keeps barrel distortion and chromatic aberration (they bend the face edges) |
+| `near=<m>` | the camera's own | near clip, above 0, at most 10 m. Use a small value inside tight rooms and at the head (`near=0.05`) |
+| `warm=<n>` | 1 | frames per face that only settle, 0..30 |
+| `samples=<n>` | 1 | jittered frames per face accumulated as anti-aliasing, 1..16 |
+| `faces=<dir>` | off | also writes `front.png`, `right.png`, `back.png`, `left.png`, `up.png`, `down.png` at full face size |
+| `compress` | off | deflates the PNG inside the game (about 10 s at 4096x2048, against under 1 s for the default stored PNG, which is a much larger file). Or recompress it afterwards with any PNG tool |
+| `delay=<n>` | 2 | frames between switching the overlays off and the first face, 0..120 |
+
+Also `pano status`, `pano help`. Faces have the shorter side of the game view in pixels: a 2560x1440 game view gives 1440 px per
+face, enough for a panorama width of 5760. A wider `size` only interpolates; when the faces hold at least twice what the width
+needs, a box filter averages them down.
+
+**Do it by hand.**
+
+1. Open the console (backquote key), or use `python tools\inside_ctl.py <command>` from a command prompt, which also prints the
+   replies. Stand where you want the panorama, or load a recording and seek (section 7.8).
+2. Type `pano C:/shots/room.png`. The reply is `pano #1 queued: C:/shots/room.png 4096x2048, eye head + 0.1 m, 2 frame(s) per face,
+   stored PNG; pano status`.
+3. You see the picture jump through six directions for under a second to about a second, depending on the frame rate, then the game
+   view comes back as it was.
+4. Type `pano status` until it says `pano #1 done C:/shots/room.png 4096x2048 from 6 x 1440 px faces in 13 frame(s): capture 781 ms,
+   convert 659 ms, write 741 ms, total 2267 ms`, a few seconds. Warnings, if any, follow that line and are in the JSON file.
+5. Open `room.png` in a panorama viewer; the file carries the GPano metadata that viewers read. In a plain image viewer it is a
+   2:1 picture: the middle of the image looks along world +z, into the level; world +x is at three quarters of the width; the top
+   edge looks straight up.
+
+There is nothing to switch off afterwards. A capture in progress ends with `restore`. `<file>.json` holds the eye, the
+orientation, the game time, `srec_t` in the recording viewer, the original camera, the timings and the warnings.
+
+**If it goes wrong.**
+
+| You see | Why | Do |
+|---|---|---|
+| `pano: busy with #N (...)` | a capture or its conversion runs | `pano status` until it ends. A capture stalled over 30 s (a level load) is dropped by the next `pano` |
+| `pano: mcam is capturing` | a MultiCam run holds the camera | wait for it, or `mcam stop` |
+| `pano #N failed: no head bone (...); give x y z` | no boy in this level state | give the eye: `pano C:/shots/room.png 412 -8.5 -9` |
+| `... failed: capture state lost (restore or level load)` | `restore` came during the capture | run it again. The camera is back already (tested); a load can end it the same way (from the code: a checkpoint reload during a capture in the test did not interrupt it) |
+| `... failed: view size changed during the capture` | the game window was resized | keep the window as it is |
+| `... failed: camera view WxH too small` | the game window is very small | make it larger |
+| `pano status` stays at `queued` | the window is minimized: a minimized game runs no frames | restore the window |
+| warning `camera moved off the face pose before the read` | something else moved the camera in that frame | stop what moves it (a MultiCam run, a script); look at the face in `faces=` |
+| the panorama shows a different place than the recording | `srec load` refused, the viewer never started (seen once at 1.1 % unresolved objects in a fresh session) | read the reply of `srec load`; `srec load <dir> maxUnresolved=0.03` if the missing objects do not matter |
+| seams of slightly different brightness | bloom and vignette work on the screen, per face (expected from how they work) | `noVignette`; the seams are weak |
+
+**Limits.** The recording viewer (`srec pause`, `srec seek`) is the safest place: nothing moves there. In live play the game keeps
+running during the 13 frames (151 to 272 ms in a small room of the game), so moving things shift between faces by their speed times
+that time (from the code, not measured on anything moving; at an idle spot no shift showed). `ts 0` before and `ts 1` after also works
+(tested once). `grec`, `rec` and `srec record` are not refused: a `pano` during a `grec` ended with no warning and the film went on with
+no frame dropped, so the film holds the six faces (from the code, that film was not viewed). Do not run them together. A checkpoint
+reload during a capture did not interrupt it in one test, so its faces can come from the load: take it again. Levels the game has not
+streamed in for the eye stay missing; `warm` gives streaming more frames (inferred, not measured).
+
+### 4.8 A first-person camera by hand: `campath mount` and its free-look limits
+
+`campath mount` rides the main camera on a transform (full argument list in section 4.6). This is how the first-person passes of
+a long bunker route in a mod scene were filmed. The stabiliser (`tau_*` above 0) follows the head with time constants and keeps
+the roll at 0. New in 0.10.0: outside the timed looks, `free_up` and `free_down` (the last two arguments, degrees) limit how far
+the head may tilt the view up and down, so the eye does not swing to the ceiling on a ladder. Inside a look they blend to
+`pitch_max` with the look's own weight, so a look at something high is still reached. They act only with the stabiliser on
+(`tau_h` or `tau_v` above 0); 0 or left out means no extra limit, exactly as before.
+
+The mount keeps only the clock from the plan, so a still plan is enough. This writes one of 60 s (save as `make_plan.py`, run it
+with Python 3 once):
+
+```
+import pathlib
+d = pathlib.Path(r"C:\films\plan"); d.mkdir(parents=True, exist_ok=True)
+n = 60 * 30
+(d / "poses.csv").write_text("step,camera,x,y,z,fov,qx,qy,qz,qw\n" + "".join(f"{i},director,0,0,0,60,0,0,0,1\n" for i in range(n + 1)))
+(d / "meta.csv").write_text("step,game_time,speed\n" + "".join(f"{i},{i / 30:.6f},1\n" for i in range(n + 1)))
+```
+
+Then, in the game, with the boy in play:
+
+1. `campath load C:/films/plan director 0 rt`. The reply names 1801 poses. `rt` leaves the game's clock alone.
+2. `campath mount _Boy/_BoyPreprocessed/visual/Boy/Head 0 0.10 -0.06 -6 0 0 70 0.05 0 20 1 1 0.12 0.35 0.30 0.45 75 8 30`. In order:
+   local offset 0, 0.10, -0.06 m; local rotation -6, 0, 0; `fov` 70; `near` 0.05; `smooth` 0; `into_scene_deg` 20 (see section 4.6:
+   the sets have no back side); `level` 1; `hide` 1 (collapses the head); `tau_h` 0.12, `tau_v` 0.35, `tau_yaw` 0.30, `tau_pitch` 0.45;
+   `pitch_max` 75; `free_up` 8; `free_down` 30. The reply ends with `pitch within 75 deg, free eye -8..+30 deg)`.
+3. `campath start`. The view moves into the boy's head; you still play him normally. Climb a ladder: the view does not tilt more than
+   8 degrees up. To compare, repeat step 2 without the last two numbers.
+4. To add a timed look: `campath look add 10 14 0.8 412 -8 2` turns the view to that point between plan seconds 10 and 14.
+5. To switch off: `campath stop`, then `campath mount off` (the mount stays set for the next start otherwise) and `campath look clear`.
+   The field of view and the near plane come back; `restore` does the same as `campath stop`.
+
+| If you see | Do |
+|---|---|
+| `campath: no poses.csv / meta.csv in ...`, or `no poses of camera 'director'` | check the folder and the camera name in the file |
+| the reply says `not found yet, retried every frame` | the transform does not exist yet or the path is wrong; correct the path, or wait for the boy to load |
+| no `free eye` in the reply | `tau_h` and `tau_v` are 0 (the limits then do nothing), or both limits are at or above `pitch_max` |
+| the boy's head or neck is in the picture | `hide 1`, or a larger `near` |
+| the far end of a room flickers between two brightness levels | see "First-person flicker" in section 15 |
 
 ## 5. First steps
 
@@ -821,6 +932,18 @@ check `observe.checkpoint` against the target:
 A second camera of the same plan is the same run with another camera name; `rt` keeps the game at speed 1 for cameras that
 should not pause it.
 
+### 7.8 A panorama of a moment in a recording
+
+The recording viewer holds the whole scene still at any second of a take, which is the safest place for `pano` (section 4.7).
+
+1. Record the take: `srec record start <dir>`, play, `srec record stop keep`.
+2. `srec load <dir>`. Read the reply; if it refuses, the viewer did not start and a panorama would show the live level.
+3. `srec pause`, then `srec seek 37.5` (seconds into the take).
+4. `pano C:/shots/t37.png near=0.05`. With no eye given, the eye is the boy's head of the recording at that second.
+5. `pano status` until `done`, then the next `srec seek` and `pano`. `srec end` when you are finished.
+
+The JSON file has `srec_t`, so every panorama says which second it shows.
+
 ## 8. Input tracks (rehearse, then take)
 
 Purpose: rehearse a scene in step mode (as slowly as needed), keep the exact input of every logic step, then play that
@@ -858,8 +981,10 @@ Rules and limits:
 - Lockstep runs one logic step per rendered frame: when the game renders below 60 fps the take plays slower than real
   time (about 0.6x at 36 to 42 fps in tests); game time per step stays exact. `lockstep:false` keeps the game's own
   timing at any frame rate (use it when sound must follow the wall clock).
-- A playback is a detached job: the host cancels detached jobs after 10 minutes, so a take longer than 10 minutes is
-  cut. A scene recorder that runs during play owns the frame pacing (the take follows its clock).
+- A playback is a detached job: the host cancels detached jobs after 45 minutes (10 before 0.10.0), so a take that needs
+  longer on the wall clock is cut. Lockstep can take far longer than the track: a 431 s take at 0.65x real time needs about 660 s.
+  `input_track {op:"status"}` says `done` for every kind of end; the real reason is in `jobs {op:"status", id}` (`outcome`,
+  `stop_reason`, `cancel_reason`). A scene recorder that runs during play owns the frame pacing (the take follows its clock).
 - Files: `<game>\_mod\input_tracks\<name>.json`. Line 1 is `{"header":{format "insidedev.input_track", version 1,
   name, created, body, subscene, savepoint, checkpoint, clock, source, load_count, start_step, start_time, step_s,
   steps, frames, seconds, trimmed}`, line 2 the columns `k, t, sx, sy, b, px, py, pz, vx, vy, vz, f` (b = 1 jump + 2
@@ -1030,6 +1155,7 @@ clock (section 13) restarts with each one. Commands through the console or the f
 | `record` | a running recording stopped (the file stays) |
 | `campath` | the director camera stopped; field of view, near plane, game speed and freeze put back |
 | `grec` | a game-render video stopped and its file closed |
+| `pano` | a running panorama capture ended; camera, TAA and post settings put back |
 | `input_track` | playback cancelled, recording stopped (the track stays in memory) |
 | `camera` | a camera override released |
 | others | stream pins, god, air, hazards, menu lock, title hide, overlay text, render and audio changes, reflect writes with `restore_on_end` (dev tools) |
@@ -1091,7 +1217,7 @@ action runs.
 - **Busy from outside.** A ctl job, a dev-profile action or a MultiCam capture (a separate InsideDev feature) holds the
   control lane; `restore` does not cancel a MultiCam capture (console `mcam stop` does). Dev tools such as `command` do
   not take the lane and can change time or load while a play action runs.
-- **Long tracks.** Detached jobs end after 10 minutes, so a track playback longer than that is cut.
+- **Long tracks.** Detached jobs end after 45 minutes, so a track playback that needs longer on the wall clock is cut (section 8).
 - **Saves.** Playing forward writes `INSIDE.sav` (the Steam Cloud save) at checkpoints exactly as a person playing does.
   `checkpoint next / prev / goto` write the spawn. Back up the save first if it matters (the dev `save {op:"backup"}` or
   a copy of the file). Tools never call Steam achievements directly, but the game's own code can award them during play,
@@ -1100,6 +1226,13 @@ action runs.
   track played under it drives nothing: `cam off` before a `campath` run.
 - **`grec` speed.** The file runs at 60 / `every` frames a second; with vSync off the game renders faster and the video
   plays slow. Turn vSync on for a real-time film (section 4.6).
+- **Panorama and the free camera.** `pano` uses the free camera and gives it back, also when `restore` ends the capture (section 4.7).
+- **First-person flicker.** Observed on a first-person pass of a long bunker route: the frame flipped at random between two
+  brightness levels (24 and 29 of 255) in one hall, though the eye stood still, while the director camera in the same seconds was
+  steady. The eye looked along the level, and the main camera's far clip of 600 m made the game stream far levels in (43 of 251
+  active). Setting the far clip to 200 m took the flips from 73 % of the frames to 0 % and the active levels to 31, with the dev
+  tool `reflect {op:"set", object:"_Camera_Main", component:"Camera", member:"farClipPlane", value:200, restore_on_end:true}`. All
+  of that is observed; which streamed level disturbs the frame is not known. Pick a far clip longer than your longest sight line.
 - **Updating Play.** `ext load` does not replace a loaded DLL: restart the game after copying a new one.
 
 ## 16. Settings

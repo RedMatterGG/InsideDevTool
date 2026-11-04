@@ -112,7 +112,7 @@ Environment variables: `INSIDEDEV_MCP_TOKEN` (stdio program and inside_ctl.py), 
 inside_ctl.py `INSIDE_MCP_PORT`, `INSIDE_BRIDGE`, `INSIDE_GAME`.
 
 Built-in limits (not settings): tool budget 55 s plus 2.5 s grace; at most 128 sessions, a session unused for 6 h is
-dropped; finished jobs are kept 10 minutes (the last 50); detached jobs are cancelled after 10 minutes; the newest 200
+dropped; finished jobs are kept 10 minutes (the last 50); detached jobs are cancelled after 45 minutes; the newest 200
 screenshots are kept; `_mod\mcp_audit.jsonl` rotates at 5 MB.
 
 ## 4. Endpoints and profiles
@@ -313,7 +313,12 @@ The text tools of the server (`game_state`, `find_objects`, `inspect`, `select`,
 - Waiting for a job: `wait_until {any:[{job:"j7"}], timeout_s:50}` (both profiles; watches without the lane) or
   `jobs {op:"await", id:"j7", timeout_s}` (dev). Cancelling: `jobs {op:"cancel", id}` (dev), `restore`, or the call's
   own `notifications/cancelled`. A cancelled action releases its input and freezes the game again.
-- Detached jobs running longer than 10 minutes are cancelled, and failed 5 s later if they do not end.
+- Detached jobs running longer than 45 minutes (10 before 0.10.0) are cancelled with the reason `job ran longer than 2700 s`, and
+  failed 5 s later if they do not end. The limit is built in, not a setting. Why it grew: a lockstep pass runs below real time on
+  a busy machine, and a 431 s take that needed about 660 s of wall clock at 0.65x was cut at 600 s.
+- The other side of that limit: a control job that hangs keeps the lane (`busy` for every action) and the idle restore waits while
+  a control job runs, so without a call the game can stay in agent mode for up to 45 minutes instead of 10. By hand: `mcp jobs` shows
+  it, `jobs {op:"cancel", id}`, `restore` or `mcp restore` ends it at once.
 - Progress notifications (only when the request carried a progress token): calls that run the game report `step n/N`
   (`act`, `interact`, `wait_until`, `time step`, ctl jobs), `move_to` reports its x and goal, a watch-only wait reports
   elapsed ms, `input_track` play reports `step n/N`, `run_scenario` the step index, `jobs await` the time waited. Loads
@@ -713,6 +718,66 @@ command tool refuses).
 | `ext` | loaded extensions and problems |
 | `ext load` | load new `_mod\InsideDev.*.dll` files |
 | `ctl ...` | character control (PLAY.md section 11) |
+| `perf ...` | the profiler (section 13.1; not in the in-game console) |
+| `pano ...`, `campath ...`, `grec ...` | panorama, live director camera, game-render video (PLAY.md sections 4.6 to 4.8) |
+
+### 13.1 `perf`: the built-in profiler
+
+`perf` answers through the file bridge, `POST /cmd`, the dev `command` tool and `tools\inside_ctl.py`; the in-game console does not
+know the word, but the editor's Diagnostics panel shows the same report. It measures InsideDev itself (not the game) and always runs:
+only `hide` changes anything in the scene.
+
+| Command | Does |
+|---|---|
+| `perf` | the report: cost per frame over the last 300 frames, garbage collections, one row per subsystem |
+| `perf reset` | clears the rows and starts the "since perf reset" line |
+| `perf enable <subsystem>` | switches a subsystem back on after the fail-safe took it off (30 exceptions in a row) |
+| `perf hide <root>[,<root>...] [name part \| mesh:<prefix>]` | disables the renderers under active objects named `<root>`; with a name part only renderers whose object name contains it (any case), with `mesh:` only those whose mesh name starts with the prefix (exact case). Lights stay on |
+| `perf show` | enables everything `perf hide` disabled |
+
+What the report says (the layout; the numbers are an example):
+
+```
+InsideDev cost per frame (last 300 frames): avg 0.570 ms, max 6.70 ms   editor closed
+  garbage collections: 31 since start (1.9/min), 12 ran inside mod calls (max 516.0 ms), heap 450 MB
+  since perf reset 10.0 s ago: 0 garbage collection(s), 0 inside mod calls (max 0.0 ms)
+  subsystem                avg ms    max(win)   max(all)  closed avg  open avg   fails  alloc KB/call
+  Extensions               0.1200      1.300      13.00      0.1200         -       0            1.5
+  mcp.pump                 0.0100      0.500     127.70      0.0100         -       0            0.0  (part of EditorUI)
+```
+
+- The `max` on the second line is the session's longest pause, so one load can stay in it for hours. The `since perf reset` line (new
+  in 0.10.0) has its own count and maximum, so every measuring window shows its own collections. It appears after the first `perf reset`.
+- A pause is charged to the call a collection happened to run in, and every allocation in the process causes it: a row with a big
+  `max(all)` and a collection in the log is not by itself a slow row.
+- `mcp.log`, `mcp.pump` (tool calls that run on the main thread), `mcp.discovery` and `mcp.sweep` used to be hidden in `Extensions`. They
+  are parts of it and are not added to the frame total again. Their rows carry the label `(part of EditorUI)`, which every nested row
+  prints: for these rows read it as "part of Extensions".
+- These four are under the fail-safe now: `mcp.pump` throwing 30 times in a row would go off (MCP calls would stop being served and
+  the log would say `FAIL-SAFE`) until `perf enable mcp.pump`. It catches the errors of each task itself, so this is not expected; before
+  0.10.0 such an exception was only logged.
+
+**Measure a window by hand.**
+
+1. `python tools\inside_ctl.py perf reset` with the game at the place you want to measure.
+2. Wait 10 to 30 s. Do not call other tools meanwhile: their calls land in `mcp.pump`.
+3. `python tools\inside_ctl.py perf`, and read the first three lines and the top rows.
+
+**Measure what a part of the scene costs by hand.**
+
+1. Note the frame rate (`time {op:"state"}`, or the HUD).
+2. Find the name of the part in the editor's scene explorer (F1), then `python tools\inside_ctl.py perf hide "<root>"`. The reply says what
+   went: `perf hide: N renderer(s) off under 1 root(s); N shadow caster(s), N mesh(es) with N vertices, N material(s); lights untouched; N
+   hidden in total (perf show restores)`. The part vanishes from the picture and from its shadows; colliders and logic stay.
+3. Compare the frame rate at the same view. In a mod scene with thousands of kit pieces this showed at once that a dark room was not
+   dark because of the kit.
+4. `python tools\inside_ctl.py perf show`. The reply is `perf show: N renderer(s) back on`, and the part is back in the picture.
+
+| If you see | Why | Do |
+|---|---|---|
+| `(not found: <root>)` in the reply | the name is not an active object (`GameObject.Find`) | use the exact name or a full path; quote a name with spaces; several roots are comma separated, no spaces |
+| `0 renderer(s) off` | no enabled renderer matched | leave out the name part; a skinned mesh has no `mesh:` match, use the name part for it |
+| things stay hidden after `restore` | `restore` does not know `perf hide` | `perf show`. A level load destroys hidden renderers of that level; those are not counted back |
 
 ## 14. Files the server writes
 
@@ -755,6 +820,8 @@ command tool refuses).
   chapter loads unlock chapters for good. Turn on `play.save_guard` for backups and confirms, or back up with
   `save {op:"backup"}`.
 - **Orbs.** `save orbs set` changes local bits that reach Steam achievements at the next game start.
+- **Long jobs.** Detached jobs end after 45 minutes; a hung one holds the lane that long unless you cancel it (section 8).
+- **Renderers hidden by `perf hide`** stay hidden through `restore`: `perf show` brings them back (section 13.1).
 - **Updating DLLs.** `ext load` does not replace a loaded DLL; restart the game.
 - **Editing editor.cfg while the game runs.** The game does not re-read it and overwrites it on its next settings save.
 - **Token.** Without `mcp.token`, any program on this computer can drive the game through the server, `/cmd` included.

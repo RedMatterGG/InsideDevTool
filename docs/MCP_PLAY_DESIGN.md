@@ -1755,7 +1755,7 @@ the end of one segment and pressed again at the start of the next is one press: 
   it`. A worker thread runs it: `CtlGame.Prepare` on the main thread (readiness, AgentCore, clock, frames), then
   `Stepper.Run` with death / load stops. Tool-backed ones (goto, time step, track play) call the Play tool's handler with
   the job's own context, so the tool's `BeginJob` gets the same job. When a job ends, the console log gets
-  `ctl jN <end line>`. `ctl stop`, MCP `restore`, `jobs {op:"cancel"}` and the host's 10-minute limit for detached jobs
+  `ctl jN <end line>`. `ctl stop`, MCP `restore`, `jobs {op:"cancel"}` and the host's 45-minute limit for detached jobs
   cancel it.
 
 ### 18.5 Replies

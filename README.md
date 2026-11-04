@@ -1,4 +1,4 @@
-# INSIDE runtime editor (InsideDev 0.9.0)
+# INSIDE runtime editor (InsideDev 0.10.0)
 
 An in-game editor and explorer for Playdead's INSIDE (Unity 5.0.4f1): browse and edit the live scene, see how
 objects, signals, PlayMaker state machines, code and audio are connected, record changes as mods, and inspect memory
@@ -6,6 +6,33 @@ with Cheat Engine.
 
 > Unofficial fan-made tool, not affiliated with or endorsed by Playdead. INSIDE is a trademark of Playdead.
 > This repository contains no game files or game code; you need your own copy of the game.
+
+## What's new in 0.10.0: a 360 degree panorama command, a much cheaper muter, less garbage per frame
+
+Everything new runs only when you call it, and the game sound is still never muted unless you start InsideMuter yourself. One
+built-in limit changed for everyone: a detached MCP job may now run 45 minutes instead of 10 (below).
+
+- **360 degree panorama (`pano`, with Play).** One console command writes an equirectangular PNG that panorama viewers open
+  directly, with a JSON file that says where the eye was. Each of the six cube faces is an ordinary game frame, so the picture
+  is what a screenshot would show there: fog, water, the game's post chain and everything the game streams in for the
+  camera. A 4096x2048 panorama took 2.3 to 2.7 s in all, of which the picture jumps around for 0.2 to 1 s (13 frames at a 2560x1440
+  game view), tried at places along a long bunker route in a mod scene. Steps: [docs/PLAY.md](docs/PLAY.md) section 4.7.
+- **Limits for a first-person camera's free look (`campath mount`).** Two new optional arguments clamp how far the head may tilt
+  the view up and down outside the timed looks, for example on a ladder, while a timed look can still reach as far as
+  `pitch_max`. Leave them out and nothing changes. Steps: [docs/PLAY.md](docs/PLAY.md) section 4.8.
+- **InsideMuter 3.** The optional muter costs about 3 % of a core instead of 40 to 60 % (measured without the game, 25 s test:
+  62 % against 2.7 %), with the same 50 ms mute poll and the same heartbeat. Details: [docs/AUDIO.md](docs/AUDIO.md) section 11.
+- **Less garbage every frame in the core.** The main loop keeps its delegates instead of making about 2 KB of new ones per frame,
+  and the Wwise trace reads its records with pointers and reuses its ring: `AudioTrace` went from 11.9 KB to 0.0-0.2 KB per call in
+  a heavy mod scene. No behaviour changes; old and new trace code gave identical results on 81,920 random records and 800,000
+  ring steps.
+- **A better profiler.** `perf` now says how many garbage collections ran since `perf reset` and the longest pause among them,
+  names the MCP server's parts (`mcp.log`, `mcp.pump`, `mcp.discovery`, `mcp.sweep`), and `perf hide` / `perf show` switch the
+  renderers of a part of the scene off and on to measure what they cost. Steps: [docs/MCP.md](docs/MCP.md) section 13.1.
+- **Long MCP jobs are no longer cut at 10 minutes.** A detached job (an input track playback, a ctl job) is cancelled after 45
+  minutes. A lockstep pass runs below real time on a busy machine: a 431 s take needed about 660 s of wall clock at 0.65x and was
+  cut at 600 s. The other side: a job that hangs holds the control lane longer, and the idle restore waits for it; `restore` or
+  `jobs {op:"cancel"}` ends it at once ([docs/MCP.md](docs/MCP.md) section 8).
 
 ## What's new in 0.9.0: film a planned camera over live play, from the game's own picture
 
@@ -135,7 +162,7 @@ To uninstall, delete `version.dll` from the game folder (and `_mod\` if you want
 
 ### Switches and defaults
 
-Nothing added in 0.7.0, 0.8.0 or 0.9.0 runs until you call it or install the optional file that has it, except that vSync is
+Nothing added in 0.7.0, 0.8.0, 0.9.0 or 0.10.0 runs until you call it or install the optional file that has it, except that vSync is
 off from the start in 0.8.0 (a development tool; `play.vsync_off=0` keeps the game's own). Settings are `key=value` lines in
 `<game>\_mod\editor.cfg`; the game reads the file once at start, so edit it with the game closed.
 
@@ -159,6 +186,9 @@ off from the start in 0.8.0 (a development tool; `play.vsync_off=0` keeps the ga
 | Real-time recorder (with Play, needs ffmpeg with ddagrab and an NVIDIA GPU) | off | `time {op:"record"}`, `rec start` | `time {op:"record_stop"}`, `rec stop`, `restore`, game quit |
 | Live director camera (with Play) | off | `campath load <dir>` then `campath arm` or `campath start` | `campath stop`, `restore`, end of the path |
 | Game-render video (with Play, needs `InsideReadback.dll`, ffmpeg and an NVIDIA GPU) | off | `grec start <file.mkv>` | `grec stop`, `restore`, game quit |
+| Panorama (with Play) | off | `pano <file.png>`: one capture, then off by itself | `restore` ends a running capture and puts the camera back |
+| First-person free-look limits (with Play) | off: the eye follows the head up to `pitch_max` | the last two arguments of `campath mount` (`free_up free_down`) | leave them out or give `0` |
+| Hide renderers to measure them (`perf hide`) | off | `perf hide <root>[,<root>...] [name part \| mesh:<prefix>]` | `perf show` (`restore` does not bring them back) |
 | Fast screenshot (no black check) | off | `screenshot {mode:"path", fast:true}` | leave `fast` out |
 | Background refresh of agent perception (with Play) | off: refreshed when `observe` runs | `play.perception_bg_s=<seconds>` | `0` |
 | Lab modules (`lab`, `det`) | not installed | copy the DLLs, then a `lab` or `det` command | `lab stop`, `det stop`; delete the DLLs |

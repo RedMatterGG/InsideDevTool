@@ -741,6 +741,10 @@ toward the screen (forward z < 0).
   rail and orbit points behind the line and follow offsets that likely end up behind it are warnings.
 - During the take, a camera that drifts behind the line is clamped to `zMax` (pose flag C) unless it looks down more than
   45 deg.
+- That exception can make a jump. The clamp reads the unclamped pitch, so a keyed path behind the line that crosses 45 degrees
+  snaps by the whole distance to `zMax` within one frame, in the plan and in every pass flown from it (read from the code, not
+  measured on film). Keep every key at z <= `zMax`, or set `zMax` to where the path really runs (`zMax: 0`), and look
+  for flag C or a step in `passes/poses.csv`.
 - `playerSide: false` turns the rule off for one camera (only for shots that really need it).
 
 ## 13. Output folder
@@ -938,6 +942,15 @@ camera moves. `mcam check`, `mcam preview` and `mcam rehearse` cover those.
   `application paused`). The process still reports itself as responding. Leave the window open; it may sit behind other
   windows. Focus loss is a different case: keep `session.runInBackground` true (default) and do not click into the game
   window during a take.
+- **Holds in keyed cameras.** Two equal keys under `interp: "catmull"` are not still: the spline overshoots between them because of
+  its neighbours. Observed on a 5 s hold over a flooded hall: a 0.33 m push-in, pitch 13.4 -> 17.35 -> 13.4, yaw 15 -> 12.6 -> 15, about
+  200 px at fov 28, which hid the slow rise of the water that the shot was for. A hold is a `static` camera with director blends
+  around it. To check by hand: `mcam passes <spec> <take>`, open `passes/poses.csv`, read that camera's rows over the hold: the
+  numbers must not change. The key list does not show this.
+- **Plan pass and pinned CPU cores.** Do not pin the game to particular cores for `mcam passes`, for example with a process
+  affinity tool. Observed on a heavy mod scene: with pinning on, the load of the record was refused twice (335 of 1764 objects
+  unresolved, 17863 objects in the scene against 19022); without it, the same mod loaded at the first try. One unpinned run is all the
+  proof. The mechanism, that the load finishes later than `waitfor streaming`, is inferred. If you pin at all, pin for live passes only.
 - **Load races.** `load` is asynchronous, and the game may still be on the level it booted into. A setup that starts the take
   right after `load`, or after `waitfor loaded` alone, can start on the old level or mid-load. Follow every `load` with
   `waitfor savepoint <the requested savepoint>` and `waitfor streaming` (the checker warns `runs right after 'load'`). When
@@ -1160,9 +1173,10 @@ The `replay` block (all keys in Section 19):
 | `mcam record <spec> <out>` | Record pass only. Writes `<out>/record/`. |
 | `mcam replay <spec> <out> [cams=a,b] [range=t0:t1]` | Load the recording (`replay.source` or `<out>/record`), plan, one pass per camera (directors after their sources). Writes the v2 take layout in `<out>`. |
 | `mcam take <spec> <out> [cams=a,b] [range=t0:t1]` | Record pass and replay passes in one session (no reload between them). |
-| `mcam passes <spec> <out> [cams=a,b] [range=t0:t1]` | Plan only: event times from the recording, segments, renders, copies, time and disk per camera. Writes `<out>/passes/poses.csv` and `meta.csv`, which the Play command `campath` can fly over live play while `grec` films the game's own frames ([PLAY.md](PLAY.md) section 4.6). |
+| `mcam passes <spec> <out> [cams=a,b] [range=t0:t1]` | Plan only: event times from the recording, segments, renders, copies, time and disk per camera. Writes `<out>/passes/poses.csv` and `meta.csv`, which the Play command `campath` can fly over live play while `grec` films the game's own frames ([PLAY.md](PLAY.md) section 4.6). `poses.csv` is also the place to check what a camera really does (the player-side clamp, holds). |
 | `mcam golden <spec> <out> [every]` | Golden test (Section 18.2 step 4); also writes `golden/noise/` (renders of one frozen frame, for the noise floor). |
 | `mcam status [json]` / `mcam stop` / `mcam abort` | As v2; states `recording` (t, samples, objects, MB, fps, drift) and `replay pass i/n <camera> step j/m eta`. Abort also stops a sound capture first. |
+| `pano <file.png> ...` (needs Play) | A 360 degree panorama of the current frame, also in the recording viewer ([PLAY.md](PLAY.md) sections 4.7 and 7.8). Useful to scout where to put cameras. |
 | `srec load <dir>` / `srec play [speed] [loop]` / `srec pause` / `srec seek <t>` / `srec step <dt>` / `srec end` | Recording viewer: the scene follows the recording while you fly the free camera (no capture). |
 | `srec status` / `srec objects [filter]` | State; object table with key counts, resolution and conflicts. |
 | `srec record start <dir> [roots=a,b] [keep=a,b] [spec=<file>] [clock=real\|fixed:<rate>] [audio=on] [overwrite=on] [<record key>=value ...]` / `srec record stop [keep]` / `srec record status` | Manual recording; `keep=` waits (up to 30 s) until those subscenes are loaded and active, `spec=` takes the spec's `replay.record` as defaults and arms its `events`. |
@@ -1491,7 +1505,7 @@ Generated by `python -I tools/mcam_spec_check.py --schema-md` from `MultiCamType
 | planar | bool | false | Keep camera z fixed (gamelike defaults to true). |
 | start | time | null | Camera clock origin (keys, rail, orbit) / follow start. |
 | keys | KeySpec[] | [] | (keys) Key list (below). |
-| interp | string | "catmull" | (keys, rail) `catmull` or `linear`. |
+| interp | string | "catmull" | (keys, rail) `catmull` or `linear`. Under `catmull` two equal keys are not a hold (Section 16). |
 | ease | string | "ends" | (keys, rail, orbit) 3.8. |
 | duration | number | 0 | (rail, orbit) Seconds on the camera clock. |
 | path | [x,y,z][] | [] | (rail) Rail points. |

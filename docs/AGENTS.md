@@ -26,7 +26,7 @@ Contents
 |---|---|---|---|
 | Editor (core) | `bin\InsideDev.dll` in `<game>\_mod\` | the in-game editor, console and file bridge; the `srec`, `mcam`, `acap`, `cam`, `hud`, `clean`, `gamma`, `seed` commands | README.md, [RECORD_REPLAY.md](RECORD_REPLAY.md), [MULTICAM.md](MULTICAM.md), [AUDIO.md](AUDIO.md) |
 | MCP server | `bin\InsideDev.Mcp.dll` in `<game>\_mod\` | MCP on `http://127.0.0.1:47811` with the dev, play and all profiles; plain `POST /cmd`, `GET /state`, `GET /ping` | [MCP.md](MCP.md) |
-| Character control | `bin\InsideDev.Play.dll` in `<game>\_mod\` (needs the MCP server) | the 14 play tools (`observe`, `act`, `move_to`, `interact`, `wait_until`, `time`, `checkpoint`, `menu`, `screenshot`, `guide`, `notes`, `restore`, `input_track`, `geometry`), the dev world tools, the `ctl` console commands, the live director camera `campath` and the game-render video `grec` | [PLAY.md](PLAY.md) |
+| Character control | `bin\InsideDev.Play.dll` in `<game>\_mod\` (needs the MCP server) | the 14 play tools (`observe`, `act`, `move_to`, `interact`, `wait_until`, `time`, `checkpoint`, `menu`, `screenshot`, `guide`, `notes`, `restore`, `input_track`, `geometry`), the dev world tools, the `ctl` console commands, the live director camera `campath`, the game-render video `grec` and the 360 degree panorama `pano` | [PLAY.md](PLAY.md) |
 | Scene recorder and viewer | core | `srec record`, `srec load` and the recording viewer | [RECORD_REPLAY.md](RECORD_REPLAY.md), design notes [REPLAY_DESIGN.md](REPLAY_DESIGN.md) |
 | MultiCam | core (+ optional `bin\InsideReadback.dll` in `<game>\INSIDE_Data\Plugins\`) | multi-camera capture, replay passes from a recording, specs in `specs\` | [MULTICAM.md](MULTICAM.md), design notes [MULTICAM_DESIGN.md](MULTICAM_DESIGN.md) |
 | Game audio capture | core (+ optional `tools\muter\InsideMuter.exe`) | `acap` WAV capture with sync markers; InsideMuter mutes the game in Windows while it runs | [AUDIO.md](AUDIO.md) |
@@ -64,7 +64,7 @@ Client configuration examples for Claude Code, Claude Desktop, Cursor, VS Code, 
 
 | Ask | Through | Answer tells you |
 |---|---|---|
-| `ping` | bridge, `command`, `GET /ping` | `pong InsideDev 0.7.0`: the core version |
+| `ping` | bridge, `command`, `GET /ping` | `pong InsideDev 0.10.0`: the core version |
 | `ext` | bridge, `command` | the loaded extensions (MCP server, Play, ReplayLab, Det) |
 | `mcp` | console, bridge, `command` | server state, port, `tools: play N, dev N, all N` (with Play: 14 / 33 / 40), build ids |
 | `inside_status` | stdio launcher | whether the game is up, the endpoint and the game's instructions |
@@ -74,7 +74,7 @@ Client configuration examples for Claude Code, Claude Desktop, Cursor, VS Code, 
 
 ## 4. Switches and defaults
 
-Nothing added in 0.7.0 runs until it is called or its optional file is installed. Settings are `key=value` lines in
+Nothing added since 0.7.0 runs until it is called or its optional file is installed. Settings are `key=value` lines in
 `<game>\_mod\editor.cfg`, read once at game start (edit them with the game closed; an agent cannot change them through
 MCP).
 
@@ -98,6 +98,9 @@ MCP).
 | InsideMuter | not running | the user starts `InsideMuter.exe` (it mutes the game) | it exits 10 s after the game |
 | Live director camera (Play) | off | `campath load <dir>`, `campath arm` / `start` | `campath stop`, `restore` |
 | Game-render video (Play, needs `InsideReadback.dll`, ffmpeg, NVIDIA) | off | `grec start <file.mkv>` | `grec stop`, `restore` |
+| Panorama (Play) | off | `pano <file.png>`, one capture | ends by itself; `restore` during a capture |
+| First-person free-look limits (Play) | off | the last two arguments of `campath mount` | leave them out or `0` |
+| Hide renderers to measure them | off | `perf hide <root>[,<root>...] [name part \| mesh:<prefix>]` | `perf show` (not `restore`) |
 | Lab modules | not installed | copy the DLLs, `lab ...`, `det ...` | `lab stop`, `det stop`, delete the DLLs |
 
 ---
@@ -145,6 +148,13 @@ stop keep`, `srec load <dir>`, `srec seek`, fly the free camera, `srec end`; off
 `mcam passes <spec> <dir>`, reset to the same checkpoint, `grec start <file.mkv>`, `campath load <dir>\passes director`,
 `campath arm`, play the track; `grec stop` when the path ends ([PLAY.md](PLAY.md) sections 4.6 and 7.7).
 
+**Take a 360 degree panorama.** Best in the recording viewer, where nothing moves: `srec load <dir>` (read the reply), `srec pause`,
+`srec seek <t>`, `pano <file.png> near=0.05`, `pano status` until `done`. One capture holds the game about 13 frames
+([PLAY.md](PLAY.md) sections 4.7 and 7.8).
+
+**Find what costs frame time.** `perf reset`, wait 10 to 30 s without other calls, `perf`; then `perf hide <root>`, compare the
+frame rate at the same view, `perf show` ([MCP.md](MCP.md) section 13.1).
+
 **Capture the game's sound.** `acap preflight`, then `srec record start <dir> audio=on` (or `acap start <name>`), stop,
 then `python -I tools/mcam_audio.py align <dir>` ([AUDIO.md](AUDIO.md) section 3).
 
@@ -170,7 +180,8 @@ then `python -I tools/mcam_audio.py align <dir>` ([AUDIO.md](AUDIO.md) section 3
   capture. Console and bridge commands do not reset this clock; keep calling a cheap tool during long work.
 - **Input tracks: lockstep vs free play.** `input_track {op:"play"}` holds the rehearsal's 60 Hz lockstep by default
   (one logic step per frame, exact); `lockstep:false` plays in free realtime, where game time follows the wall clock and
-  the result can differ. Detached jobs end after 10 minutes, so longer playbacks are cut.
+  the result can differ. Detached jobs end after 45 minutes, so longer playbacks are cut; a lockstep take on a busy machine can
+  need much more wall clock than its length. `input_track` status says `done` for every end: read `jobs {op:"status", id}`.
 - **Ids die on every load and respawn.** Use ids only from the latest `observe` or action result.
 - **Busy.** One control job at a time (actions, waits, loads, ctl jobs, a MultiCam capture). A second request gets
   `busy` with the running job; `wait_until {any:[{job:"jN"}]}` waits for it. `restore` does not cancel a MultiCam
@@ -179,6 +190,12 @@ then `python -I tools/mcam_audio.py align <dir>` ([AUDIO.md](AUDIO.md) section 3
   no input; release it first.
 - **`grec` follows rendered frames, not time.** The file is written at 60 / `every` fps; with vSync off (the default)
   the game renders faster and the video plays slow. `vsync on` before a real-time film.
+- **`pano` uses the free camera** and gives it back, also after `restore`. In live play the game keeps running during the
+  capture; use the recording viewer or `ts 0`.
+- **`perf hide` survives `restore`.** Always end with `perf show`.
+- **Keyed cameras (MultiCam).** The player-side clamp applies only under pitch 45, so a keyed path crossing 45 degrees behind
+  the line jumps for a frame; two equal keys under `catmull` are not a hold; run `mcam passes` without core pinning
+  ([MULTICAM.md](MULTICAM.md) section 12 and section 16). First-person flicker: [PLAY.md](PLAY.md) section 15.
 - **After a MultiCam replay run** the game stays frozen (`ts 1` resumes) unless the spec says `restore: "reload"`.
 - **Updating a DLL.** `ext load` loads new DLLs only; replacing a loaded one needs a game restart.
 - **Paths.** Bridge and `mcam` / `srec` paths should be absolute; relative paths resolve against the game's working
