@@ -208,7 +208,7 @@ namespace InsideDev.McpExt
         internal static Func<bool> CaptureBusy;
         internal static int KeepFinished = 50;
         internal static TimeSpan KeepFor = TimeSpan.FromMinutes(10);
-        internal static TimeSpan MaxDetached = TimeSpan.FromMinutes(10);
+        internal static TimeSpan MaxDetached = TimeSpan.FromMinutes(45);
 
         internal static bool CaptureOn()
         {
