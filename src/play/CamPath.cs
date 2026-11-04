@@ -40,7 +40,7 @@ namespace InsideDev.Play
         static bool mountHas, mountHide;
         static Vector3 mountPos;
         static Quaternion mountCur;
-        static float tauH, tauV, tauYaw, tauPitch, pitchMax = 89f, camYaw, camPitch;
+        static float tauH, tauV, tauYaw, tauPitch, pitchMax = 89f, pitchUp = 89f, pitchDown = 89f, camYaw, camPitch;
         static Transform hidden;
         static Vector3 hiddenScale = Vector3.one;
 
@@ -231,11 +231,11 @@ namespace InsideDev.Play
 
         static string Mount(List<string> a)
         {
-            if (a.Count < 3) return "campath mount <transform path|off> [lx ly lz] [rx ry rz] [fov] [near] [smooth 0..1] [into_scene_deg] [level 0..1] [hide 0|1] [tau_h tau_v tau_yaw tau_pitch s] [pitch_max_deg]: the camera rides the transform (position and rotation every frame), the plan keeps only the clock; hide collapses the transform (the boy's head) while mounted; tau_* > 0 stabilise the eye: position and yaw / pitch follow the transform with those time constants, roll 0, pitch clamped (without it the head bob shakes the picture by 26-33 px a frame); into_scene_deg turns the view about world up toward +z (into the level, away from the unbuilt player side), whichever way the transform faces, fading out while the view looks down 18..38 deg (the boy looking at his hands or the watch); level takes that share of the head's roll out (1 = horizon always level)";
+            if (a.Count < 3) return "campath mount <transform path|off> [lx ly lz] [rx ry rz] [fov] [near] [smooth 0..1] [into_scene_deg] [level 0..1] [hide 0|1] [tau_h tau_v tau_yaw tau_pitch s] [pitch_max_deg] [free_up_deg free_down_deg]: the camera rides the transform (position and rotation every frame), the plan keeps only the clock; hide collapses the transform (the boy's head) while mounted; tau_* > 0 stabilise the eye: position and yaw / pitch follow the transform with those time constants, roll 0, pitch clamped (without it the head bob shakes the picture by 26-33 px a frame); into_scene_deg turns the view about world up toward +z (into the level, away from the unbuilt player side), whichever way the transform faces, fading out while the view looks down 18..38 deg (the boy looking at his hands or the watch); level takes that share of the head's roll out (1 = horizon always level); free_up / free_down clamp the eye's pitch outside the look windows (the head's own up / down tilt: idle, ladders), blended to pitch_max by the look weight";
             if (a[2].ToLowerInvariant() == "off") { Unhide(); mountPath = ""; mount = null; return "campath: mount off"; }
-            float[] v = new float[17];
-            float[] def = { 0f, 0f, 0f, 0f, 0f, 0f, 60f, 0.03f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 89f };
-            for (int i = 0; i < 17; i++) { v[i] = def[i]; float x; if (a.Count > 3 + i && float.TryParse(a[3 + i], NumberStyles.Float, IC, out x)) v[i] = x; }
+            float[] v = new float[19];
+            float[] def = { 0f, 0f, 0f, 0f, 0f, 0f, 60f, 0.03f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 89f, 0f, 0f };
+            for (int i = 0; i < 19; i++) { v[i] = def[i]; float x; if (a.Count > 3 + i && float.TryParse(a[3 + i], NumberStyles.Float, IC, out x)) v[i] = x; }
             Unhide();
             mountPath = a[2];
             mount = Find(mountPath);
@@ -243,8 +243,9 @@ namespace InsideDev.Play
             mountRot = Quaternion.Euler(v[3], v[4], v[5]);
             mountFov = v[6]; mountNear = v[7]; mountSmooth = Mathf.Clamp01(v[8]); mountIntoScene = Mathf.Clamp(v[9], 0f, 89f); mountLevel = Mathf.Clamp01(v[10]);
             mountHide = v[11] > 0.5f; tauH = Mathf.Max(0f, v[12]); tauV = Mathf.Max(0f, v[13]); tauYaw = Mathf.Max(0f, v[14]); tauPitch = Mathf.Max(0f, v[15]); pitchMax = Mathf.Clamp(v[16], 1f, 89f);
+            pitchUp = v[17] > 0f ? Mathf.Clamp(v[17], 1f, pitchMax) : pitchMax; pitchDown = v[18] > 0f ? Mathf.Clamp(v[18], 1f, pitchMax) : pitchMax;
             mountHas = false;
-            return "campath: mounted on " + mountPath + (mount == null ? " (not found yet, retried every frame)" : "") + ", local " + mountLocal.ToString("F3") + ", rot " + mountRot.eulerAngles.ToString("F1") + ", fov " + mountFov.ToString("0.#", IC) + (mountIntoScene > 0f ? ", into the scene up to " + mountIntoScene.ToString("0.#", IC) + " deg" : "") + (mountLevel > 0f ? ", horizon level " + mountLevel.ToString("0.##", IC) : "") + (mountHide ? ", the transform collapsed while mounted" : "") + (tauH > 0f || tauV > 0f ? ", stabilised (tau h " + tauH.ToString("0.###", IC) + " v " + tauV.ToString("0.###", IC) + " yaw " + tauYaw.ToString("0.###", IC) + " pitch " + tauPitch.ToString("0.###", IC) + " s, pitch within " + pitchMax.ToString("0.#", IC) + " deg)" : "");
+            return "campath: mounted on " + mountPath + (mount == null ? " (not found yet, retried every frame)" : "") + ", local " + mountLocal.ToString("F3") + ", rot " + mountRot.eulerAngles.ToString("F1") + ", fov " + mountFov.ToString("0.#", IC) + (mountIntoScene > 0f ? ", into the scene up to " + mountIntoScene.ToString("0.#", IC) + " deg" : "") + (mountLevel > 0f ? ", horizon level " + mountLevel.ToString("0.##", IC) : "") + (mountHide ? ", the transform collapsed while mounted" : "") + (tauH > 0f || tauV > 0f ? ", stabilised (tau h " + tauH.ToString("0.###", IC) + " v " + tauV.ToString("0.###", IC) + " yaw " + tauYaw.ToString("0.###", IC) + " pitch " + tauPitch.ToString("0.###", IC) + " s, pitch within " + pitchMax.ToString("0.#", IC) + " deg" + (pitchUp < pitchMax || pitchDown < pitchMax ? ", free eye " + (-pitchUp).ToString("0.#", IC) + "..+" + pitchDown.ToString("0.#", IC) + " deg" : "") + ")" : "");
         }
 
         static string LookCommand(List<string> a)
@@ -266,8 +267,9 @@ namespace InsideDev.Play
             return "campath: look " + looks.Count + " at " + (l.path.Length > 0 ? l.path : l.point.ToString("F2")) + " from " + l.t0.ToString("0.00", IC) + " to " + l.t1.ToString("0.00", IC) + " s, ease " + l.ease.ToString("0.00", IC);
         }
 
-        static Quaternion Looked(Quaternion wr, Vector3 eye, double tp)
+        static Quaternion Looked(Quaternion wr, Vector3 eye, double tp, out float weight)
         {
+            weight = 0f;
             foreach (var l in looks)
             {
                 double e = Math.Max(0.05, l.ease);
@@ -284,6 +286,7 @@ namespace InsideDev.Play
                 if (dir.sqrMagnitude < 1e-4f) continue;
                 float w = (float)(k * k * (3.0 - 2.0 * k));
                 wr = Quaternion.Slerp(wr, Quaternion.LookRotation(dir, Vector3.up), w);
+                weight = Mathf.Max(weight, w);
             }
             return wr;
         }
@@ -325,7 +328,8 @@ namespace InsideDev.Play
                             wr = Quaternion.AngleAxis(turn, Vector3.up) * wr;
                         }
                     }
-                    if (looks.Count > 0) wr = Looked(wr, wp, realtime ? Time.timeDbl - gameT0 : PlanT(wall.Elapsed.TotalSeconds * fps));
+                    float lookW = 0f;
+                    if (looks.Count > 0) wr = Looked(wr, wp, realtime ? Time.timeDbl - gameT0 : PlanT(wall.Elapsed.TotalSeconds * fps), out lookW);
                     if (mountLevel > 0f)
                     {
                         var lf = wr * Vector3.forward;
@@ -335,7 +339,7 @@ namespace InsideDev.Play
                     {
                         var fw = wr * Vector3.forward;
                         float yaw = Mathf.Atan2(fw.x, fw.z) * Mathf.Rad2Deg;
-                        float pitch = Mathf.Clamp(-Mathf.Asin(Mathf.Clamp(fw.y, -1f, 1f)) * Mathf.Rad2Deg, -pitchMax, pitchMax);
+                        float pitch = Mathf.Clamp(-Mathf.Asin(Mathf.Clamp(fw.y, -1f, 1f)) * Mathf.Rad2Deg, -Mathf.Lerp(pitchUp, pitchMax, lookW), Mathf.Lerp(pitchDown, pitchMax, lookW));
                         float dt = Time.deltaTime;
                         if (!mountHas) { mountPos = wp; camYaw = yaw; camPitch = pitch; mountHas = true; }
                         else if (dt > 0f)
