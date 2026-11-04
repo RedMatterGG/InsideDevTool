@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using UnityEngine;
 
@@ -155,7 +156,7 @@ namespace InsideDev
         static readonly System.Diagnostics.Stopwatch sw = new System.Diagnostics.Stopwatch();
 
         // called once per frame on the main thread
-        public static void Tick(Action<Rec> sink)
+        public static unsafe void Tick(Action<Rec> sink)
         {
             if (!Available) return;
             sw.Reset(); sw.Start();
@@ -166,18 +167,18 @@ namespace InsideDev
                 int n = pDrain(buf, Batch);
                 for (int i = 0; i < n; i++)
                 {
-                    IntPtr p = new IntPtr(buf.ToInt64() + (long)i * RecSize);
+                    byte* p = (byte*)buf.ToPointer() + (long)i * RecSize;
                     var r = new Rec();
-                    r.type = Marshal.ReadInt16(p, 4) & 0xFFFF; r.api = Marshal.ReadInt16(p, 6) & 0xFFFF;
-                    r.thread = Marshal.ReadInt32(p, 8); r.frame = Marshal.ReadInt32(p, 12); r.qpc = Marshal.ReadInt64(p, 16);
-                    r.gameObj = (uint)Marshal.ReadInt32(p, 24); r.eventId = (uint)Marshal.ReadInt32(p, 28); r.playingId = (uint)Marshal.ReadInt32(p, 32);
-                    r.groupId = (uint)Marshal.ReadInt32(p, 36); r.valueId = (uint)Marshal.ReadInt32(p, 40);
-                    r.fvalue = BitConverter.ToSingle(BitConverter.GetBytes(Marshal.ReadInt32(p, 44)), 0);
-                    r.bankId = (uint)Marshal.ReadInt32(p, 48); r.cbType = (uint)Marshal.ReadInt32(p, 52); r.cookie = Marshal.ReadInt64(p, 56);
-                    r.ret = Marshal.ReadInt32(p, 64); r.i1 = Marshal.ReadInt32(p, 68); r.i2 = Marshal.ReadInt32(p, 72); r.flags = (uint)Marshal.ReadInt32(p, 76);
+                    r.type = *(ushort*)(p + 4); r.api = *(ushort*)(p + 6);
+                    r.thread = *(int*)(p + 8); r.frame = *(int*)(p + 12); r.qpc = *(long*)(p + 16);
+                    r.gameObj = *(uint*)(p + 24); r.eventId = *(uint*)(p + 28); r.playingId = *(uint*)(p + 32);
+                    r.groupId = *(uint*)(p + 36); r.valueId = *(uint*)(p + 40);
+                    r.fvalue = *(float*)(p + 44);
+                    r.bankId = *(uint*)(p + 48); r.cbType = *(uint*)(p + 52); r.cookie = *(long*)(p + 56);
+                    r.ret = *(int*)(p + 64); r.i1 = *(int*)(p + 68); r.i2 = *(int*)(p + 72); r.flags = *(uint*)(p + 76);
                     if (r.type == 17 || r.type == 18)
-                        r.pos = new Vector3(Fl(p, 80), Fl(p, 84), Fl(p, 88));
-                    if (Marshal.ReadInt16(p, 96) != 0) r.name = Marshal.PtrToStringUni(new IntPtr(p.ToInt64() + 96));
+                        r.pos = new Vector3(*(float*)(p + 80), *(float*)(p + 84), *(float*)(p + 88));
+                    if (*(short*)(p + 96) != 0) r.name = NameAt((char*)(p + 96), (RecSize - 96) / 2);
                     try { sink(r); } catch (Exception e) { DevLog.Error("wwise sink", e); }
                 }
                 total += n;
@@ -187,6 +188,30 @@ namespace InsideDev
             lastDrained = total; if (total > maxDrained) maxDrained = total;
             lastDrainMs = (float)sw.Elapsed.TotalMilliseconds;
         }
-        static float Fl(IntPtr p, int off) { return BitConverter.ToSingle(BitConverter.GetBytes(Marshal.ReadInt32(p, off)), 0); }
+
+        const int NameCacheCap = 4096;
+        static readonly Dictionary<int, string> nameCache = new Dictionary<int, string>();
+
+        static unsafe string NameAt(char* s, int max)
+        {
+            int len = 0, h = unchecked((int)2166136261);
+            while (len < max && s[len] != '\0') { h = (h ^ s[len]) * 16777619; len++; }
+            if (len == max) return Marshal.PtrToStringUni(new IntPtr(s));
+            h = (h ^ len) * 16777619;
+            string cached;
+            if (nameCache.TryGetValue(h, out cached))
+            {
+                if (cached.Length == len)
+                {
+                    int k = 0;
+                    while (k < len && cached[k] == s[k]) k++;
+                    if (k == len) return cached;
+                }
+                return new string(s, 0, len);
+            }
+            var made = new string(s, 0, len);
+            if (nameCache.Count < NameCacheCap) nameCache[h] = made;
+            return made;
+        }
     }
 }

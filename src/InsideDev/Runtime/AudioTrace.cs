@@ -37,6 +37,7 @@ namespace InsideDev
             public float t; public int frame; public WwiseNative.Rec r; public int count = 1;   // count > 1: coalesced repeats
             public string text;   // built lazily
             public string line; public int lineCount; public bool lineRaw;   // timeline row text (panel cache)
+            public long seq;
         }
 
         public sealed class WObj
@@ -86,8 +87,10 @@ namespace InsideDev
             if (!started) { started = true; WwiseNative.Init(); LoadNames(); }
             RefreshGameNames();
             SaveNamesMaybe();
-            WwiseNative.Tick(Sink);
+            WwiseNative.Tick(sinkAction);
         }
+
+        static readonly Action<WwiseNative.Rec> sinkAction = Sink;
 
         static long drainQpc; static float drainT;
         static void Sink(WwiseNative.Rec r)
@@ -101,23 +104,28 @@ namespace InsideDev
             {
                 long key = ((long)r.type << 56) ^ ((long)r.gameObj << 24) ^ r.groupId;
                 Ev last;
-                if (lastByKey.TryGetValue(key, out last) && t - last.t < 0.5f && last == FindRecent(last)) { last.r = r; last.count++; last.text = null; coalesced++; return; }
+                if (lastByKey.TryGetValue(key, out last) && t - last.t < 0.5f && Recent(last) && KeyOf(last.r) == key) { last.r = r; last.count++; last.text = null; coalesced++; return; }
                 var ev = Add(r, t); lastByKey[key] = ev; return;
             }
             Add(r, t);
         }
         static int lastSinkFrame;
         static readonly Dictionary<long, Ev> lastByKey = new Dictionary<long, Ev>();
-        static Ev FindRecent(Ev e) { for (int i = 0; i < Math.Min(count, 64); i++) if (Get(i) == e) return e; return null; }
+        static long added;
+        static long KeyOf(WwiseNative.Rec r) { return ((long)r.type << 56) ^ ((long)r.gameObj << 24) ^ r.groupId; }
+        static bool Recent(Ev e) { long age = added - 1 - e.seq; return age >= 0 && age < Math.Min(count, 64) && ring[(int)(e.seq % Cap)] == e; }
 
         static Ev Add(WwiseNative.Rec r, float t)
         {
-            var ev = new Ev { t = t, frame = r.frame, r = r };
+            var ev = count == Cap ? ring[head] : null;
+            if (ev == null) ev = new Ev();
+            ev.t = t; ev.frame = r.frame; ev.r = r; ev.count = 1; ev.text = null; ev.line = null; ev.lineCount = 0; ev.lineRaw = false;
+            ev.seq = added++;
             ring[head] = ev; head = (head + 1) % Cap; if (count < Cap) count++;
             return ev;
         }
 
-        public static void Clear() { Array.Clear(ring, 0, Cap); head = count = 0; lastByKey.Clear(); }
+        public static void Clear() { Array.Clear(ring, 0, Cap); head = count = 0; added = 0; lastByKey.Clear(); }
 
         // ---------------------------------------------------------------- state machine
         static void Apply(WwiseNative.Rec r, float t)

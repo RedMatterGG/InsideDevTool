@@ -29,6 +29,7 @@ namespace InsideDev
         public bool captureGameLog;
         float fps, fpsAcc; int fpsFrames;
         float nextBeat;
+        readonly Action tShockwave, tAudioTimed, tAudioCatalog, tRenderScale, tEditorUI, tObjectDatabase, tSelection, tEventMonitor, tSoundLibrary, tChangeRecorder, tMods, tAudioTrace, tAudioDb, tAudioRules, tHiddenScan, tAudioRefScan, tCodeDeps, tLogic, tModifiedPanel, tReferenceIndex, tCustomSpawns, tGizmo, tWorldPick, tOverlay, tLevels, tLiveSavepoints, tDiscovery, tBridge, tExtensions, tAudioSpy, tHiddenScanTick, tSpawnCache;
         public float unityUpdateRT = -100f; public bool fallbackUpdLogged;
         public static bool quietBackground;   // set by the replay record pass: background scanners (object database, reference index, audio refs, hidden scans, code deps, spawn cache) wait until it ends
         // Background scanners (object database, reference index, sound library, audio database and reference scan, hidden scans,
@@ -48,6 +49,38 @@ namespace InsideDev
         public DevCore()
         {
             Instance = this;
+            tShockwave = Shockwave.LateUpdate;
+            tAudioTimed = AudioTimed.LateUpdate;
+            tAudioCatalog = AudioCatalog.AutoRecord;
+            tRenderScale = RenderScale.Tick;
+            tEditorUI = () => { try { workspace.Build(ui, hud ? 54f / uiScale : 0f, "INSIDE Dev " + Boot.Version); } catch (Exception e) { DevLog.Error("workspace", e); ui.EndArea(); } };
+            tObjectDatabase = () => ObjectDatabase.Tick(panel);
+            tSelection = Selection.Tick;
+            tEventMonitor = EventMonitor.Tick;
+            tSoundLibrary = SoundLibrary.Tick;
+            tChangeRecorder = ChangeRecorder.Tick;
+            tMods = Mods.Tick;
+            tAudioTrace = AudioTrace.Tick;
+            tAudioDb = AudioDb.Tick;
+            tAudioRules = AudioRules.BootTick;
+            tHiddenScan = PassiveHidden.Tick;
+            tAudioRefScan = AudioRefScan.Tick;
+            tCodeDeps = CodeDeps.Tick;
+            tLogic = LogicPanel.Tick;
+            tModifiedPanel = ModifiedPanel.Tick;
+            tReferenceIndex = ReferenceIndex.Tick;
+            tCustomSpawns = CustomSpawns.Tick;
+            tGizmo = () => TransformGizmo.Update(ui.mouseOverUI);
+            tWorldPick = () => WorldPick.Update(ui.mouseOverUI, panel);
+            tOverlay = overlay.Update;
+            tLevels = Levels.ScanStreaming;
+            tLiveSavepoints = RefreshLiveSavepoints;
+            tDiscovery = Discovery.Update;
+            tBridge = () => Remote.Update(this);
+            tExtensions = () => { Extensions.LoadAll(this); Extensions.Tick(this); };
+            tAudioSpy = () => { if (AudioSpy.Instance == null || !(SoundEngine.GetImplementationDebug() is AudioSpy)) { if (Time.realtimeSinceStartup > nextAudioTry) { nextAudioTry = Time.realtimeSinceStartup + 2f; AudioSpy.Install(); } } };
+            tHiddenScanTick = TickHidden;
+            tSpawnCache = SpawnCache.Scan;
             ui = new UI(draw);
             RenderHost.buildWorld = BuildWorld;
             EditorState.Load();
@@ -79,11 +112,11 @@ namespace InsideDev
         // ---------------------------------------------------------------- per-frame logic
         public void LateUpdate()
         {
-            Perf.Run("Shockwave", Shockwave.LateUpdate);
-            Perf.Run("AudioTimed", AudioTimed.LateUpdate);
-            if (BackgroundOk) Perf.Run("AudioCatalog", AudioCatalog.AutoRecord);
+            Perf.Run("Shockwave", tShockwave);
+            Perf.Run("AudioTimed", tAudioTimed);
+            if (BackgroundOk) Perf.Run("AudioCatalog", tAudioCatalog);
             CameraControl.Apply();
-            Perf.Run("RenderScale", RenderScale.Tick);
+            Perf.Run("RenderScale", tRenderScale);
         }
 
         public void Update()
@@ -129,7 +162,7 @@ namespace InsideDev
                 {
                     Cursor.visible = true;
                     Cursor.lockState = CursorLockMode.None;
-                    Perf.Run("EditorUI", () => { try { workspace.Build(ui, hud ? 54f / uiScale : 0f, "INSIDE Dev " + Boot.Version); } catch (Exception e) { DevLog.Error("workspace", e); ui.EndArea(); } });
+                    Perf.Run("EditorUI", tEditorUI);
                     try { CommandPalette.Draw(ui); } catch (Exception e) { DevLog.Error("palette", e); ui.EndArea(); CommandPalette.open = false; }
                     try { ui.DrawTooltip(); } catch (Exception e) { DevLog.Error("tooltip", e); }
                 }
@@ -138,37 +171,37 @@ namespace InsideDev
                 RenderHost.MarkUiBuild(panel);
                 Perf.editorOpen = panel;
                 bool bg = BackgroundOk;
-                if (bg) Perf.Run("ObjectDatabase", () => ObjectDatabase.Tick(panel));
-                Perf.Run("Selection", Selection.Tick);
+                if (bg) Perf.Run("ObjectDatabase", tObjectDatabase);
+                Perf.Run("Selection", tSelection);
                 // browser-style history: Alt+Left / Alt+Right, or the mouse back / forward side buttons
                 if (!capLock && ((EditorInput.alt && EditorInput.Key(KeyCode.LeftArrow)) || Input.GetMouseButtonDown(3))) Selection.Back();
                 if (!capLock && ((EditorInput.alt && EditorInput.Key(KeyCode.RightArrow)) || Input.GetMouseButtonDown(4))) Selection.Forward();
-                Perf.Run("EventMonitor", EventMonitor.Tick);
-                if (bg) Perf.Run("SoundLibrary", SoundLibrary.Tick);
-                Perf.Run("ChangeRecorder", ChangeRecorder.Tick);
-                Perf.Run("Mods", Mods.Tick);
-                Perf.Run("AudioTrace", AudioTrace.Tick);
-                if (bg) Perf.Run("AudioDb", AudioDb.Tick);
-                Perf.Run("AudioRules", AudioRules.BootTick);
-                if (bg) Perf.Run("HiddenScan", PassiveHidden.Tick);
-                if (bg) Perf.Run("AudioRefScan", AudioRefScan.Tick);
-                if (bg) Perf.Run("CodeDeps", CodeDeps.Tick);
-                Perf.Run("Logic", LogicPanel.Tick);
-                Perf.Run("ModifiedPanel", ModifiedPanel.Tick);
-                if (bg) Perf.Run("ReferenceIndex", ReferenceIndex.Tick);
-                Perf.Run("CustomSpawns", CustomSpawns.Tick);
-                Perf.Run("Gizmo", () => TransformGizmo.Update(ui.mouseOverUI));
-                Perf.Run("WorldPick", () => WorldPick.Update(ui.mouseOverUI, panel));
+                Perf.Run("EventMonitor", tEventMonitor);
+                if (bg) Perf.Run("SoundLibrary", tSoundLibrary);
+                Perf.Run("ChangeRecorder", tChangeRecorder);
+                Perf.Run("Mods", tMods);
+                Perf.Run("AudioTrace", tAudioTrace);
+                if (bg) Perf.Run("AudioDb", tAudioDb);
+                Perf.Run("AudioRules", tAudioRules);
+                if (bg) Perf.Run("HiddenScan", tHiddenScan);
+                if (bg) Perf.Run("AudioRefScan", tAudioRefScan);
+                if (bg) Perf.Run("CodeDeps", tCodeDeps);
+                Perf.Run("Logic", tLogic);
+                Perf.Run("ModifiedPanel", tModifiedPanel);
+                if (bg) Perf.Run("ReferenceIndex", tReferenceIndex);
+                Perf.Run("CustomSpawns", tCustomSpawns);
+                Perf.Run("Gizmo", tGizmo);
+                Perf.Run("WorldPick", tWorldPick);
                 if (EditorInput.down[2] && !ui.mouseOverUI && !capLock) TeleportToMouse();
-                Perf.Run("Overlay", overlay.Update);
-                Perf.Run("Levels", Levels.ScanStreaming);
-                if (bg) Perf.Run("LiveSavepoints", RefreshLiveSavepoints);
-                Perf.Run("Discovery", Discovery.Update);
-                Perf.Run("Bridge", () => Remote.Update(this));
-                Perf.Run("Extensions", () => { Extensions.LoadAll(this); Extensions.Tick(this); });
-                Perf.Run("AudioSpy", () => { if (AudioSpy.Instance == null || !(SoundEngine.GetImplementationDebug() is AudioSpy)) { if (Time.realtimeSinceStartup > nextAudioTry) { nextAudioTry = Time.realtimeSinceStartup + 2f; AudioSpy.Install(); } } });
-                if (bg) Perf.Run("HiddenScan", TickHidden);
-                if (bg) Perf.Run("SpawnCache", SpawnCache.Scan);
+                Perf.Run("Overlay", tOverlay);
+                Perf.Run("Levels", tLevels);
+                if (bg) Perf.Run("LiveSavepoints", tLiveSavepoints);
+                Perf.Run("Discovery", tDiscovery);
+                Perf.Run("Bridge", tBridge);
+                Perf.Run("Extensions", tExtensions);
+                Perf.Run("AudioSpy", tAudioSpy);
+                if (bg) Perf.Run("HiddenScan", tHiddenScanTick);
+                if (bg) Perf.Run("SpawnCache", tSpawnCache);
             }
             catch (Exception e) { DevLog.Error("Update", e); }
         }
