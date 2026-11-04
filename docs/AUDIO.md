@@ -211,6 +211,21 @@ session of every process named `INSIDE` (every install and copy alike) on every 
 volume and never unmutes. Every 250 ms it writes a heartbeat file that the core's muted capture output and lab test L5
 read to prove the game is muted.
 
+Version 3 (InsideDev 0.10.0) keeps the 50 ms poll, the 250 ms heartbeat and the file format, and costs about 3 % of a core
+instead of 40-60 %. Version 2 walked every process of the PC by name on every poll (17 ms of CPU per scan with 374
+processes). Version 3 identifies the owner of an audio session by its process id (the image name is read once per process
+and the handle stays open), so an INSIDE session is muted on the first poll that sees it; the process list is read every
+1 s, every 5 s while an INSIDE.exe is known, and the exit of a known game is read from its handle on every poll; each
+device's session manager is activated once; the device list is read again on every Windows device notification and every
+heartbeat. Measured without the game, with a scratch process that plays silence as the `--also` target, `test 25`: version
+2 used 62 % of a core, version 3 2.7 %. Waiting with no game (`run`, 12 s): 42 % against 7.7 %. 40 unmutes from outside, 300 ms
+apart: all 40 muted again, median 46 ms, max 67 ms (version 2: median 32 ms, max 62 ms). With the game running, 2 muters
+together took 11-18 % of a core on a loaded machine. A device being added or removed was not exercised.
+
+To check it by hand: start `InsideMuter.exe`, then look at `InsideMuter.exe` in Task Manager, Details tab. The CPU column shows a
+share of all logical processors: with 8 of them about 0 to 2 % is expected, 5 to 8 % means an old version. `muterVersion` in the
+heartbeat must say 3. If the game stays audible, read the health check at the end of section 11.3.
+
 ### 11.1 Commands
 
 It is a console program (.NET Framework 4.x, built into Windows, x64). Start it from a command prompt or by double-clicking;
@@ -251,7 +266,7 @@ non-ASCII escaped). It contains the game's exe path and device names; do not sha
 
 | Field | Meaning |
 |---|---|
-| `muterVersion`, `muterPid` | Program version ("2") and process id (stop a muter by this pid, not by name, if several run). |
+| `muterVersion`, `muterPid` | Program version ("3") and process id (stop a muter by this pid, not by name, if several run). |
 | `mode`, `status` | `run`: `waiting`, `running`, `linger`, `stopped` (last write). `test`: `test`, then `stopped`. |
 | `targets` | Process names muted (`INSIDE`, plus the `--also` name). |
 | `seq`, `time`, `unixMs` | Write counter, UTC time. Age = now - `unixMs`. |

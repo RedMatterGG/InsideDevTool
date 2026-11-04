@@ -1,6 +1,9 @@
 // InsideMuter (optional, gate G1 of docs/REPLAY_DESIGN.md 6.0): mutes every INSIDE.exe audio session on every active
 // render endpoint every 50 ms (ISimpleAudioVolume.SetMute only, the volume is never changed) and writes heartbeat.json every
 // 250 ms. No minute limit: it runs while INSIDE.exe runs and exits 10 s (--linger) after the last INSIDE.exe ended.
+// Version 3: a session's owner is identified by its pid (image name, once per process); the process list (Toolhelp snapshot)
+// is read every 1 s (5 s while an INSIDE.exe is known; its exit is read from its handle every poll), the render endpoint list
+// on every device notification and every heartbeat, and each endpoint's session manager is activated once.
 // Usage: InsideMuter [run] [--heartbeat <path>] [--linger <s>] | list | test <seconds> [--heartbeat <path>] [--also <process name>]
 // --also (test mode only) adds a second process name next to INSIDE, for an offline check of the mute path.
 using System;
@@ -19,6 +22,30 @@ interface IMMDeviceEnumerator
 {
     void EnumAudioEndpoints(int dataFlow, int stateMask, out IMMDeviceCollection devices);
     void GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice device);
+    void GetDevice([MarshalAs(UnmanagedType.LPWStr)] string id, out IMMDevice device);
+    void RegisterEndpointNotificationCallback(IMMNotificationClient client);
+    void UnregisterEndpointNotificationCallback(IMMNotificationClient client);
+}
+
+[ComImport, Guid("7991EEC9-7E89-4D85-8390-6C703CEC60C0"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMNotificationClient
+{
+    void OnDeviceStateChanged([MarshalAs(UnmanagedType.LPWStr)] string id, int state);
+    void OnDeviceAdded([MarshalAs(UnmanagedType.LPWStr)] string id);
+    void OnDeviceRemoved([MarshalAs(UnmanagedType.LPWStr)] string id);
+    void OnDefaultDeviceChanged(int flow, int role, [MarshalAs(UnmanagedType.LPWStr)] string id);
+    void OnPropertyValueChanged([MarshalAs(UnmanagedType.LPWStr)] string id, PropertyKey key);
+}
+
+[ComVisible(true)]
+sealed class DeviceEvents : IMMNotificationClient
+{
+    public static volatile bool dirty = true;
+    public void OnDeviceStateChanged(string id, int state) { dirty = true; }
+    public void OnDeviceAdded(string id) { dirty = true; }
+    public void OnDeviceRemoved(string id) { dirty = true; }
+    public void OnDefaultDeviceChanged(int flow, int role, string id) { dirty = true; }
+    public void OnPropertyValueChanged(string id, PropertyKey key) { }
 }
 
 [Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -108,6 +135,13 @@ sealed class SessionInfo
     public int unmutedSeen;
 }
 
+sealed class EndpointCache
+{
+    public string id = "", name = "";
+    public object manager, meter;
+    public int pass;
+}
+
 sealed class EndpointInfo
 {
     public string id = "", name = "";
@@ -119,7 +153,7 @@ sealed class EndpointInfo
 static class InsideMuter
 {
     const int RenderFlow = 0, RoleConsole = 0, StateActive = 1, ClsCtxAll = 23, PollMs = 50, HeartbeatMs = 250, VtLpwstr = 31;
-    const string Version = "2";
+    const string Version = "3";
     static readonly Guid MuteContext = new Guid("6C1F0E52-6E1B-4E47-9C5B-1A5D3C0A7B11");
     static readonly Guid SessionManagerIid = typeof(IAudioSessionManager2).GUID;
     static readonly Guid MeterIid = typeof(IAudioMeterInformation).GUID;
@@ -129,8 +163,17 @@ static class InsideMuter
     static string heartbeatPath, mode = "run", alsoTarget;
     static double lingerSeconds = 10;
     static readonly HashSet<uint> insidePids = new HashSet<uint>();
+    static readonly Dictionary<uint, IntPtr> insideHandles = new Dictionary<uint, IntPtr>();
+    static readonly Dictionary<uint, IntPtr> otherHandles = new Dictionary<uint, IntPtr>();
+    static readonly HashSet<uint> unopened = new HashSet<uint>();
+    static readonly List<uint> pidScratch = new List<uint>();
+    static readonly HashSet<uint> scanSeen = new HashSet<uint>();
+    static bool seenInside;
     static readonly Dictionary<uint, string> processPaths = new Dictionary<uint, string>();
     static readonly Dictionary<string, string> endpointNames = new Dictionary<string, string>();
+    static readonly Dictionary<string, EndpointCache> endpointCache = new Dictionary<string, EndpointCache>();
+    static readonly List<string> endpointGone = new List<string>();
+    static int endpointPass;
     static readonly Dictionary<string, int> unmutedSeen = new Dictionary<string, int>();
     static readonly HashSet<string> reported = new HashSet<string>();
     static readonly List<SessionInfo> sessions = new List<SessionInfo>();
@@ -144,6 +187,31 @@ static class InsideMuter
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern bool MoveFileExW(string from, string to, int flags);
+
+    const int ScanWaitingMs = 1000, ScanRunningMs = 5000;
+    static readonly DeviceEvents deviceEvents = new DeviceEvents();
+    static IMMDeviceEnumerator notifying;
+    const uint SnapProcess = 2, QueryLimited = 0x1000, Synchronize = 0x00100000, WaitSignaled = 0;
+    static readonly IntPtr InvalidHandle = new IntPtr(-1);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct ProcessEntry
+    {
+        public uint size, usage, pid;
+        public IntPtr heapId;
+        public uint moduleId, threads, parentPid;
+        public int basePriority;
+        public uint flags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string exe;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool Process32FirstW(IntPtr snap, ref ProcessEntry entry);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool Process32NextW(IntPtr snap, ref ProcessEntry entry);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool QueryFullProcessImageNameW(IntPtr process, int flags, StringBuilder name, ref int size);
+    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint ms);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
 
     [MTAThread]
     static int Main(string[] args)
@@ -190,32 +258,29 @@ static class InsideMuter
         muterPid = Process.GetCurrentProcess().Id;
         startedMs = NowMs();
         lastInsideMs = -1;
-        long nextPoll = 0, nextBeat = 0;
-        bool seenInside = false;
+        long nextPoll = 0, nextBeat = 0, nextScan = 0;
+        seenInside = false;
         Log("InsideMuter " + Version + " " + mode + ": poll " + PollMs + " ms, heartbeat " + HeartbeatMs + " ms -> " + heartbeatPath + (mode == "test" ? ", test for " + testSeconds.ToString(IC) + " s" : ", exits " + lingerSeconds.ToString(IC) + " s after the last INSIDE.exe"));
         while (true)
         {
             long now = NowMs();
-            try { FindInside(); }
-            catch (Exception e) { Error("process scan: " + e.Message); }
-            if (insidePids.Count > 0)
-            {
-                if (!seenInside) Log("INSIDE.exe found: pid " + JoinPids());
-                seenInside = true;
-                lastInsideMs = now;
-            }
             bool full = clock.ElapsedMilliseconds >= nextBeat;
-            if (full) { sessions.Clear(); endpoints.Clear(); }
-            if (full || insidePids.Count > 0)
+            try
             {
-                polls++;
-                try
-                {
-                    if (enumerator == null) enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorCo();
-                    Poll(enumerator, full);
-                }
-                catch (Exception e) { Error("poll: " + e.Message); Release(enumerator); enumerator = null; }
+                if (clock.ElapsedMilliseconds >= nextScan) { FindInside(); nextScan = clock.ElapsedMilliseconds + (insidePids.Count > 0 ? ScanRunningMs : ScanWaitingMs); }
+                else CheckExits();
             }
+            catch (Exception e) { Error("process scan: " + e.Message); }
+            Seen(now, "");
+            if (full) { sessions.Clear(); endpoints.Clear(); }
+            if (full || insidePids.Count > 0) polls++;
+            try
+            {
+                if (enumerator == null) { enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorCo(); Notify(enumerator); }
+                Poll(enumerator, full);
+            }
+            catch (Exception e) { Error("poll: " + e.Message); DropEndpoints(); Unnotify(); Release(enumerator); enumerator = null; }
+            Seen(now, " (by its audio session)");
             string status = mode == "test" ? "test" : !seenInside ? "waiting" : insidePids.Count > 0 ? "running" : "linger";
             if (full)
             {
@@ -232,36 +297,123 @@ static class InsideMuter
         }
         sessions.Clear();
         endpoints.Clear();
+        DropEndpoints();
+        Unnotify();
+        Release(enumerator);
         WriteHeartbeat("stopped");
         Log(mode == "test" ? "test finished" : "no INSIDE.exe for " + lingerSeconds.ToString(IC) + " s; exiting");
         return 0;
     }
 
-    static void FindInside()
+    static void Seen(long now, string how)
     {
-        insidePids.Clear();
-        ScanProcesses("INSIDE");
-        if (alsoTarget != null) ScanProcesses(alsoTarget);
+        if (insidePids.Count == 0) return;
+        if (!seenInside) Log("INSIDE.exe found" + how + ": pid " + JoinPids());
+        seenInside = true;
+        lastInsideMs = now;
     }
 
-    static void ScanProcesses(string processName)
+    static bool IsTargetName(string exeName)
     {
-        foreach (var p in Process.GetProcessesByName(processName))
-        {
-            insidePids.Add((uint)p.Id);
-            string path;
-            if (!processPaths.TryGetValue((uint)p.Id, out path) || path.Length == 0)
-            {
-                path = "";
-                try { path = p.MainModule.FileName; } catch (Exception) { }
-                processPaths[(uint)p.Id] = path;
-            }
-            p.Dispose();
-        }
+        string n = Path.GetFileNameWithoutExtension(exeName ?? "");
+        return string.Equals(n, "INSIDE", StringComparison.OrdinalIgnoreCase) || (alsoTarget != null && string.Equals(n, alsoTarget, StringComparison.OrdinalIgnoreCase));
     }
+
+    static void FindInside()
+    {
+        scanSeen.Clear();
+        IntPtr snap = CreateToolhelp32Snapshot(SnapProcess, 0);
+        if (snap == InvalidHandle || snap == IntPtr.Zero) throw new Exception("process snapshot failed, win32 error " + Marshal.GetLastWin32Error());
+        try
+        {
+            var e = new ProcessEntry();
+            e.size = (uint)Marshal.SizeOf(typeof(ProcessEntry));
+            for (bool ok = Process32FirstW(snap, ref e); ok; ok = Process32NextW(snap, ref e))
+                if (IsTargetName(e.exe)) { scanSeen.Add(e.pid); if (!insidePids.Contains(e.pid)) AddInside(e.pid, OpenProcess(QueryLimited | Synchronize, false, e.pid)); }
+        }
+        finally { CloseHandle(snap); }
+        pidScratch.Clear();
+        foreach (uint pid in insidePids) if (!scanSeen.Contains(pid) || Exited(insideHandles[pid])) pidScratch.Add(pid);
+        foreach (uint pid in pidScratch) DropInside(pid);
+        pidScratch.Clear();
+        foreach (var kv in otherHandles) if (Exited(kv.Value)) pidScratch.Add(kv.Key);
+        foreach (uint pid in pidScratch) { CloseHandle(otherHandles[pid]); otherHandles.Remove(pid); }
+        unopened.Clear();
+    }
+
+    static void CheckExits()
+    {
+        pidScratch.Clear();
+        foreach (var kv in insideHandles) if (kv.Value != IntPtr.Zero && Exited(kv.Value)) pidScratch.Add(kv.Key);
+        foreach (uint pid in pidScratch) DropInside(pid);
+    }
+
+    static bool Exited(IntPtr handle)
+    {
+        return handle != IntPtr.Zero && WaitForSingleObject(handle, 0) == WaitSignaled;
+    }
+
+    static void AddInside(uint pid, IntPtr handle)
+    {
+        insidePids.Add(pid);
+        insideHandles[pid] = handle;
+        string path;
+        if (!processPaths.TryGetValue(pid, out path) || path.Length == 0) processPaths[pid] = handle != IntPtr.Zero ? ImagePath(handle) : "";
+    }
+
+    static void DropInside(uint pid)
+    {
+        IntPtr h;
+        if (insideHandles.TryGetValue(pid, out h) && h != IntPtr.Zero) CloseHandle(h);
+        insideHandles.Remove(pid);
+        insidePids.Remove(pid);
+    }
+
+    static string ImagePath(IntPtr handle)
+    {
+        var sb = new StringBuilder(1024);
+        int size = sb.Capacity;
+        return QueryFullProcessImageNameW(handle, 0, sb, ref size) ? sb.ToString(0, size) : "";
+    }
+
+    static bool IsTargetPid(uint pid)
+    {
+        if (insidePids.Contains(pid)) return true;
+        if (pid == 0 || otherHandles.ContainsKey(pid) || unopened.Contains(pid)) return false;
+        IntPtr h = OpenProcess(QueryLimited | Synchronize, false, pid);
+        if (h == IntPtr.Zero) { unopened.Add(pid); return false; }
+        string path = ImagePath(h);
+        if (IsTargetName(path)) { processPaths[pid] = path; AddInside(pid, h); return true; }
+        otherHandles[pid] = h;
+        return false;
+    }
+
+    static void Notify(IMMDeviceEnumerator enumerator)
+    {
+        DeviceEvents.dirty = true;
+        try { enumerator.RegisterEndpointNotificationCallback(deviceEvents); notifying = enumerator; }
+        catch (Exception e) { Fault("device notifications unavailable (endpoint list read every poll): " + e.Message); notifying = null; }
+    }
+
+    static void Unnotify()
+    {
+        if (notifying == null) return;
+        try { notifying.UnregisterEndpointNotificationCallback(deviceEvents); } catch (Exception) { }
+        notifying = null;
+    }
+
+    static readonly List<EndpointCache> endpointOrder = new List<EndpointCache>();
 
     static void Poll(IMMDeviceEnumerator enumerator, bool full)
     {
+        if (!full && !DeviceEvents.dirty && notifying != null && endpointCache.Count > 0)
+        {
+            endpointOrder.Clear();
+            endpointOrder.AddRange(endpointCache.Values);
+            foreach (var c in endpointOrder) PollCached(c);
+            return;
+        }
+        DeviceEvents.dirty = false;
         IMMDeviceCollection devices = null;
         try
         {
@@ -269,22 +421,57 @@ static class InsideMuter
             int n;
             devices.GetCount(out n);
             string defaultId = full ? DefaultEndpointId(enumerator) : "";
+            endpointPass++;
             for (int d = 0; d < n; d++) PollEndpoint(devices, d, full, defaultId);
+            endpointGone.Clear();
+            foreach (var kv in endpointCache) if (kv.Value.pass != endpointPass) endpointGone.Add(kv.Key);
+            foreach (var id in endpointGone) DropEndpoint(id);
         }
         finally { Release(devices); }
+    }
+
+    static EndpointCache CachedEndpoint(IMMDevice dev, string id)
+    {
+        EndpointCache c;
+        if (endpointCache.TryGetValue(id, out c)) return c;
+        c = new EndpointCache();
+        c.id = id;
+        c.name = EndpointName(dev, id);
+        var iid = SessionManagerIid;
+        dev.Activate(ref iid, ClsCtxAll, IntPtr.Zero, out c.manager);
+        try { var mid = MeterIid; dev.Activate(ref mid, ClsCtxAll, IntPtr.Zero, out c.meter); } catch (Exception) { c.meter = null; }
+        endpointCache[id] = c;
+        return c;
+    }
+
+    static void DropEndpoint(string id)
+    {
+        EndpointCache c;
+        if (!endpointCache.TryGetValue(id, out c)) return;
+        endpointCache.Remove(id);
+        Release(c.meter);
+        Release(c.manager);
+    }
+
+    static void DropEndpoints()
+    {
+        endpointGone.Clear();
+        endpointGone.AddRange(endpointCache.Keys);
+        foreach (var id in endpointGone) DropEndpoint(id);
     }
 
     static void PollEndpoint(IMMDeviceCollection devices, int index, bool full, string defaultId)
     {
         IMMDevice dev = null;
-        object manager = null;
         IAudioSessionEnumerator list = null;
+        string id = null;
         try
         {
             devices.Item(index, out dev);
-            string id;
             dev.GetId(out id);
-            string name = EndpointName(dev, id);
+            var cache = CachedEndpoint(dev, id);
+            cache.pass = endpointPass;
+            string name = cache.name;
             EndpointInfo ep = null;
             if (full)
             {
@@ -292,19 +479,37 @@ static class InsideMuter
                 ep.id = id;
                 ep.name = name;
                 ep.isDefault = id == defaultId;
-                ep.peak = EndpointPeak(dev);
+                ep.peak = CachedPeak(cache);
                 endpoints.Add(ep);
             }
-            if (insidePids.Count == 0) return;
-            var iid = SessionManagerIid;
-            dev.Activate(ref iid, ClsCtxAll, IntPtr.Zero, out manager);
-            ((IAudioSessionManager2)manager).GetSessionEnumerator(out list);
+            ((IAudioSessionManager2)cache.manager).GetSessionEnumerator(out list);
             int count;
             list.GetCount(out count);
             for (int s = 0; s < count; s++) PollSession(list, s, id, name, ep);
         }
-        catch (Exception e) { Error("endpoint " + index + ": " + e.Message); }
-        finally { Release(list); Release(manager); Release(dev); }
+        catch (Exception e) { Error("endpoint " + index + ": " + e.Message); if (id != null) DropEndpoint(id); }
+        finally { Release(list); Release(dev); }
+    }
+
+    static void PollCached(EndpointCache c)
+    {
+        IAudioSessionEnumerator list = null;
+        try
+        {
+            ((IAudioSessionManager2)c.manager).GetSessionEnumerator(out list);
+            int count;
+            list.GetCount(out count);
+            for (int s = 0; s < count; s++) PollSession(list, s, c.id, c.name, null);
+        }
+        catch (Exception e) { Error("endpoint '" + c.name + "': " + e.Message); DropEndpoint(c.id); DeviceEvents.dirty = true; }
+        finally { Release(list); }
+    }
+
+    static float CachedPeak(EndpointCache c)
+    {
+        if (c.meter == null) return -1f;
+        try { float peak; ((IAudioMeterInformation)c.meter).GetPeakValue(out peak); return peak; }
+        catch (Exception) { return -1f; }
     }
 
     static void PollSession(IAudioSessionEnumerator list, int index, string endpointId, string endpointName, EndpointInfo ep)
@@ -315,7 +520,7 @@ static class InsideMuter
             list.GetSession(index, out ctl);
             uint pid;
             ctl.GetProcessId(out pid);
-            if (!insidePids.Contains(pid)) return;
+            if (!IsTargetPid(pid)) return;
             var volume = (ISimpleAudioVolume)ctl;
             bool muted;
             volume.GetMute(out muted);
