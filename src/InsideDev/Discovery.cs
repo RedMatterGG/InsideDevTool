@@ -68,16 +68,27 @@ namespace InsideDev
             {
                 if (queue.Count == 0) { status = ""; batchTotal = batchDone = 0; return; }
                 cur = queue.Dequeue();
+                if (cur.sub < 0 || cur.sub >= SavepointManager.SubsceneCount)
+                {
+                    DevLog.Write("discover: no area " + cur.sub + " (areas are 0.." + (SavepointManager.SubsceneCount - 1) + ")");
+                    cur = null; batchDone++;
+                    return;
+                }
                 if (waitMethod == null)
                 {
                     waitMethod = typeof(SavepointManager.SavepointTask).GetMethod("WaitForSubscene", BindingFlags.NonPublic | BindingFlags.Static);
                     if (waitMethod == null) { DevLog.Write("discover: WaitForSubscene not found"); queue.Clear(); cur = null; return; }
                 }
-                bool unload = cur.action == Action.Discover;
-                if (cur.action == Action.Catalog)
+                // an area that is loaded now (the boy stands in it, or the game streams it) is never unloaded behind the game's
+                // back; when its state cannot be read, Discover unloads as it always did
+                bool stateKnown = false;
+                try
                 {
-                    try { var cul = SavepointManager.GetCuller(cur.sub); cur.wasUnloaded = cul != null && cul.LoadedState == SubsceneCuller.ELoadedState.Unloaded; } catch { }
+                    var cul = SavepointManager.GetCuller(cur.sub);
+                    if (cul != null) { stateKnown = true; cur.wasUnloaded = cul.LoadedState == SubsceneCuller.ELoadedState.Unloaded; }
                 }
+                catch { }
+                bool unload = cur.action == Action.Discover && (!stateKnown || cur.wasUnloaded);
                 try { it = (IEnumerator)waitMethod.Invoke(null, new object[] { cur.sub, unload }); }
                 catch (Exception e) { DevLog.Error("discover start " + cur.sub, e); cur = null; return; }
                 jobStart = Time.realtimeSinceStartup;
@@ -142,9 +153,13 @@ namespace InsideDev
         }
 
         static readonly Dictionary<string, Entry> byName = new Dictionary<string, Entry>();
-        static bool loaded, dirty;
+        static bool loaded, dirty, loadFailed, loadFailLogged;
         static float nextScan;
+        static int[] seenCount;
+        static int seenStream = -1;
         static readonly CultureInfo IC = CultureInfo.InvariantCulture;
+        // more savepoints than any area has: a count above it in the cache file is a damaged line
+        const int MaxSavepoints = 4096;
 
         static string PathFile { get { return Path.Combine(Path.Combine(Path.GetDirectoryName(Application.dataPath), "_mod"), "spawns.cache"); } }
 
@@ -152,35 +167,61 @@ namespace InsideDev
         {
             if (loaded) return;
             loaded = true;
-            try
+            string text;
+            bool fromBackup;
+            try { text = SafeFile.ReadAllTextOrBackup(PathFile, out fromBackup); }
+            catch (Exception ex)
             {
-                if (!File.Exists(PathFile)) return;
-                foreach (var line in File.ReadAllLines(PathFile))
-                {
-                    var f = line.Split('|');
-                    if (f.Length < 4) continue;
-                    var e = new Entry { name = f[0], count = int.Parse(f[1], IC) };
-                    var ps = f[2].Split(';'); var inf = f[3].Split(';');
-                    e.pos = new Vector3[e.count]; e.info = new string[e.count];
-                    for (int i = 0; i < e.count; i++)
-                    {
-                        if (i < ps.Length)
-                        {
-                            var c = ps[i].Split(',');
-                            if (c.Length == 3) e.pos[i] = new Vector3(float.Parse(c[0], IC), float.Parse(c[1], IC), float.Parse(c[2], IC));
-                        }
-                        e.info[i] = i < inf.Length ? inf[i] : "";
-                    }
-                    byName[e.name] = e;
-                }
-                DevLog.Write("spawn cache: " + byName.Count + " area(s) loaded from disk");
+                // the file is there but could not be read: never write a shorter list over it
+                loadFailed = true;
+                DevLog.Error("spawn cache load", ex);
+                return;
             }
-            catch (Exception ex) { DevLog.Error("spawn cache load", ex); }
+            if (text == null) return;
+            int bad = 0;
+            foreach (var raw in text.Split('\n'))
+            {
+                string line = raw.TrimEnd('\r');
+                if (line.Length == 0) continue;
+                var e = ParseLine(line);
+                if (e == null) { bad++; continue; }
+                byName[e.name] = e;
+            }
+            if (fromBackup) dirty = true;
+            DevLog.Write("spawn cache: " + byName.Count + " area(s) loaded from disk" + (bad > 0 ? ", " + bad + " unreadable line(s) skipped" : "") +
+                         (fromBackup ? " (spawns.cache was unreadable, its .bak copy was used)" : ""));
+        }
+
+        // name|count|x,y,z;x,y,z;...|info;info;...   null for a line that is not one (a bad position alone reads as unknown)
+        internal static Entry ParseLine(string line)
+        {
+            var f = line.Split('|');
+            if (f.Length < 4 || f[0].Length == 0) return null;
+            int count;
+            if (!Fmt.TryI(f[1], out count) || count < 0 || count > MaxSavepoints) return null;
+            var e = new Entry { name = f[0], count = count, pos = new Vector3[count], info = new string[count] };
+            var ps = f[2].Split(';'); var inf = f[3].Split(';');
+            for (int i = 0; i < count; i++)
+            {
+                if (i < ps.Length)
+                {
+                    var c = ps[i].Split(',');
+                    float x, y, z;
+                    if (c.Length == 3 && Fmt.TryF(c[0], out x) && Fmt.TryF(c[1], out y) && Fmt.TryF(c[2], out z)) e.pos[i] = new Vector3(x, y, z);
+                }
+                e.info[i] = i < inf.Length ? inf[i] : "";
+            }
+            return e;
         }
 
         public static void SaveIfDirty()
         {
             if (!dirty) return;
+            if (loadFailed)
+            {
+                if (!loadFailLogged) { loadFailLogged = true; DevLog.Write("spawn cache: not saved, spawns.cache could not be read at start (the file is left as it is)"); }
+                return;
+            }
             dirty = false;
             try
             {
@@ -194,10 +235,10 @@ namespace InsideDev
                         sb.Append(e.pos[i].x.ToString("R", IC)).Append(',').Append(e.pos[i].y.ToString("R", IC)).Append(',').Append(e.pos[i].z.ToString("R", IC));
                     }
                     sb.Append('|');
-                    for (int i = 0; i < e.count; i++) { if (i > 0) sb.Append(';'); sb.Append((e.info[i] ?? "").Replace("|", "/").Replace(";", ",")); }
+                    for (int i = 0; i < e.count; i++) { if (i > 0) sb.Append(';'); sb.Append((e.info[i] ?? "").Replace("|", "/").Replace(";", ",").Replace("\n", " ").Replace("\r", " ")); }
                     sb.Append('\n');
                 }
-                File.WriteAllText(PathFile, sb.ToString());
+                SafeFile.WriteAllText(PathFile, sb.ToString(), true);
             }
             catch (Exception ex) { DevLog.Error("spawn cache save", ex); }
         }
@@ -207,15 +248,27 @@ namespace InsideDev
             Load();
             int n;
             try { n = SavepointManager.GetSubsceneSavepointCount(sub); } catch { return; }
-            if (n < 0) return;
+            if (n < 0 || n > MaxSavepoints) return;
             string name = SavepointManager.GetSubsceneName(sub);
             Entry old;
             byName.TryGetValue(name, out old);
+            if (old != null && old.count == n)
+            {
+                // nothing new is the usual case: compare in place and allocate nothing
+                bool same = true;
+                for (int i = 0; i < n && same; i++)
+                {
+                    Vector3 p = Vector3.zero;
+                    try { p = SavepointManager.GetSavepointPosition(sub, i); } catch { }
+                    if (p == Vector3.zero) continue;   // not known to the game right now: the cached position stays
+                    if ((p - old.pos[i]).sqrMagnitude > 0.0001f) same = false;
+                }
+                if (same) return;
+            }
             var e = new Entry { name = name, count = n, pos = new Vector3[n], info = new string[n] };
-            bool anyPos = false;
             for (int i = 0; i < n; i++)
             {
-                try { e.pos[i] = SavepointManager.GetSavepointPosition(sub, i); anyPos |= e.pos[i] != Vector3.zero; } catch { }
+                try { e.pos[i] = SavepointManager.GetSavepointPosition(sub, i); } catch { }
                 if (e.pos[i] == Vector3.zero && old != null && i < old.count) e.pos[i] = old.pos[i];
                 string inf = "";
                 try
@@ -226,18 +279,12 @@ namespace InsideDev
                 catch { }
                 e.info[i] = inf;
             }
-            if (old != null && old.count == n && SamePos(old, e)) return;
             byName[name] = e;
             dirty = true;
         }
 
-        static bool SamePos(Entry a, Entry b)
-        {
-            for (int i = 0; i < a.count; i++) if ((a.pos[i] - b.pos[i]).sqrMagnitude > 0.0001f) return false;
-            return true;
-        }
-
-        // periodic: record anything the game has learned on its own (normal play streaming)
+        // periodic: record anything the game has learned on its own (normal play streaming). An area is read again only
+        // when its savepoint count changed, and every known area once after a streaming change (positions arrive then).
         public static void Scan()
         {
             if (Time.realtimeSinceStartup < nextScan || !G.SavepointsReady) return;
@@ -245,8 +292,20 @@ namespace InsideDev
             Load();
             try
             {
-                for (int s = 0; s < SavepointManager.SubsceneCount; s++)
-                    if (SavepointManager.GetSubsceneSavepointCount(s) >= 0) Record(s);
+                int subs = SavepointManager.SubsceneCount;
+                if (seenCount == null || seenCount.Length != subs)
+                {
+                    seenCount = new int[subs];
+                    for (int s = 0; s < subs; s++) seenCount[s] = int.MinValue;
+                }
+                bool all = Levels.Changed(ref seenStream);
+                for (int s = 0; s < subs; s++)
+                {
+                    int n = SavepointManager.GetSubsceneSavepointCount(s);
+                    if (n < 0 || (!all && n == seenCount[s])) continue;
+                    seenCount[s] = n;
+                    Record(s);
+                }
                 SaveIfDirty();
             }
             catch (Exception e) { DevLog.Error("spawn cache scan", e); nextScan = Time.realtimeSinceStartup + 60f; }

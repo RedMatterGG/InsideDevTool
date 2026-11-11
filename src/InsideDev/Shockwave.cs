@@ -34,10 +34,26 @@ namespace InsideDev
             mResetWall = t.GetMethod("ResetWall", BF);
         }
 
+        // Timing edits go into the history (undo, "Revert all my changes", "Record as mod"). A slider drag is one entry:
+        // its first change opens a transaction that LateUpdate closes when the mouse button is released, also when the
+        // panel was closed in the middle of the drag.
+        static bool dragOpen;
+        public static bool Editing { get { return dragOpen; } }
+
+        static void BeginDrag()
+        {
+            if (dragOpen) return;
+            dragOpen = true;
+            ChangeRecorder.Begin("shockwave timing", "shockwave");
+        }
+
+        static string CheckerField(string which) { return which == "blow" ? "blowChecker" : which == "warn" ? "warningChecker" : "resetChecker"; }
+
         // called from LateUpdate: ForcePushManager.Update runs InitBlow() before re-enabling kill in the same frame,
         // so clearing killEnabled after its Update means the next blow never arms the kill timer.
         public static void LateUpdate()
         {
+            if (dragOpen && !EditorInput.held[0]) { dragOpen = false; ChangeRecorder.End(); }
             if (!noKill) return;
             var m = Mgr;
             if (m == null) return;
@@ -75,7 +91,9 @@ namespace InsideDev
             var m = Mgr; if (m == null) return; Bind();
             var f = which == "blow" ? fBlow : which == "warn" ? fWarn : fReset;
             var c = f.GetValue(m) as MusicEventChecker;
-            if (c != null) c.SetEventTime(t);
+            if (c == null) return;
+            ChangeRecorder.BeforeField(m, CheckerField(which) + ".eventTime_s", "shockwave");
+            c.SetEventTime(t);
         }
 
         public static void Draw(UI ui)
@@ -127,10 +145,15 @@ namespace InsideDev
             if (ui.Button("apply", 60) || e1 || e2)
             {
                 float vb, ve;
-                if (float.TryParse(explTxt, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out ve) && ve > 0f) m.explosionTime = ve;
-                if (float.TryParse(blowTxt, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out vb))
-                { SetCheckerTime("blow", vb); SetCheckerTime("warn", Mathf.Repeat(vb + 0.1f - m.explosionTime + m.offset, cycle)); }
-                DevLog.Write("shockwave: blow @" + CheckerTime("blow") + "s, travel " + m.explosionTime + "s");
+                ChangeRecorder.Begin("shockwave timing", "shockwave");
+                try
+                {
+                    if (Fmt.TryF(explTxt, out ve) && ve > 0f) { ChangeRecorder.BeforeField(m, "explosionTime", "shockwave"); m.explosionTime = ve; }
+                    if (Fmt.TryF(blowTxt, out vb))
+                    { SetCheckerTime("blow", vb); SetCheckerTime("warn", Mathf.Repeat(vb + 0.1f - m.explosionTime + m.offset, cycle)); }
+                }
+                finally { ChangeRecorder.End(); }
+                DevLog.Write("shockwave: blow @" + Fmt.F(CheckerTime("blow")) + "s, travel " + Fmt.F(m.explosionTime) + "s");
                 blowTxt = explTxt = "";
             }
             ui.EndRow();
@@ -139,10 +162,10 @@ namespace InsideDev
             ui.BeginRow();
             ui.Label("blow at", null, 60);
             float nb = ui.Slider("sw_blow", blowAt, 0f, Mathf.Max(0.1f, cycle), 260);
-            if (Mathf.Abs(nb - blowAt) > 0.01f) { SetCheckerTime("blow", nb); SetCheckerTime("warn", Mathf.Repeat(nb + 0.1f - m.explosionTime + m.offset, cycle)); }
+            if (Mathf.Abs(nb - blowAt) > 0.01f) { BeginDrag(); SetCheckerTime("blow", nb); SetCheckerTime("warn", Mathf.Repeat(nb + 0.1f - m.explosionTime + m.offset, cycle)); }
             ui.Label("  wave travel time", null, 120);
             float ne = ui.Slider("sw_expl", m.explosionTime, 0.1f, 3f, 200);
-            if (Mathf.Abs(ne - m.explosionTime) > 0.01f) { m.explosionTime = ne; SetCheckerTime("warn", Mathf.Repeat(CheckerTime("blow") + 0.1f - ne + m.offset, cycle)); }
+            if (Mathf.Abs(ne - m.explosionTime) > 0.01f) { BeginDrag(); ChangeRecorder.BeforeField(m, "explosionTime", "shockwave"); m.explosionTime = ne; SetCheckerTime("warn", Mathf.Repeat(CheckerTime("blow") + 0.1f - ne + m.offset, cycle)); }
             ui.EndRow();
             ui.Label("Note: moving 'blow at' away from the music hit desyncs the kill from what you hear - that's the point of Playdead's design.", UI.Dim);
         }

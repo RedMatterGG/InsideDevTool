@@ -12,17 +12,26 @@ using UObj = UnityEngine.Object;
 namespace InsideDev
 {
     // File bridge so an external helper can drive the mod live:
-    //   _mod/cmd/in_*.txt   : command files (one command per line, optional "id|" prefix); processed in name order, then deleted
-    //   _mod/cmd/out.txt    : results  (">>> id  command" ... "<<< id")
-    //   _mod/cmd/state.txt  : live snapshot, rewritten every second
-    //   _mod/cmd/shot_*.png : screenshots
+    //   _mod/cmd/in_*.txt     : command files (one command per line, optional "id|" prefix); processed in name order, then deleted
+    //   _mod/cmd/out.txt      : results  (">>> id  command" ... "<<< id")
+    //   _mod/cmd/out_<id>.txt : the result of one command that was sent with an id, a file of its own (status line first)
+    //   _mod/cmd/state.txt    : live snapshot, rewritten every second while command files arrive
+    //   _mod/cmd/shot_*.png   : screenshots
+    // Nothing is written while nobody sends command files; the folder is looked at every 2 s then.
     public static class Remote
     {
-        static string dir;
-        static float nextPoll, nextState, lastCommandAt = -1000f;
+        static string dir, statePath;
+        static float nextPoll, nextState, nextClean, lastFileCommandAt = -1000f;
         static int autoId;
+        static bool inited, stateAlways;
         static readonly CultureInfo IC = CultureInfo.InvariantCulture;
         public static bool enabled = true;
+        // seconds the file bridge counts as in use after its last command file
+        const float FileUseWindow = 120f;
+        // seconds a reply file out_<id>.txt is kept
+        const float ReplyKeep = 600f;
+        // longest id of "id|command"
+        public const int MaxIdLength = 40;
 
         static string Dir
         {
@@ -37,23 +46,42 @@ namespace InsideDev
             }
         }
 
+        static void Init()
+        {
+            inited = true;
+            statePath = Path.Combine(Dir, "state.txt");
+            try { CoreBCommands.Init(); } catch (Exception e) { DevLog.Error("core commands init", e); }
+            enabled = EditorState.Get("bridge.enabled", true);
+            ReloadConfig();
+            if (!enabled) DevLog.Write("remote: file bridge off (editor.cfg bridge.enabled=0); `remote on` starts it for this session");
+        }
+
+        public static void ReloadConfig()
+        {
+            string m = EditorState.Get("bridge.state", "auto");
+            stateAlways = m == "always" || m == "1";
+        }
+
         public static void Update(DevCore core)
         {
+            if (!inited) Init();
+            CoreBCommands.Tick();
             if (!enabled) return;
             try { MemLink.Update(); } catch { }
             float now = Time.realtimeSinceStartup;
-            // Phase 12 throttling: poll fast (0.3 s) while the bridge is in use or the editor is open, 1 s when idle;
-            // state.txt every second while active, every 5 s when idle. One directory listing per poll.
-            bool active = now - lastCommandAt < 120f || core.panel;
+            // In use = a command file arrived in the last two minutes: the folder is polled every 0.3 s and state.txt is
+            // written every second. Otherwise one directory listing every second (every 2 s while nobody uses the tool at
+            // all) and no state.txt, unless editor.cfg bridge.state=always asks for it every 5 s.
             if (now >= nextPoll)
             {
-                nextPoll = now + (active ? 0.3f : 1f);
+                nextPoll = now + (now - lastFileCommandAt < FileUseWindow ? 0.3f : Background.InUse ? 1f : 2f);
                 try { Poll(core); } catch (Exception e) { DevLog.Error("remote poll", e); nextPoll = now + 5f; }
             }
-            if (now >= nextState)
+            bool active = now - lastFileCommandAt < FileUseWindow;
+            if ((active || stateAlways) && now >= nextState)
             {
                 nextState = now + (active ? 1f : 5f);
-                try { File.WriteAllText(Path.Combine(Dir, "state.txt"), State(core)); } catch { }
+                try { SafeFile.WriteAllText(statePath, State(core)); } catch { }
             }
         }
 
@@ -61,45 +89,80 @@ namespace InsideDev
         {
             var files = Directory.GetFiles(Dir, "in_*.txt");
             if (files.Length == 0) return;
-            ObjectDatabase.Demand(60f);
-            lastCommandAt = Time.realtimeSinceStartup;
             Array.Sort(files, StringComparer.Ordinal);
+            bool any = false;
             foreach (var f in files)
             {
                 string[] lines;
-                try { lines = File.ReadAllLines(f); File.Delete(f); } catch { continue; }
+                try
+                {
+                    // created but not written yet: left for the next poll, so the command is not lost
+                    var fi = new FileInfo(f);
+                    double age = (DateTime.UtcNow - fi.LastWriteTimeUtc).TotalSeconds;
+                    if (fi.Length == 0 && age >= 0 && age < 2.0) continue;
+                    // left by a client that died: it must not run at the next game start
+                    if (age > 30.0) { try { File.Delete(f); } catch { } DevLog.Write("remote: dropped a stale command file " + Path.GetFileName(f)); continue; }
+                    lines = File.ReadAllLines(f); File.Delete(f);
+                }
+                catch { continue; }
+                if (!any) { any = true; ObjectDatabase.Demand(60f); }
+                lastFileCommandAt = Time.realtimeSinceStartup;
                 foreach (var raw in lines)
                 {
                     string line = raw.Trim();
                     if (line.Length == 0 || line.StartsWith("#")) continue;
-                    string id;
-                    int bar = line.IndexOf('|');
-                    if (bar > 0 && bar < 12) { id = line.Substring(0, bar); line = line.Substring(bar + 1).Trim(); }
-                    else id = "r" + (++autoId);
-                    Execute(id, line, core);
+                    string id, command;
+                    bool ownId = SplitId(line, out id, out command);
+                    if (!ownId) id = "r" + (++autoId);
+                    Execute(id, ownId, command, core);
                 }
             }
+            if (any) nextState = 0f;   // the snapshot follows the commands at once
         }
 
-        static void Execute(string id, string line, DevCore core)
+        // "id|command": the part before the first '|' is an id when it has no blank and at most MaxIdLength characters,
+        // so a command that uses '|' itself ("fsmset Door|Open|0|x|1") stays whole when it is sent without an id.
+        public static bool SplitId(string line, out string id, out string command)
         {
-            var sb = new StringBuilder();
-            sb.Append(">>> ").Append(id).Append("  ").Append(line).Append("   [frame ").Append(Time.frameCount).Append(", t=").Append(Time.realtimeSinceStartup.ToString("0.0", IC)).Append("]\n");
-            int before;
-            lock (DevLog.Lines) before = DevLog.Lines.Count;
+            int bar = line.IndexOf('|');
+            if (bar > 0 && bar <= MaxIdLength)
+            {
+                bool plain = true;
+                for (int i = 0; i < bar; i++) if (char.IsWhiteSpace(line[i])) { plain = false; break; }
+                if (plain) { id = line.Substring(0, bar); command = line.Substring(bar + 1).Trim(); return true; }
+            }
+            id = null; command = line;
+            return false;
+        }
+
+        static readonly List<string> execLog = new List<string>();
+
+        static void Execute(string id, bool ownId, string line, DevCore core)
+        {
+            Background.Touch();
+            int frame = Time.frameCount;
+            float t = Time.realtimeSinceStartup;
+            int logAt = DevLog.Total;
+            var body = new StringBuilder();
+            bool failed = false;
+            bool was = trusted;
+            trusted = true;   // a command file comes from somebody who can write into the game folder
             try
             {
                 string res = Run(line, core);
-                if (res != null) sb.Append(res).Append('\n');
+                if (res != null) { body.Append(res).Append('\n'); failed = IsError(res); }
             }
-            catch (Exception e) { sb.Append("ERROR ").Append(e.GetType().Name).Append(": ").Append(e.Message).Append('\n').Append(e.StackTrace).Append('\n'); }
-            lock (DevLog.Lines)
-            {
-                // include anything the command logged (existing console commands report through DevLog)
-                int from = Math.Min(before, DevLog.Lines.Count);
-                for (int i = from; i < DevLog.Lines.Count; i++) sb.Append("  log: ").Append(DevLog.Lines[i]).Append('\n');
-            }
-            sb.Append("<<< ").Append(id).Append("\n\n");
+            catch (Exception e) { failed = true; body.Append("ERROR ").Append(e.GetType().Name).Append(": ").Append(e.Message).Append('\n').Append(e.StackTrace).Append('\n'); }
+            finally { trusted = was; }
+            // include anything the command logged (the console commands report through DevLog)
+            execLog.Clear();
+            DevLog.Since(logAt, execLog);
+            if (body.Length == 0 && execLog.Count > 0) failed = IsError(execLog[0]);
+            foreach (var l in execLog) body.Append("  log: ").Append(l).Append('\n');
+            execLog.Clear();
+            var sb = new StringBuilder();
+            sb.Append(">>> ").Append(id).Append("  ").Append(line).Append("   [frame ").Append(frame).Append(", t=").Append(t.ToString("0.0", IC)).Append("]\n");
+            sb.Append(body).Append("<<< ").Append(id).Append("\n\n");
             try
             {
                 string outp = Path.Combine(Dir, "out.txt");
@@ -107,41 +170,186 @@ namespace InsideDev
                 File.AppendAllText(outp, sb.ToString());
             }
             catch { }
+            if (ownId) WriteReply(id, line, frame, t, failed, body);
             DevLog.Write("remote> " + line);
         }
 
-        // entry for other channels (the Unity live link): same commands as the file bridge
-        public static string RunCommand(string line, DevCore core) { lastCommandAt = Time.realtimeSinceStartup; return Run(line, core); }
+        // out_<id>.txt: "key: value" lines (status first), an empty line, then the reply as it stands in out.txt. Written
+        // to a temporary name and renamed, so a reader never sees half a file.
+        static void WriteReply(string id, string line, int frame, float t, bool failed, StringBuilder body)
+        {
+            try
+            {
+                var sb = new StringBuilder();
+                sb.Append("status: ").Append(failed ? "error" : "ok").Append('\n');
+                sb.Append("id: ").Append(id).Append('\n');
+                sb.Append("command: ").Append(line).Append('\n');
+                sb.Append("frame: ").Append(frame.ToString(IC)).Append('\n');
+                sb.Append("time: ").Append(t.ToString("0.0", IC)).Append('\n');
+                sb.Append('\n').Append(body);
+                SafeFile.WriteAllText(Path.Combine(Dir, ReplyFileName(id)), sb.ToString());
+                if (t >= nextClean)
+                {
+                    nextClean = t + 60f;
+                    var limit = DateTime.UtcNow.AddSeconds(-ReplyKeep);
+                    foreach (var f in Directory.GetFiles(Dir, "out_*.txt*"))
+                    {
+                        try { if (File.GetLastWriteTimeUtc(f) < limit) File.Delete(f); } catch { }
+                    }
+                }
+            }
+            catch (Exception e) { DevLog.Write("remote: reply file for '" + id + "' not written: " + e.Message); }
+        }
+
+        // name of the reply file of an id: characters that cannot stand in a file name become '_'
+        public static string ReplyFileName(string id)
+        {
+            var sb = new StringBuilder("out_", id.Length + 8);
+            foreach (char c in id) sb.Append((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' ? c : '_');
+            return sb.Append(".txt").ToString();
+        }
+
+        // True when the first line of a reply says that the command could not do its job: the first words every client
+        // treats as an error (refused, failed, usage, unknown, not found, busy, error, cannot ...).
+        public static bool IsError(string reply)
+        {
+            if (string.IsNullOrEmpty(reply)) return false;
+            int nl = reply.IndexOf('\n');
+            string first = (nl < 0 ? reply : reply.Substring(0, nl)).Trim();
+            if (first.Length == 0) return false;
+            if (first.StartsWith("ERROR", StringComparison.Ordinal)) return true;
+            string low = first.ToLowerInvariant();
+            foreach (var w in errorStarts) if (low.StartsWith(w, StringComparison.Ordinal)) return true;
+            foreach (var w in errorParts) if (low.IndexOf(w, StringComparison.Ordinal) >= 0) return true;
+            return low.EndsWith(" failed", StringComparison.Ordinal) || low.EndsWith(" not found", StringComparison.Ordinal);
+        }
+        static readonly string[] errorStarts = { "not found", "usage:", "usage ", "unknown ", "unknown:", "busy:", "busy ", "refused", "failed:", "failed to ", "error:", "error in ", "error -", "cannot ", "can't ", "could not ", "couldn't ", "no fsm", "no playmakerfsm", "no active ", "no character", "no type ", "no method ", "no variable ", "no mod ", "no effect ", "no setting ", "no such ", "nothing selected", "not built", "object scan not finished" };
+        static readonly string[] errorParts = { "component not found", "field/property not found", "no parameterless method", " failed:", "unknown command" };
+
+        // a file-bridge command or the in-game console: allowed to change the protected settings (see cfg)
+        static bool trusted;
+        public static bool Trusted { get { return trusted; } }
+
+        // one line for the doctor
+        public static string BridgeStatus()
+        {
+            if (!enabled) return "file bridge off (remote on starts it)";
+            float ago = Time.realtimeSinceStartup - lastFileCommandAt;
+            return "file bridge on, folder " + Dir + ", " + (lastFileCommandAt < 0f ? "no command file yet" : "last command file " + Fmt.F(ago, "0") + " s ago") +
+                   ", state.txt " + (stateAlways ? "always" : "only while command files arrive");
+        }
+
+        // set by InsideDev.Mcp: reason text when a line drives a secret / achievement object, else null (main thread)
+        public static Func<string, string> ObjectRefusal;
+
+        // RemotePolicy.Refusal plus the object rule, for the untrusted entries below; null = the line may run
+        static string Refused(string line, bool allowQuit)
+        {
+            if (line == null || line.Trim().Length == 0) return null;
+            string why = RemotePolicy.Refusal(line, allowQuit, EditorState.Get("play.save_guard", false));
+            if (why != null) return why;
+            var f = ObjectRefusal;
+            if (f == null) return null;
+            try { return f(line); }
+            catch (Exception e) { return "the object check failed (" + e.GetType().Name + ")"; }
+        }
+
+        // entry for other channels (MCP, POST /cmd, Play, Det): same commands as the file bridge, minus RemotePolicy's list
+        // (quit allowed here: the command tool and POST /cmd may close the game; scenario steps and det cues check first)
+        public static string RunCommand(string line, DevCore core)
+        {
+            Background.Touch();
+            string why = Refused(line, true);
+            if (why != null) return "refused: " + why;
+            bool was = trusted;
+            trusted = false;
+            try { return Run(line, core); }
+            finally { trusted = was; }
+        }
+
+        // the same for a caller that sits at the game itself (the in-game console): may change protected settings
+        public static string RunLocal(string line, DevCore core)
+        {
+            Background.Touch();
+            bool was = trusted;
+            trusted = true;
+            try { return Run(line, core); }
+            finally { trusted = was; }
+        }
 
         // MultiCam runner: setup and cue commands pass the capture lock
         static int internalDepth;
         public static string RunInternal(string line, DevCore core)
         {
+            string why = Refused(line, false);
+            if (why != null) return "refused: " + why;
             internalDepth++;
+            bool was = trusted;
+            trusted = false;
             try { return Run(line, core); }
-            finally { internalDepth--; }
+            finally { internalDepth--; trusted = was; }
         }
 
         // ---------------------------------------------------------------- commands
+        // Every command has a row in CoreBHelp's table (name, usage, text, least number of arguments). A word without a
+        // row goes to the extensions and then to the console's commands; a call with too few arguments, or with a word
+        // where a number belongs, is answered with the usage line.
         static string Run(string line, DevCore core)
         {
+            if (!inited) Init();
             var a = Split(line);
             if (a.Count == 0) return null;
-            if (internalDepth == 0 && MultiCam.Blocks(a)) return MultiCam.BusyText;
             string c = a[0].ToLowerInvariant();
+            if (internalDepth == 0 && c != "help" && MultiCam.Blocks(a)) return MultiCam.BusyText;
+            var cmd = CoreBHelp.Find(c);
+            if (cmd == null || cmd.console) return Fallback(a, line, core);
+            if (a.Count - 1 < cmd.min) return "usage: " + CoreBHelp.Usage(cmd);
+            if (cmd.forwarded) return Dispatch(c, a, line, core);
+            try { return Dispatch(c, a, line, core); }
+            catch (FormatException e) { return "usage: " + CoreBHelp.Usage(cmd) + "   (" + e.Message + ")"; }
+            catch (ArgumentOutOfRangeException e) { return "usage: " + CoreBHelp.Usage(cmd) + "   (an argument is missing: " + e.GetType().Name + ")"; }
+        }
+
+        // extensions first, then the console's commands (which answer through the log); never deeper than once, so the
+        // console handing an unknown word to the bridge cannot go round in a circle
+        static int fallbackDepth;
+        static string Fallback(List<string> a, string line, DevCore core)
+        {
+            var er = Extensions.Command(a, core);
+            if (er != null) return er;
+            if (fallbackDepth > 0) return "unknown command '" + a[0] + "' (help lists the commands)";
+            fallbackDepth++;
+            try { Commands.Run(line, core, false); }
+            finally { fallbackDepth--; }
+            return null;
+        }
+
+        static string Dispatch(string c, List<string> a, string line, DevCore core)
+        {
             switch (c)
             {
                 case "ping": return "pong  InsideDev " + Boot.Version;
-                case "state": return State(core);
+                case "state": return CoreBCommands.IsJson(a) ? CoreBCommands.StateJson(core) : State(core);
+                case "where":
+                    if (CoreBCommands.IsJson(a)) return CoreBCommands.WhereJson();
+                    return Fallback(a, line, core);
+                case "quit":
+                case "doctor":
+                case "cfg":
+                case "background":
+                    return CoreBCommands.Run(c, a, core);
                 case "screenshot":
                     {
-                        string name = "shot_" + DateTime.Now.ToString("HHmmss") + (a.Count > 1 ? "_" + a[1] : "") + ".png";
+                        string tag = a.Count > 1 ? a[1] : "";
+                        foreach (char bad in Path.GetInvalidFileNameChars()) tag = tag.Replace(bad, '_');
+                        if (tag.Length > 60) tag = tag.Substring(0, 60);
+                        string name = "shot_" + DateTime.Now.ToString("HHmmss", IC) + (tag.Length > 0 ? "_" + tag : "") + ".png";
                         string p = Path.Combine(Dir, name);
                         Application.CaptureScreenshot(p);
                         return "screenshot -> " + p + " (written at end of frame)";
                     }
-                case "diag": return RenderHost.Report();
-                case "cams": return RenderDiag.CameraReport();
+                case "diag": return a.Count > 1 && a[1] == "json" ? RenderHost.ReportJson() : RenderHost.Report();
+                case "cams": return RenderDiag.CameraReport(a.Count > 1 && a[1] == "json");
                 case "render":
                     {
                         string m = a.Count > 1 ? a[1].ToLowerInvariant() : "";
@@ -151,7 +359,7 @@ namespace InsideDev
                             case "eof": RenderHost.Request(Backend.EndOfFrame); break;
                             case "overlay": RenderHost.Request(Backend.OverlayCamera); break;
                             case "gamecam": RenderHost.Request(Backend.GameCameraPost); break;
-                            case "probe": RenderHost.RequestProbe("remote", 1); break;
+                            case "probe": RenderHost.RequestProbe("remote", 1, true); break;
                             case "reset": RenderHost.renderer.DestroyResources(); RenderHost.Event("renderer resources destroyed (remote)"); break;
                             case "snapshot": RenderHost.Snapshot("remote snapshot"); break;
                             case "board": RenderDiag.board = a.Count > 2 ? On(a[2]) : !RenderDiag.board; break;
@@ -163,25 +371,41 @@ namespace InsideDev
                 case "focustest":
                     {
                         if (a.Count > 1 && a[1] == "stop") { FocusTest.Stop(); return "stopping"; }
-                        if (a.Count > 1 && a[1] == "status") return FocusTest.Status();
+                        if (a.Count > 1 && a[1] == "status") return a.Count > 2 && a[2] == "json" ? FocusTest.StatusJson() : FocusTest.Status();
                         int n = a.Count > 1 ? (int)F(a[1]) : 20, away = a.Count > 2 ? (int)F(a[2]) : 2500, back = a.Count > 3 ? (int)F(a[3]) : 1500;
                         string mode = a.Count > 4 ? a[4] : "alttab";
+                        if (a.Contains("force")) mode += "+force";
                         int bg = a.Count > 5 ? (On(a[5]) ? 1 : 0) : -1;
                         return FocusTest.Start(n, away, back, mode, bg);
                     }
                 case "keyhold":
                     {
+                        if (a.Count > 1 && a[1] == "status") return "keyhold: " + FocusTest.KeyHoldStatus();
                         byte vk = 0x27;   // Right arrow (INSIDE's default "right")
-                        if (a.Count > 1) vk = a[1] == "right" ? (byte)0x27 : a[1] == "left" ? (byte)0x25 : a[1] == "up" ? (byte)0x26 : Convert.ToByte(a[1], 16);
+                        if (a.Count > 1)
+                        {
+                            if (a[1] == "right") vk = 0x27;
+                            else if (a[1] == "left") vk = 0x25;
+                            else if (a[1] == "up") vk = 0x26;
+                            else { try { vk = Convert.ToByte(a[1], 16); } catch { return "usage: keyhold [right|left|up|<hex vk>] [ms] [text]"; } }
+                        }
                         int ms = a.Count > 2 ? (int)F(a[2]) : 1500;
                         return FocusTest.KeyHold(vk, ms, a.Count > 3 ? a[3] : null);
                     }
                 case "tp":
                     {
-                        // tp x y z  |  tp <obj>   teleports the boy
-                        var parts = Split(line);
-                        if (parts.Count >= 4) { var p = new Vector3(F(parts[1]), F(parts[2]), F(parts[3])); return G.Teleport(p) ? "boy -> " + V(p) : "no active character"; }
-                        var go = Resolve(parts.Count > 1 ? parts[1] : ""); if (go == null) return "usage: tp x y z | tp <obj>";
+                        // tp x y [z]  |  tp <obj>   teleports the boy; two numbers keep his depth (the console's form)
+                        float x, y, z;
+                        if (a.Count >= 3 && Fmt.TryF(a[1], out x) && Fmt.TryF(a[2], out y))
+                        {
+                            var ch = G.MainCharacter;
+                            if (a.Count < 4) z = ch != null ? ch.pos3.z : 0f;
+                            else if (!Fmt.TryF(a[3], out z)) return "usage: tp <x> <y> [z] | tp <obj>";
+                            var p = new Vector3(x, y, z);
+                            return G.Teleport(p) ? "boy -> " + V(p) : "no active character";
+                        }
+                        string q = a.Count == 2 ? a[1] : Rest(line);
+                        var go = Resolve(q); if (go == null) return "not found: " + q + "   (usage: tp <x> <y> [z] | tp <obj>)";
                         return G.Teleport(go.transform.position) ? "boy -> " + go.name + " " + V(go.transform.position) : "no active character";
                     }
                 case "boypos":
@@ -197,8 +421,8 @@ namespace InsideDev
                         ObjectDatabase.Demand(60f);
                         switch (m)
                         {
-                            case "stats": ObjectDatabase.EnsureFresh(3f); return ObjectDatabase.Stats();
-                            case "budget": if (a.Count > 2) ObjectDatabase.budgetMs = F(a[2]); return "budget " + ObjectDatabase.budgetMs + " ms/frame";
+                            case "stats": ObjectDatabase.EnsureFresh(3f); return a.Count > 2 && a[2] == "json" ? ObjectDatabase.StatsJson() : ObjectDatabase.Stats();
+                            case "budget": if (a.Count > 2) ObjectDatabase.budgetMs = Mathf.Clamp(F(a[2]), 0.1f, 50f); return "budget " + Fmt.F(ObjectDatabase.budgetMs) + " ms/frame";
                             case "dirty": ObjectDatabase.MarkDirty("remote"); return "marked dirty";
                             case "find":
                                 {
@@ -264,11 +488,11 @@ namespace InsideDev
                         }
                         return sb.ToString();
                     }
-                case "memwhat": { long v; if (!MemLink.ParseHex(Rest(line), out v)) return "memwhat <hex>"; GameObject o; return MemAddr.WhatIs(v, out o); }
-                case "memmethod": { long v; if (!MemLink.ParseHex(Rest(line), out v)) return "memmethod <hex>"; return MemLink.Method(v, true); }
+                case "memwhat": { long v; if (!MemLink.ParseHex(Rest(line), out v)) return "usage: memwhat <hex>"; GameObject o; return MemAddr.WhatIs(v, out o); }
+                case "memmethod": { long v; if (!MemLink.ParseHex(Rest(line), out v)) return "usage: memmethod <hex>"; return MemLink.Method(v, true); }
                 case "memjit":
                     {
-                        var a2 = Rest(line).Split(' '); if (a2.Length < 2) return "memjit <Type> <method> [+offset]";
+                        var a2 = Rest(line).Split(' '); if (a2.Length < 2) return "usage: memjit <Type> <method> [+hex]";
                         var t = CodeGraph.FindType(a2[0]);
                         if (t == null) foreach (var asm in AppDomain.CurrentDomain.GetAssemblies()) { try { foreach (var x in asm.GetTypes()) if (x.Name == a2[0] || x.FullName == a2[0]) { t = x; break; } } catch { } if (t != null) break; }
                         if (t == null) return "no type " + a2[0];
@@ -286,9 +510,13 @@ namespace InsideDev
                 case "memexport": return MemLink.Export(Selection.Current);
                 case "memread":
                     {
-                        long v; var parts = Rest(line).Split(' '); if (!MemLink.ParseHex(parts[0], out v)) return "memread <hex> [bytes]";
-                        int n = parts.Length > 1 ? int.Parse(parts[1]) : 16; var sb = new StringBuilder(); if (!MemAddr.Readable((IntPtr)v, n)) return "not readable memory";
-                        for (int i = 0; i < n; i += 4) sb.Append((v + i).ToString("X")).Append(": ").Append(System.Runtime.InteropServices.Marshal.ReadInt32((IntPtr)(v + i)).ToString("X8")).Append("  f=").Append(MemAddr.ReadFloat((IntPtr)(v + i), 0)).Append('\n');
+                        long v; var parts = Rest(line).Split(' '); if (!MemLink.ParseHex(parts[0], out v)) return "usage: memread <hex> [bytes]";
+                        int n = 16;
+                        if (parts.Length > 1 && !Fmt.TryI(parts[1], out n)) return "usage: memread <hex> [bytes]";
+                        // whole 4-byte steps (each line reads four bytes) and a bounded reply
+                        n = Math.Max(4, Math.Min(4096, (n + 3) & ~3));
+                        var sb = new StringBuilder(); if (!MemAddr.Readable((IntPtr)v, n)) return "not readable memory";
+                        for (int i = 0; i < n; i += 4) sb.Append((v + i).ToString("X")).Append(": ").Append(System.Runtime.InteropServices.Marshal.ReadInt32((IntPtr)(v + i)).ToString("X8")).Append("  f=").Append(MemAddr.ReadFloat((IntPtr)(v + i), 0).ToString("R", IC)).Append('\n');
                         return sb.ToString();
                     }
                 case "fsmgraph":
@@ -310,20 +538,20 @@ namespace InsideDev
                 case "postfx":
                     {
                         // postfx | postfx on|off|default <Type> | postfx set <Type> <field> <value>
-                        if (a.Count < 3) return PostFx.Report();
+                        if (a.Count < 3) return a.Count == 2 && a[1].ToLowerInvariant() == "json" ? PostFx.ReportJson() : PostFx.Report();
                         var cam = G.Cam(); if (cam == null) return "no gameplay camera";
                         Behaviour b = null; foreach (var x in PostFx.Effects(cam)) if (x.GetType().Name.Equals(a[2], StringComparison.OrdinalIgnoreCase)) b = x;
                         if (b == null) return "no effect " + a[2] + " on " + cam.name;
                         if (a[1] == "on" || a[1] == "off") { PostFx.SetEnabled(b, a[1] == "on"); return b.GetType().Name + " " + a[1]; }
                         if (a[1] == "default") { PostFx.DefaultAll(b); return b.GetType().Name + " back to the game's values"; }
                         if (a[1] == "set" && a.Count > 4) { var st = PostFx.Find(b, a[3]); if (st == null) return "no setting " + a[3]; return PostFx.SetValue(b, st, a[4]); }
-                        return "postfx | postfx on|off|default <Type> | postfx set <Type> <field> <value>";
+                        return "usage: postfx | postfx on|off|default <Type> | postfx set <Type> <field> <value>";
                     }
                 case "fsmset":
                     {
                         // fsmset <fsm object>|<state>|<action index>|<field>|<value>   (field "(enabled)" = action on/off)
                         var p = Rest(line).Split(new[] { '|' }, 5);
-                        if (p.Length < 5) return "fsmset <fsm object>|<state>|<action index>|<field>|<value>";
+                        if (p.Length < 5) return "usage: fsmset <fsm object>|<state>|<action index>|<field>|<value>";
                         var go = Resolve(p[0].Trim()); if (go == null) return "not found";
                         var f = go.GetComponent<PlayMakerFSM>(); if (f == null) return "no FSM on " + go.name;
                         return ActionEdit.Apply(f, p[1] + "|" + p[2] + "|" + p[3] + "|" + p[4], "bridge");
@@ -333,11 +561,11 @@ namespace InsideDev
                     {
                         // sigwire <fsm object>|<signal in>|<sender object>|<signal out>
                         var p = Rest(line).Split('|');
-                        if (p.Length < 4) return a[0] + " <fsm object>|<signal in>|<sender object>|<signal out>";
+                        if (p.Length < 4) return "usage: " + a[0] + " <fsm object>|<signal in>|<sender object>|<signal out>";
                         var go = Resolve(p[0].Trim()); if (go == null) return "fsm object not found";
                         var f = go.GetComponent<PlayMakerFSM>(); if (f == null) return "no FSM on " + go.name;
                         var snd = Resolve(p[2].Trim()); if (snd == null) return "sender not found";
-                        if (a[0] == "sigwire") return SignalEdit.Connect(f, snd, p[3].Trim(), p[1].Trim(), "bridge");
+                        if (c == "sigwire") return SignalEdit.Connect(f, snd, p[3].Trim(), p[1].Trim(), "bridge");
                         foreach (var sc in SignalEdit.Incoming(f)) if (sc.signalOutGameObject == snd && sc.signalOutName == p[3].Trim() && sc.signalInName == p[1].Trim()) return SignalEdit.Disconnect(f, sc, "bridge");
                         return "no such connection";
                     }
@@ -412,6 +640,7 @@ namespace InsideDev
                             var ps = ReferenceIndex.AllPaths(ga.GetInstanceID(), gb.GetInstanceID(), 8, 20);
                             sb.Append(ps.Count).Append(" path(s)\n");
                             foreach (var p in ps) { sb.Append("  "); foreach (var e in p) sb.Append(ReferenceIndex.NameOf(e.srcGo)).Append(" -> "); sb.Append(gb.name).Append('\n'); }
+                            if (ReferenceIndex.PathsTruncated) sb.Append("(stopped at the work limit: more paths may exist)\n");
                         }
                         return sb.ToString();
                     }
@@ -450,8 +679,10 @@ namespace InsideDev
                 case "seed": return MultiCam.Seed(a);
                 case "cam":
                     {
-                        // cam | cam pose x y z yaw pitch [fov] [seconds] [roll] | cam fov <deg> | cam roll <deg> | cam json [name] | cam off
+                        // cam | cam status [json] | cam look <target> ... | cam back | cam pose x y z yaw pitch [fov] [seconds] [roll] | cam fov <deg> | cam roll <deg> | cam json [name] | cam off
                         string sub = a.Count > 1 ? a[1].ToLowerInvariant() : "";
+                        string own = CameraControl.Command(a);
+                        if (own != null) return own;
                         if (sub == "off") { CameraControl.SetFree(false); return CameraControl.Describe(); }
                         if (sub == "pose")
                         {
@@ -509,8 +740,14 @@ namespace InsideDev
                         var ui = core.UIKit;
                         switch (m)
                         {
-                            case "scale": if (a.Count > 2) { core.uiScale = F(a[2]); EditorState.Set("ui.scale", core.uiScale); } break;
-                            case "layout": if (a.Count > 2) core.workspace.SetDocked(a[2] == "dock"); break;
+                            case "scale": if (a.Count > 2) { core.uiScale = Mathf.Clamp(F(a[2]), 0.25f, 8f); EditorState.Set("ui.scale", core.uiScale); } break;
+                            case "layout":
+                                if (a.Count > 3 && a[2] == "save") return core.workspace.SaveLayout(a[3]);
+                                if (a.Count > 3 && a[2] == "load") { core.SetPanel(true, null); return core.workspace.LoadLayout(a[3]); }
+                                if (a.Count > 3 && a[2] == "delete") return core.workspace.DeleteLayout(a[3]);
+                                if (a.Count > 2 && a[2] == "list") return string.Join(" ", core.workspace.Layouts().ToArray());
+                                if (a.Count > 2) core.workspace.SetDocked(a[2] == "dock");
+                                break;
                             case "reset": core.workspace.ResetLayout(); break;
                             case "show": if (a.Count > 2) { core.SetPanel(true, null); core.workspace.Show(a[2]); } break;
                             case "dock":    // ui dock left|right|bottom <fraction 0.1-0.7 | off | on>
@@ -523,9 +760,11 @@ namespace InsideDev
                             case "put":     // ui put <panel id> left|right|bottom
                                 if (a.Count < 4) return "usage: ui put <panel id> left|right|bottom";
                                 { string r = core.workspace.Put(a[2], a[3]); core.SetPanel(true, null); return r; }
-                            case "docks": return core.workspace.Describe();
+                            case "docks": return a.Count > 2 && a[2] == "json" ? core.workspace.DescribeJson() : core.workspace.Describe();
                             case "focus": ui.focus = a.Count > 2 && a[2] != "none" ? a[2] : null; break;
-                            case "scroll": ui.ScrollTo(a[2], F(a[3])); return "scroll " + a[2] + " = " + a[3];
+                            case "scroll":
+                                if (a.Count < 4) return "usage: ui scroll <id> <y>";
+                                ui.ScrollTo(a[2], F(a[3])); return "scroll " + a[2] + " = " + a[3];
                             case "record": ui.recordWidgets = a.Count < 3 || On(a[2]); return "widget recording " + ui.recordWidgets;
                             case "find":
                             case "clicktext":
@@ -536,7 +775,7 @@ namespace InsideDev
                                     var r = ui.FindWidget(txt, nth);
                                     if (r == null) return "no widget containing '" + txt + "' in the last frame (" + ui.lastWidgets.Count + " logged; recording is now on, retry next frame)";
                                     var wc = r.Value.center;
-                                    if (m == "find") return "'" + txt + "' #" + nth + " at " + wc.x.ToString("0", IC) + "," + wc.y.ToString("0", IC) + "  rect " + r.Value;
+                                    if (m == "find") return "'" + txt + "' #" + nth + " at " + wc.x.ToString("0", IC) + "," + wc.y.ToString("0", IC) + "  rect " + Fmt.S("(x:{0:F2}, y:{1:F2}, width:{2:F2}, height:{3:F2})", r.Value.x, r.Value.y, r.Value.width, r.Value.height);
                                     EditorInput.Inject(wc * core.uiScale, m == "clicktext" ? 0 : -1);
                                     return m + " '" + txt + "' at " + wc.x.ToString("0", IC) + "," + wc.y.ToString("0", IC);
                                 }
@@ -553,6 +792,7 @@ namespace InsideDev
                             case "hover":
                                 {
                                     // logical UI coordinates (as drawn at the current UI scale)
+                                    if (a.Count < 4) return "usage: ui click|rclick|hover <x> <y>";
                                     float sc = core.uiScale;
                                     EditorInput.Inject(new Vector2(F(a[2]) * sc, F(a[3]) * sc), a[1] == "click" ? 0 : a[1] == "rclick" ? 1 : -1);
                                     return a[1] + " injected at " + a[2] + "," + a[3];
@@ -560,7 +800,7 @@ namespace InsideDev
                             case "renderer": if (a.Count > 2) { RenderHost.SetRenderer(a[2]); EditorState.Set("render.renderer", a[2]); } break;
                         }
                         string gi; try { gi = GameInput.IsEnabled() ? "enabled" : "DISABLED"; } catch { gi = "?"; }
-                        return "ui scale " + core.uiScale + "  layout " + (core.workspace.docked ? "dock" : "window") + "  panel " + core.Panel +
+                        return "ui scale " + Fmt.F(core.uiScale) + "  layout " + (core.workspace.docked ? "dock" : "window") + "  panel " + core.Panel +
                                "  focus " + (ui.focus ?? "none") + "  mouseOverUI " + ui.mouseOverUI + "  " + InputCapture.Status + "  GameInput " + gi +
                                "  renderer " + RenderHost.renderer.Name + "\n  left=" + core.workspace.ActivePanel("left") + " right=" + core.workspace.ActivePanel("right") + " bottom=" + core.workspace.ActivePanel("bottom") +
                                "  gameView " + core.workspace.GameViewRect(core.uiScale);
@@ -576,30 +816,26 @@ namespace InsideDev
                     }
                 case "select":
                     {
-                        var go = Resolve(Rest(line)); if (go == null) return "not found";
+                        int matches;
+                        var go = Resolve(Rest(line), out matches); if (go == null) return "not found";
                         Selection.Set(go, "bridge");
-                        return "selected " + Selection.Describe();
+                        return "selected " + Selection.Describe() + (matches > 1 ? "   (the nearest of " + matches + " matches)" : "");
                     }
                 case "events":
                     {
-                        if (a.Count > 1 && a[1] == "on") { EventMonitor.enabled = true; return EventMonitor.Status(); }
-                        if (a.Count > 1 && a[1] == "off") { EventMonitor.enabled = false; return EventMonitor.Status(); }
-                        if (a.Count > 1 && a[1] == "clear") { EventMonitor.Clear(); return EventMonitor.Status(); }
-                        int n = 40; string flt = null;
-                        if (a.Count > 1 && !int.TryParse(a[1], out n)) { n = 40; flt = a[1]; }
-                        if (a.Count > 2) flt = a[2];
-                        return EventMonitor.Dump(n, flt);
+                        return EventMonitor.Command(a);
                     }
                 case "pick":
                     {
                         if (a.Count > 1 && (a[1] == "on" || a[1] == "off")) { WorldPick.mode = a[1] == "on"; return "pick mode " + WorldPick.mode; }
                         if (a.Count > 2 && a[1] == "filter") { int fi = Array.IndexOf(WorldPick.Filters, a[2]); if (fi < 0) return "filters: " + string.Join(" ", WorldPick.Filters); WorldPick.filter = fi; return "pick filter " + a[2]; }
                         if (a.Count > 1 && a[1] == "status") return "pick mode " + WorldPick.mode + ", filter " + WorldPick.Filters[WorldPick.filter] + ", queries " + WorldPick.queries + "\n" + WorldPick.lastResult;
+                        if (a.Count > 3 && a[3] == "look") return WorldPick.PickAt(new Vector2(F(a[1]), F(a[2])), false);
                         if (a.Count > 2) return WorldPick.PickAt(new Vector2(F(a[1]), F(a[2])));
                         var ch = G.MainCharacter; var cm = G.Cam();
                         if (ch == null || cm == null) return "no character/camera";
                         var sp = RenderScale.W2S(cm, ch.pos3 + Vector3.up * 0.5f);
-                        return "boy is at screen " + sp.x.ToString("0") + "," + (Screen.height - sp.y).ToString("0") + "\n" + WorldPick.PickAt(new Vector2(sp.x, Screen.height - sp.y));
+                        return "boy is at screen " + sp.x.ToString("0", IC) + "," + (Screen.height - sp.y).ToString("0", IC) + "\n" + WorldPick.PickAt(new Vector2(sp.x, Screen.height - sp.y));
                     }
                 case "gizmo":
                     {
@@ -607,12 +843,32 @@ namespace InsideDev
                         var gs = Selection.Current;
                         if (a.Count > 2 && a[1] == "global") { TransformGizmo.SetGlobal(a[2] == "on"); }
                         else if (a.Count > 1 && (a[1] == "on" || a[1] == "off")) { if (gs == null) return "nothing selected"; TransformGizmo.SetFor(gs, a[1] == "on"); }
-                        return "gizmo global " + TransformGizmo.globalOn + ", selection " + (gs == null ? "none" : gs.name + " per-object " + TransformGizmo.IsOnFor(gs) + ", visible " + TransformGizmo.Visible + ", pos " + gs.transform.position.ToString("F2"));
+                        return "gizmo global " + TransformGizmo.globalOn + ", selection " + (gs == null ? "none" : gs.name + " per-object " + TransformGizmo.IsOnFor(gs) + ", visible " + TransformGizmo.Visible + ", pos " + Fmt.V3(gs.transform.position, "F2"));
                     }
                 case "labels":
                     {
+                        // labels [off|selected|nearby|all]   plus the console's on|off: on = the level in use, or ALL
                         var ov = core.Overlay;
-                        if (a.Count > 1) { int lv = Array.IndexOf(Overlay.LabelLevels, a[1].ToUpperInvariant()); if (lv >= 0) { ov.labelLevel = lv; ov.showLabels = lv > 0; } }
+                        if (a.Count > 2 && a[1].ToLowerInvariant() == "types")
+                        {
+                            // labels types <n>: component names per label (0 only the count, all = every one)
+                            int nt;
+                            if (a[2].ToLowerInvariant() == "all") nt = -1;
+                            else if (!Fmt.TryI(a[2], out nt) || nt < -1 || nt > 50) return "usage: labels types <0..50|all>";
+                            ov.labelTypes = nt;
+                            EditorState.Set("overlay.label.types", nt);
+                            return "labels " + Overlay.LabelLevels[ov.labelLevel] + ", " + (nt < 0 ? "all components" : Fmt.I(nt) + " component name(s) per label");
+                        }
+                        if (a.Count > 1)
+                        {
+                            string v = a[1].ToUpperInvariant();
+                            int lv = Array.IndexOf(Overlay.LabelLevels, v);
+                            bool onWord = lv < 0 && (v == "ON" || v == "1" || v == "TRUE" || v == "YES");
+                            if (lv < 0 && (v == "0" || v == "FALSE" || v == "NO")) lv = 0;
+                            if (lv < 0 && !onWord) return "usage: labels [off|selected|nearby|all|on]";
+                            if (onWord) ov.SetLabels(true); else ov.SetLabelLevel(lv);
+                            ov.SaveChoices();
+                        }
                         return "labels " + Overlay.LabelLevels[ov.labelLevel];
                     }
                 case "scope":
@@ -629,48 +885,19 @@ namespace InsideDev
                     }
                 case "perf":
                     {
-                        // perf | perf reset | perf enable <subsystem>
-                        if (a.Count > 1 && a[1] == "reset") { Perf.Reset(); return "perf stats reset"; }
-                        if (a.Count > 2 && a[1] == "enable") return Perf.Enable(a[2], true) ? a[2] + " re-enabled" : "no subsystem " + a[2];
-                        if (a.Count > 1 && a[1] == "hide") return a.Count > 2 ? Perf.Hide(a[2], a.Count > 3 ? a[3] : "") : "perf hide <root>[,<root>...] [name part | mesh:<mesh name prefix>]";
-                        if (a.Count > 1 && a[1] == "show") return Perf.Show();
-                        return Perf.Report();
+                        // perf [json] | perf reset [json] | perf enable <subsystem> | perf hide ... | perf show
+                        return Perf.Command(a);
                     }
-                case "history": return ChangeRecorder.Dump(a.Count > 1 ? int.Parse(a[1]) : 30);
-                case "undo": return ChangeRecorder.Undo();
-                case "redo": return ChangeRecorder.Redo();
+                case "history":
+                case "undo":
+                case "redo":
                 case "revert":
-                    {
-                        // revert all | revert <n>  (n = index in the NET CHANGES list of "history")
-                        if (a.Count > 1 && a[1] == "all") return ChangeRecorder.RevertAll();
-                        var net = ChangeRecorder.NetChanges();
-                        int k; if (a.Count < 2 || !int.TryParse(a[1], out k) || k < 0 || k >= net.Count) return "revert all | revert <0.." + (net.Count - 1) + ">";
-                        return ChangeRecorder.Revert(net[k]);
-                    }
+                    // history [n] [json] | undo [n | to <id>] | redo [n] | revert all|<n>|<label text> [dry]  (n = index in the NET CHANGES list of "history")
+                    return ChangeRecorder.Command(a);
                 case "mod":
                     {
-                        // mod list | show <name> | record <name> [description...] | dry <name> | validate <name> | enable|disable <name> | reload | delete <name>
-                        string sub = a.Count > 1 ? a[1].ToLowerInvariant() : "list";
-                        if (sub == "list") return Mods.mods.Count == 0 ? "no mods in " + Mods.Dir : Mods.Summary();
-                        if (sub == "reload") { Mods.LoadAll(); return Mods.Summary(); }
-                        if (sub == "record")
-                        {
-                            if (a.Count < 3) return "mod record <name> [description]";
-                            var acts = new List<ChangeRecorder.Entry>();
-                            return HistoryPanel.RecordMod(a[2], a.Count > 3 ? string.Join(" ", a.GetRange(3, a.Count - 3).ToArray()) : "", ChangeRecorder.NetChanges(), acts);
-                        }
-                        if (a.Count < 3) return "mod " + sub + " <name>";
-                        var m = Mods.Find(a[2]); if (m == null) return "no mod " + a[2];
-                        switch (sub)
-                        {
-                            case "show": return Mods.Status(m);
-                            case "dry": return Mods.DryRun(m);
-                            case "validate": Mods.Validate(m); return m.problems.Count == 0 ? "valid" : string.Join("\n", m.problems.ToArray());
-                            case "enable": Mods.SetEnabled(m, true); return Mods.Status(m);
-                            case "disable": Mods.SetEnabled(m, false); return Mods.Status(m);
-                            case "delete": Mods.mods.Remove(m); try { System.IO.File.Delete(m.file); } catch (Exception e) { return e.Message; } return "deleted " + m.file;
-                        }
-                        return "unknown mod command";
+                        // mod list | show <name> | record <name> [description...] | dry <name> | validate <name> | enable|disable <name> | reload | delete <name>   [json]
+                        return Mods.Command(a);
                     }
                 case "bookmark":
                     {
@@ -678,16 +905,16 @@ namespace InsideDev
                         string sub = a.Count > 1 ? a[1] : "list";
                         if (sub == "add") { var mk = Bookmarks.Add(Selection.Current, null, a.Count > 2 ? string.Join(" ", a.GetRange(2, a.Count - 2).ToArray()) : ""); return mk == null ? "nothing selected" : "bookmarked " + mk.name + "  " + mk.selector; }
                         if (sub == "list") { var sb = new System.Text.StringBuilder(); for (int i = 0; i < Bookmarks.marks.Count; i++) sb.Append(i).Append("  ").Append(Bookmarks.marks[i].name).Append("  ").Append(Bookmarks.marks[i].note).Append("  ").Append(Bookmarks.marks[i].selector).Append('\n'); return sb.Length > 0 ? sb.ToString() : "no bookmarks"; }
-                        int bi; if (a.Count < 3 || !int.TryParse(a[2], out bi) || bi < 0 || bi >= Bookmarks.marks.Count) return "bookmark go|del <n>";
+                        int bi; if (a.Count < 3 || !Fmt.TryI(a[2], out bi) || bi < 0 || bi >= Bookmarks.marks.Count) return "usage: bookmark go|del <n>   (n = 0.." + (Bookmarks.marks.Count - 1) + ")";
                         if (sub == "go") return Bookmarks.Go(Bookmarks.marks[bi], a.Count > 3 && a[3] == "tp");
                         if (sub == "del") { var mk = Bookmarks.marks[bi]; Bookmarks.Remove(mk); return "removed " + mk.name; }
-                        return "bookmark add|list|go|del";
+                        return "usage: bookmark add [note] | bookmark list | bookmark go <n> [tp] | bookmark del <n>";
                     }
                 case "palette":
                     {
                         // palette <query...> [#n]   list hits, or open hit n
                         int open = -1; var words = new List<string>(a.GetRange(1, a.Count - 1));
-                        if (words.Count > 0 && words[words.Count - 1].StartsWith("#")) { open = int.Parse(words[words.Count - 1].Substring(1)); words.RemoveAt(words.Count - 1); }
+                        if (words.Count > 0 && words[words.Count - 1].StartsWith("#")) { if (!Fmt.TryI(words[words.Count - 1].Substring(1), out open)) return "usage: palette <query> [#n]"; words.RemoveAt(words.Count - 1); }
                         return CommandPalette.Bridge(string.Join(" ", words.ToArray()), open);
                     }
                 case "cmd":
@@ -717,7 +944,7 @@ namespace InsideDev
                             return sb.ToString();
                         }
                         if (a.Count > 1 && a[1] == "anim") return LogicPanel.AnimDump(a.Count > 2 ? a[2] : null);
-                        if (a.Count < 2) return "logic <Type|object> | logic shared [f] | logic anim [f]";
+                        if (a.Count < 2) return "usage: logic <Type|object> | logic shared [f] | logic anim [f]";
                         string q = string.Join(" ", a.GetRange(1, a.Count - 1).ToArray());
                         var t = CodeGraph.FindType(q);
                         if (t == null) { var go = Resolve(q); if (go != null) { var sb = new System.Text.StringBuilder(); foreach (var mb in go.GetComponents<MonoBehaviour>()) { if (mb == null) continue; string an = mb.GetType().Assembly.GetName().Name; if (an == "Assembly-CSharp" || an == "Assembly-CSharp-firstpass") sb.Append(LogicPanel.Report(mb.GetType())); } return sb.Length > 0 ? sb.ToString() : "no game scripts on " + go.name; } return "no type or object " + q; }
@@ -737,17 +964,17 @@ namespace InsideDev
                         if (sub == "replace" && a.Count > 3) return AudioRules.Change("replace:" + a[2], a[3], "bridge");
                         if (sub == "force" && a.Count > 4) return AudioRules.Change(a[2].ToLowerInvariant() + ":" + a[3], a[4], "bridge");
                         if (sub == "clear" && a.Count > 2) { if (a[2] == "all") { AudioRules.ClearAll("bridge"); return "cleared"; } return AudioRules.Change(a[2], null, "bridge"); }
-                        return "audio rules | mute <ev> | unmute <ev> | nuke <ev> | unnuke <ev> | replace <ev> <with> | force switch|state|rtpc <name> <value> | clear <key|all>";
+                        return "usage: audio rules | mute <ev> | unmute <ev> | nuke <ev> | unnuke <ev> | replace <ev> <with> | force switch|state|rtpc <name> <value> | clear <key|all>";
                     }
                 case "hidden": return PassiveHidden.Command(a);
-                case "ext": return a.Count > 1 && a[1] == "load" ? Extensions.LoadNew(core) : Extensions.Summary();
+                case "ext": return Extensions.CommandExt(a, core);
                 case "live": return Extensions.Command(a, core) ?? "the live link is not installed (_mod\\InsideDev.LiveLink.dll)";
                 case "adb":
                     {
                         // adb [stats] | find <text> [filter] | show <name|id> | tree <name|id> | filter <FILTER> [n]
                         string sub = a.Count > 1 ? a[1].ToLowerInvariant() : "stats";
                         var sb = new System.Text.StringBuilder();
-                        if (sub == "stats") return AudioDb.Stats();
+                        if (sub == "stats") return a.Count > 2 && a[2] == "json" ? AudioDb.StatsJson() : AudioDb.Stats();
                         if (sub == "export") return AudioExport.Run();
                         if (sub == "exportstatus") return AudioExport.status;
                         if (sub == "find" || sub == "filter")
@@ -755,13 +982,13 @@ namespace InsideDev
                             var f = AudioDb.Filter.All; string q = "";
                             if (sub == "filter") { int fi = Array.IndexOf(AudioDb.FilterNames, a.Count > 2 ? a[2].ToUpperInvariant().Replace("_", " ") : ""); if (fi < 0) return "filters: " + string.Join(", ", AudioDb.FilterNames); f = (AudioDb.Filter)fi; }
                             else q = a.Count > 2 ? a[2] : "";
-                            int max = 40; if (sub == "filter" && a.Count > 3) int.TryParse(a[3], out max);
+                            int max = 40; if (sub == "filter" && a.Count > 3 && !Fmt.TryI(a[3], out max)) max = 40;
                             var l = AudioDb.Query(f, q, 100000);
                             sb.Append(l.Count).Append(" record(s)\n");
                             for (int i = 0; i < l.Count && i < max; i++) sb.Append(l[i].kind).Append("  ").Append(l[i].Name).Append("  [").Append(l[i].bank).Append("]  ").Append(AudioDb.Status(l[i])).Append(l[i].refs.Count > 0 ? "  refs " + l[i].refs.Count : "").Append('\n');
                             return sb.ToString();
                         }
-                        if (a.Count < 3) return "adb stats|find <text>|filter <F> [n]|show <name|id>|select <name|id>";
+                        if (a.Count < 3) return "usage: adb stats|find <text>|filter <F> [n]|show <name|id>|select <name|id>";
                         var r0 = AudioDb.Find(string.Join(" ", a.GetRange(2, a.Count - 2).ToArray()));
                         if (r0 == null) return "not found";
                         if (sub == "select") { AudioDbPanel.Select(r0); return "selected " + r0.Name; }
@@ -772,21 +999,36 @@ namespace InsideDev
                         // wwise [stats] | api [filter] | watched | trace [n] [filter] | level <0-3> | objs [filter] | banks | pid <id> | hash <name> | ids [filter]
                         string sub = a.Count > 1 ? a[1].ToLowerInvariant() : "stats";
                         var sb = new System.Text.StringBuilder();
-                        if (sub == "stacks") { if (a.Count > 2) { string m = a[2].ToLowerInvariant(); AudioSpy.stackMode = m == "off" ? 0 : m == "full" ? 2 : 1; } return "call stacks: " + AudioSpy.StackModes[AudioSpy.stackMode]; }
+                        if (sub == "stacks")
+                        {
+                            if (a.Count > 2) { string m = a[2].ToLowerInvariant(); AudioSpy.stackMode = m == "off" ? 0 : m == "full" ? 2 : 1; }
+                            Background.Want(Background.Audio, 600f);
+                            return "call stacks: " + AudioSpy.StackModes[AudioSpy.stackMode] + (AudioSpy.stackMode > 0 ? "   (taken while the tool is in use; this call keeps the audio log awake for 10 minutes)" : "");
+                        }
                         if (sub == "version") return WwiseApiPanel.VersionLine();
                         if (sub == "stock") return WwiseApiPanel.StockReport();
                         switch (sub)
                         {
-                            case "stats": return WwiseApiPanel.Diagnostics() + AudioTrace.Status();
+                            case "stats": return a.Count > 2 && a[2] == "json" ? AudioTrace.StatusJson() : WwiseApiPanel.Diagnostics() + AudioTrace.Status();
                             case "api": return WwiseApiPanel.Dump(a.Count > 2 ? a[2] : null, false);
                             case "watched": return WwiseApiPanel.Dump(a.Count > 2 ? a[2] : null, true);
-                            case "level": if (a.Count > 2) WwiseNative.SetLevel(int.Parse(a[2])); return "level " + WwiseNative.Level;
+                            case "level":
+                                {
+                                    int lv;
+                                    if (a.Count > 2) { if (!Fmt.TryI(a[2], out lv) || lv < 0 || lv > 3) return "usage: wwise level <0-3>"; WwiseNative.SetLevel(lv); }
+                                    return "level " + WwiseNative.Level;
+                                }
                             case "hash": { string nm = string.Join(" ", a.GetRange(2, a.Count - 2).ToArray()); return nm + " = " + AudioTrace.Hash(nm) + "  (known as: " + AudioTrace.Name(AudioTrace.Hash(nm)) + ")"; }
-                            case "pid": return AudioTrace.DescribePlay(uint.Parse(a[2]));
+                            case "pid":
+                                {
+                                    uint pid;
+                                    if (a.Count < 3 || !uint.TryParse(a[2], NumberStyles.Integer, IC, out pid)) return "usage: wwise pid <playing id>";
+                                    return AudioTrace.DescribePlay(pid);
+                                }
                             case "trace":
                                 {
                                     int n = 60; string f = null;
-                                    if (a.Count > 2 && !int.TryParse(a[2], out n)) { n = 60; f = a[2]; }
+                                    if (a.Count > 2 && !Fmt.TryI(a[2], out n)) { n = 60; f = a[2]; }
                                     if (a.Count > 3) f = a[3];
                                     int shown = 0;
                                     for (int i = 0; i < AudioTrace.Count && shown < n; i++)
@@ -794,7 +1036,7 @@ namespace InsideDev
                                         var e = AudioTrace.Get(i); if (e == null) break;
                                         string tx = AudioTrace.Kind(e.r.type) + "  " + AudioTrace.Text(e, false);
                                         if (f != null && tx.IndexOf(f, StringComparison.OrdinalIgnoreCase) < 0) continue;
-                                        sb.Append(e.t.ToString("0.000")).Append("s f").Append(e.frame).Append("  ").Append(tx).Append('\n'); shown++;
+                                        sb.Append(e.t.ToString("0.000", IC)).Append("s f").Append(e.frame).Append("  ").Append(tx).Append('\n'); shown++;
                                     }
                                     return sb.Length > 0 ? sb.ToString() : "(no records)";
                                 }
@@ -814,7 +1056,7 @@ namespace InsideDev
                                 foreach (var id in AudioTrace.unknownIds) { sb.Append("unknown ").Append(id).Append('\n'); if (sb.Length > 4000) break; }
                                 return AudioTrace.KnownIds + " named ids\n" + sb;
                         }
-                        return "wwise stats|api [f]|watched|trace [n] [f]|level n|objs [f]|banks|pid <id>|hash <name>|ids";
+                        return "usage: wwise stats|api [f]|watched|trace [n] [f]|level n|objs [f]|banks|pid <id>|hash <name>|ids";
                     }
                 case "sounds":
                     {
@@ -824,7 +1066,7 @@ namespace InsideDev
                         {
                             // sounds override <event> <binding#> <newEvent> | revert/post/trigger <event> <binding#>
                             SoundLibrary.Def d0; if (!SoundLibrary.defs.TryGetValue(a[2], out d0)) return "unknown sound";
-                            int bi; if (!int.TryParse(a[3], out bi) || bi < 0 || bi >= d0.bindings.Count) return "binding index 0.." + (d0.bindings.Count - 1);
+                            int bi; if (!Fmt.TryI(a[3], out bi) || bi < 0 || bi >= d0.bindings.Count) return "usage: binding index 0.." + (d0.bindings.Count - 1);
                             var b0 = d0.bindings[bi];
                             if (a[1] == "override") return a.Count > 4 ? SoundLibrary.Override(b0, a[4]) : "need new event name";
                             if (a[1] == "revert") return SoundLibrary.Revert(b0);
@@ -850,13 +1092,30 @@ namespace InsideDev
                 case "graph":
                     if (a.Count > 2 && (a[1] == "mode")) { GraphView.SetMode(a[2]); return GraphView.Dump(0); }
                     if (a.Count > 1 && a[1] == "live") { if (a.Count > 2) GraphView.SetLive(a[2]); return GraphView.LiveDump(); }   // graph live [s f a n | all | none]
-                    if (a.Count > 2) GraphView.SetFilter(a[2]);   // graph <hops> [f|s|m|o combination | all]
+                    if (a.Count > 1 && a[1] == "look") return GraphView.Snapshot(Selection.Current, a.Count > 2 ? a[2] : null, a.Count > 3 ? (int)F(a[3]) : 0, a.Count > 4 ? a[4] : null);
+                    if (a.Count > 2) GraphView.SetFilter(a[2]);   // graph <hops> [f|s|m|o|c combination | all]   (c = code edges)
                     return GraphView.Dump(a.Count > 1 ? (int)F(a[1]) : 0);
                 case "sel":
                     {
-                        if (a.Count > 1 && a[1] == "back") Selection.Back();
-                        else if (a.Count > 1 && a[1] == "fwd") Selection.Forward();
-                        else if (a.Count > 1 && a[1] == "clear") Selection.Clear("bridge");
+                        // sel | sel back|fwd|clear | sel <obj>   (the last form selects, as the console's sel does)
+                        if (a.Count > 1)
+                        {
+                            if (a[1] == "back") Selection.Back();
+                            else if (a[1] == "fwd") Selection.Forward();
+                            else if (a[1] == "clear") Selection.Clear("bridge");
+                            else
+                            {
+                                string q = Rest(line);
+                                var go = Resolve(q);
+                                if (go == null)
+                                {
+                                    // the console's matching: every word in the name or the path, active objects only
+                                    foreach (var r in ObjectDatabase.Search(q, 200)) if (r.go != null && r.activeInHierarchy) { go = r.go; break; }
+                                }
+                                if (go == null) return "not found: " + q;
+                                Selection.Set(go, "bridge");
+                            }
+                        }
                         return Selection.Describe() + "   history " + Selection.HistoryCount + "   explorer: " + SceneExplorer.Status();
                     }
                 case "children":
@@ -866,17 +1125,37 @@ namespace InsideDev
                         for (int i = 0; i < go.transform.childCount; i++) { var ch = go.transform.GetChild(i); sb.Append(ch.gameObject.activeSelf ? "  " : "  [off] ").Append(ch.name).Append(ch.childCount > 0 ? "  (" + ch.childCount + ")" : "").Append('\n'); }
                         return sb.ToString();
                     }
-                case "near": return Near(a.Count > 1 ? F(a[1]) : 15f, a.Count > 2 ? a[2] : null);
+                case "near":
+                    {
+                        float r = 15f;
+                        if (a.Count > 1 && !Fmt.TryF(a[1], out r)) return "usage: near [radius] [filter]";
+                        return Near(r, a.Count > 2 ? a[2] : null);
+                    }
                 case "triggers":
-                    if (a.Count > 1 && (a[1] == "on" || a[1] == "off")) { Commands.Run(line, core); return "trigger overlay " + a[1]; }
-                    return Triggers(a.Count > 1 ? F(a[1]) : 20f);
+                    {
+                        // triggers [radius]   lists them;   triggers on|off   switches the trigger overlay (the console's form)
+                        float r = 20f;
+                        if (a.Count > 1)
+                        {
+                            string v = a[1].ToLowerInvariant();
+                            if (v == "on" || v == "off" || v == "true" || v == "false" || v == "yes" || v == "no")
+                            {
+                                core.Overlay.showTriggers = On(v);
+                                core.Overlay.SaveChoices();
+                                core.Overlay.ForceRefresh();
+                                return "trigger overlay " + (core.Overlay.showTriggers ? "on" : "off");
+                            }
+                            if (!Fmt.TryF(a[1], out r)) return "usage: triggers [radius] | triggers on|off";
+                        }
+                        return Triggers(r);
+                    }
                 case "hiddennear":
                     {
                         core.ScanHidden();
                         var ch = G.MainCharacter; var o = ch != null ? ch.pos3 : Vector3.zero; float r = a.Count > 1 ? F(a[1]) : 30f;
                         var sb = new StringBuilder();
                         foreach (var h in core.hidden) if (h.go != null && (h.go.transform.position - o).magnitude <= r) sb.Append(((h.go.transform.position - o).magnitude).ToString("0.0", IC)).Append("m  ").Append(Inspector.PathOf(h.go.transform)).Append("  [").Append(h.kind).Append("]\n");
-                        return sb.Length > 0 ? sb.ToString() : "none within " + r + "m";
+                        return sb.Length > 0 ? sb.ToString() : "none within " + Fmt.F(r) + "m";
                     }
                 case "setactive":
                     {
@@ -914,7 +1193,25 @@ namespace InsideDev
                         var fi = FindField(comp.GetType(), a[3]);
                         if (fi != null) { ChangeRecorder.BeforeField(comp, fi.Name, "bridge"); fi.SetValue(comp, Parse(val, fi.FieldType, fi.GetValue(comp))); return a[3] + " = " + Describe(fi.GetValue(comp)); }
                         var pi = comp.GetType().GetProperty(a[3], BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                        if (pi != null && pi.CanWrite) { pi.SetValue(comp, Parse(val, pi.PropertyType, pi.GetValue(comp, null)), null); return a[3] + " = " + Describe(pi.GetValue(comp, null)); }
+                        if (pi != null && pi.CanWrite)
+                        {
+                            object before = null;
+                            try { if (pi.CanRead) before = pi.GetValue(comp, null); } catch { }
+                            if (pi.CanRead)
+                            {
+                                // undoable: the history reads and writes the property itself
+                                var pc = comp; var pp = pi;
+                                ChangeRecorder.BeforeCustom(go, "prop:" + comp.GetInstanceID() + ":" + pi.Name, go.name + " " + comp.GetType().Name + "." + pi.Name,
+                                                            () => pp.GetValue(pc, null), x => pp.SetValue(pc, x, null), "bridge");
+                                pi.SetValue(comp, Parse(val, pi.PropertyType, before), null);
+                                return a[3] + " = " + Describe(pi.GetValue(comp, null)) + "   (a property; it was " + Describe(before) + ")";
+                            }
+                            // a property that cannot be read has nothing to restore: the edit is listed in the history but cannot be undone
+                            pi.SetValue(comp, Parse(val, pi.PropertyType, before), null);
+                            string now = val;
+                            ChangeRecorder.Action(go, "set property", null, comp.GetType().Name + "." + pi.Name + " = " + now + " (was " + Describe(before) + ")", "bridge");
+                            return a[3] + " = " + now + "   (a property: listed in the history, not undoable; it was " + Describe(before) + ")";
+                        }
                         return "field/property not found or read-only";
                     }
                 case "anim":
@@ -931,7 +1228,7 @@ namespace InsideDev
                     {
                         // reparent <object> <newParent|none|up>   (keeps the world position)
                         var go = Resolve(a[1]); if (go == null) return "not found";
-                        if (a.Count < 3) return "usage: reparent <obj> <newParent|none|up>";
+                        if (a.Count < 3) return "usage: reparent <obj> <newParent|none|up|restore>";
                         if (a[2] == "none") return Reparent.Do(go, null, "bridge");
                         if (a[2] == "up") return Reparent.Do(go, go.transform.parent != null ? go.transform.parent.parent : null, "bridge");
                         if (a[2] == "restore") return Reparent.Restore(go);
@@ -957,6 +1254,7 @@ namespace InsideDev
                         foreach (var x in go.GetComponents<PlayMakerFSM>()) if (a.Count > 2 && x.FsmName == a[2]) { fsm = x; i = 3; }
                         if (fsm == null) fsm = go.GetComponent<PlayMakerFSM>();
                         if (fsm == null) return "no PlayMakerFSM on object";
+                        if (a.Count <= i) return "usage: fsm <obj> [fsmName] event|state|var <name> [value] | wire <state|*> <event> <toState> | unwire <state|*> <event> | resetwires | events";
                         string op = a[i].ToLowerInvariant(); string arg = a.Count > i + 1 ? a[i + 1] : "";
                         if (op == "event") { ChangeRecorder.Action(go, "fsmEvent", fsm.FsmName, arg, "bridge"); fsm.SendEvent(arg); return fsm.FsmName + " <- event '" + arg + "'  now in state [" + fsm.ActiveStateName + "]"; }
                         if (op == "state") { ChangeRecorder.Action(go, "fsmState", fsm.FsmName, arg, "bridge"); fsm.SetState(arg); return fsm.FsmName + " -> state [" + fsm.ActiveStateName + "]"; }
@@ -964,8 +1262,24 @@ namespace InsideDev
                         {
                             var v = fsm.FsmVariables.GetVariable(arg);
                             if (v == null) return "no variable " + arg;
-                            if (a.Count > i + 2) { string val = a[i + 2]; SetFsmVar(v, val); }
-                            return arg + " = " + v.RawValue;
+                            if (a.Count > i + 2)
+                            {
+                                string was = Fmt.Any(v.RawValue);
+                                string val = string.Join(" ", a.GetRange(i + 2, a.Count - i - 2).ToArray());
+                                if (v is FsmBool || v is FsmFloat || v is FsmInt || v is FsmString || v is FsmVector3)
+                                {
+                                    // undoable: the history reads and writes the variable itself
+                                    var vv = v;
+                                    ChangeRecorder.BeforeCustom(go, "fsmvar:" + fsm.FsmName + ":" + v.Name, "FSM var " + v.Name, () => vv.RawValue, x => WriteFsmVar(vv, x), "bridge");
+                                    SetFsmVar(v, val);
+                                    return arg + " = " + Fmt.Any(v.RawValue) + "   (it was " + was + ")";
+                                }
+                                // FSM variables of other types cannot be written back: the edit is listed in the history, not undoable
+                                SetFsmVar(v, val);
+                                ChangeRecorder.Action(go, "set fsm variable", fsm.FsmName, fsm.FsmName + "." + arg + " = " + Fmt.Any(v.RawValue) + " (was " + was + ")", "bridge");
+                                return arg + " = " + Fmt.Any(v.RawValue) + "   (listed in the history, not undoable; it was " + was + ")";
+                            }
+                            return arg + " = " + Fmt.Any(v.RawValue);
                         }
                         // wire <state|*> <event> <toState>   unwire <state|*> <event>   resetwires   events
                         if (op == "wire" && a.Count > i + 3) return FsmEdit.Wire(fsm, a[i + 1], a[i + 2], a[i + 3], "bridge");
@@ -995,7 +1309,14 @@ namespace InsideDev
                     }
                 case "audiolog":
                     {
-                        int n = a.Count > 1 ? (int)F(a[1]) : 40; var sb = new StringBuilder();
+                        int n = 40;
+                        if (a.Count > 1 && !Fmt.TryI(a[1], out n)) return "usage: audiolog [n]";
+                        // the log sleeps while nobody uses the tool: this call keeps it awake for two minutes, and the
+                        // "wake" line in it marks the stretch that was not recorded
+                        Background.Want(Background.Audio, 120f);
+                        AudioSpy.Wake();
+                        var sb = new StringBuilder();
+                        if (AudioSpy.Instance == null) sb.Append("(the audio spy is not installed: ").Append(EditorState.Get("audio.spy", true) ? "the sound engine is not ready yet" : "editor.cfg audio.spy=0").Append(")\n");
                         for (int i = Math.Max(0, AudioSpy.log.Count - n); i < AudioSpy.log.Count; i++) { var e = AudioSpy.log[i]; sb.Append(e.frame).Append(' ').Append(e.kind).Append(' ').Append(e.name).Append(" @").Append(e.source).Append(' ').Append(e.detail).Append('\n'); }
                         return sb.ToString();
                     }
@@ -1007,7 +1328,10 @@ namespace InsideDev
                     }
                 case "timed":
                     {
-                        AudioTimed.Scan(true); var sb = new StringBuilder();
+                        Background.Want(Background.Timed, 120f);
+                        AudioTimed.Scan(true);
+                        if (CoreBCommands.IsJson(a)) return CoreBCommands.TimedJson();
+                        var sb = new StringBuilder();
                         foreach (var s in AudioTimed.systems)
                         {
                             if (s.comp == null) continue;
@@ -1019,6 +1343,7 @@ namespace InsideDev
                 case "timer":
                     {
                         // timer <TypeName> <field> <seconds|mute|unmute|fire>
+                        Background.Want(Background.Timed, 120f);
                         AudioTimed.Scan(true);
                         foreach (var s in AudioTimed.systems)
                             if (s.comp != null && s.typeName.Equals(a[1], StringComparison.OrdinalIgnoreCase))
@@ -1026,10 +1351,15 @@ namespace InsideDev
                                     if (t.field.Equals(a[2], StringComparison.OrdinalIgnoreCase))
                                     {
                                         string op = a[3].ToLowerInvariant();
-                                        if (op == "mute") AudioTimed.SetMuted(t, true);
-                                        else if (op == "unmute") AudioTimed.SetMuted(t, false);
+                                        if (op == "mute") AudioTimed.SetMuted(t, true, "bridge");
+                                        else if (op == "unmute") AudioTimed.SetMuted(t, false, "bridge");
                                         else if (op == "fire") AudioTimed.FireNow(t);
-                                        else { t.original = F(op); t.chk.SetEventTime(t.original); }
+                                        else
+                                        {
+                                            float sec;
+                                            if (!Fmt.TryF(op, out sec)) return "usage: timer <Type> <field> <seconds|mute|unmute|fire>";
+                                            AudioTimed.SetTime(t, sec, "bridge");
+                                        }
                                         return s.typeName + "." + t.field + " -> " + (t.muted ? "MUTED" : t.original.ToString("0.###", IC) + "s");
                                     }
                         return "timer not found (use 'timed' to list)";
@@ -1040,29 +1370,11 @@ namespace InsideDev
                         return string.Format(IC, "music pos {0:0.000}s loop {1:0.000}s beat {2} bar {3}", m.GetMusicPosition_s(), m.GetLoopLength_s(), m.LastBeat, m.Bar);
                     }
                 case "remote":
-                    if (a.Count > 1 && a[1] == "off") enabled = false;
+                    if (a.Count > 1) enabled = On(a[1]);
                     return "remote " + (enabled ? "on" : "off");
-                case "help":
-                    return "remote: ping | state | diag | cams | render auto|eof|overlay|gamecam|probe|reset|snapshot|board | panel on|off [tab#]\n" +
-                           "        focustest <n> [awayMs] [backMs] [alttab|minimize] [bg on|off] | focustest stop|status | bg on|off | fullscreen on|off | res <w> <h> [full]\n" +
-                           "        screenshot [tag] | inspect <obj> | children <obj> | near [r] [filter] | triggers [r] | hiddennear [r]\n" +
-                           "        setactive <obj> on|off | enable <obj> <Comp> on|off | get/set <obj> <Comp> <field> [value] | call <obj> <Comp> <method>\n" +
-                           "        fsm <obj> [fsmName] event|state|var <name> [value] | fsm <obj> wire <state|*> <event> <toState> | unwire <state|*> <event> | resetwires | events\n" +
-                           "        signal <obj> <out> | signalin <obj> <in>\n" +
-                           "        mats <obj> | origin <obj> [deep] (level file vs live) | graph live [s f a n|all|none]\n" +
-                           "        fsmgraph <obj> [fsmName] (opens the FSM Graph panel) | postfx [on|off|default <T> | set <T> <f> <v>] | fsmfind <text> | fsmset <obj>|<state>|<i>|<field>|<value> | sigs <obj> | sigwire|sigunwire <fsm obj>|<>in>|<sender>|<out>\n" +
-                           "        mem [obj|on|off] | memwhat <hex> | memmethod <hex> | memread <hex> [n] | memjit <Type> <method> [+hex] | memexport (Cheat Engine)\n" +
-                           "        audiolog [n] | waits | timed | timer <Type> <field> <s|mute|unmute|fire> | music\n" +
-                           "        " + MultiCam.Help + "\n" +
-                           "        srec status | objects [filter] | load <dir> | end | play [speed] [loop] | pause | seek <t> | step <dt> | probe [n] | probe camera [n] | record start <dir> [...] | record stop [keep]\n" +
-                           "        acap preflight | start <name> | mark <ascii> | stop | suspend on|off | status\n" +
-                           "        cam [pose x y z yaw pitch [fov] [s] [roll] | fov <deg> | roll <deg> | json [name] | off] | hud on|off | clean on|off | gamma <0..1>|reset | seed <n>\n" +
-                           "        <obj> = name (nearest match), full/path, or #instanceID.  Quote names with spaces: \"My Obj\".\n" +
-                           "plus every console command (tp, spawn, god, ts, kill, find, sel, flag, post, cue, shockwave, catalog...)";
+                case "help": return CoreBHelp.Help(a);
                 default:
-                    { var er = Extensions.Command(a, core); if (er != null) return er; }
-                    Commands.Run(line, core, false);
-                    return null;
+                    return Fallback(a, line, core);
             }
         }
 
@@ -1070,7 +1382,7 @@ namespace InsideDev
         public static string State(DevCore core)
         {
             var sb = new StringBuilder();
-            sb.Append("InsideDev ").Append(Boot.Version).Append("   ").Append(DateTime.Now.ToString("HH:mm:ss")).Append("   frame ").Append(Time.frameCount).Append('\n');
+            sb.Append("InsideDev ").Append(Boot.Version).Append("   ").Append(DateTime.Now.ToString("HH:mm:ss", IC)).Append("   frame ").Append(Time.frameCount).Append('\n');
             sb.Append("render: backend ").Append(RenderHost.requested).Append("->").Append(RenderHost.active).Append("  submits ").Append(RenderHost.submitCount).Append(" fails ").Append(RenderHost.submitFails)
               .Append("  focus lost/regained ").Append(RenderHost.focusLostCount).Append('/').Append(RenderHost.focusRegainCount).Append("  probe ").Append(RenderHost.probeResult).Append('\n');
             var ch = G.MainCharacter;
@@ -1085,7 +1397,7 @@ namespace InsideDev
             if (Shockwave.Mgr != null)
             {
                 var m = Shockwave.Mgr;
-                sb.Append("shockwave: in cover ").Append(ForcePushManager.GetInCover()).Append("  zones ").Append(ForcePushManager.getActiveZoneCount()).Append("  nokill ").Append(Shockwave.noKill).Append("  blow@").Append(Shockwave.CheckerTime("blow").ToString("0.00", IC)).Append("s cycle ").Append(m.musicCycleTime).Append('\n');
+                sb.Append("shockwave: in cover ").Append(ForcePushManager.GetInCover()).Append("  zones ").Append(ForcePushManager.getActiveZoneCount()).Append("  nokill ").Append(Shockwave.noKill).Append("  blow@").Append(Shockwave.CheckerTime("blow").ToString("0.00", IC)).Append("s cycle ").Append(Fmt.F(m.musicCycleTime)).Append('\n');
             }
             sb.Append("\nnearest triggers:\n").Append(Triggers(15f, 25));
             sb.Append("\nFSMs waiting on audio right now:\n");
@@ -1095,11 +1407,8 @@ namespace InsideDev
             sb.Append("\nlast audio events:\n");
             for (int i = Math.Max(0, AudioSpy.log.Count - 15); i < AudioSpy.log.Count; i++) { var e = AudioSpy.log[i]; sb.Append("  ").Append(e.frame).Append(' ').Append(e.kind).Append(' ').Append(e.name).Append(" @").Append(e.source).Append('\n'); }
             sb.Append("\nchanges by user: ").Append(Changes.list.Count).Append('\n');
-            lock (DevLog.Lines)
-            {
-                sb.Append("\nconsole tail:\n");
-                for (int i = Math.Max(0, DevLog.Lines.Count - 12); i < DevLog.Lines.Count; i++) sb.Append("  ").Append(DevLog.Lines[i]).Append('\n');
-            }
+            sb.Append("\nconsole tail:\n");
+            foreach (var l in DevLog.Tail(12)) sb.Append("  ").Append(l).Append('\n');
             return sb.ToString();
         }
 
@@ -1121,32 +1430,41 @@ namespace InsideDev
                 var e = list[i].Value;
                 sb.Append("  ").Append(list[i].Key.ToString("0.0", IC)).Append("m  ").Append(Inspector.PathOf(e.col.transform)).Append(e.col.enabled ? "" : " (off)").Append("  <").Append(e.types).Append(">  #").Append(e.col.gameObject.GetInstanceID()).Append('\n');
             }
-            return sb.Length > 0 ? sb.ToString() : "  none within " + radius + "m (trigger scan on? F2)\n";
+            return sb.Length > 0 ? sb.ToString() : "  none within " + Fmt.F(radius) + "m (trigger scan on? F2)\n";
         }
 
+        // Ranked from the records of the object database (positions of its last pass, at most 3 s old); the engine is asked
+        // only for the rows that are printed.
         static string Near(float radius, string filter)
         {
             var ch = G.MainCharacter; var o = ch != null ? ch.pos3 : Vector3.zero;
-            var list = new List<KeyValuePair<float, Transform>>();
-            foreach (var t in Inspector.AllSceneTransforms())
+            ObjectDatabase.Demand(30f);
+            Background.Want(Background.Objects, 30f);
+            try { ObjectDatabase.EnsureFresh(3f); } catch (Exception e) { DevLog.Error("near: object database", e); }
+            if (!ObjectDatabase.Ready) return "object scan not finished, try again in a moment";
+            string fl = filter != null ? filter.ToLowerInvariant() : null;
+            float r2 = radius * radius;
+            var list = new List<KeyValuePair<float, ObjRecord>>();
+            foreach (var r in ObjectDatabase.all)
             {
-                if (t == null) continue;
-                float d = (t.position - o).magnitude;
-                if (d > radius) continue;
-                if (filter != null && t.name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
-                list.Add(new KeyValuePair<float, Transform>(d, t));
+                float d2 = (r.pos - o).sqrMagnitude;
+                if (d2 > r2) continue;
+                if (fl != null && (r.nameLower == null || r.nameLower.IndexOf(fl, StringComparison.Ordinal) < 0)) continue;
+                if (r.go == null) continue;
+                list.Add(new KeyValuePair<float, ObjRecord>(Mathf.Sqrt(d2), r));
             }
             list.Sort((x, y) => x.Key.CompareTo(y.Key));
             var sb = new StringBuilder();
             for (int i = 0; i < Math.Min(150, list.Count); i++)
             {
-                var t = list[i].Value;
+                var t = list[i].Value.t;
+                if (t == null) continue;
                 sb.Append(list[i].Key.ToString("0.0", IC)).Append("m  ").Append(t.gameObject.activeInHierarchy ? "" : "[hidden] ").Append(Inspector.PathOf(t)).Append("  #").Append(t.gameObject.GetInstanceID());
                 var comps = t.GetComponents<MonoBehaviour>();
                 if (comps.Length > 0) { sb.Append("  <"); foreach (var c in comps) if (c != null) sb.Append(c.GetType().Name).Append(' '); sb.Append('>'); }
                 sb.Append('\n');
             }
-            return list.Count + " object(s) within " + radius + "m" + (list.Count > 150 ? " (showing 150)" : "") + "\n" + sb;
+            return list.Count + " object(s) within " + Fmt.F(radius) + "m" + (list.Count > 150 ? " (showing 150)" : "") + "\n" + sb;
         }
 
         public static string Inspect(GameObject go)
@@ -1267,7 +1585,7 @@ namespace InsideDev
             try
             {
                 var vars = fsm.FsmVariables.GetAllNamedVariables();
-                if (vars != null && vars.Length > 0) { sb.Append("  variables: "); foreach (var v in vars) sb.Append(v.Name).Append('=').Append(v.RawValue).Append("  "); sb.Append('\n'); }
+                if (vars != null && vars.Length > 0) { sb.Append("  variables: "); foreach (var v in vars) sb.Append(v.Name).Append('=').Append(Fmt.Any(v.RawValue)).Append("  "); sb.Append('\n'); }
             }
             catch { }
         }
@@ -1282,38 +1600,124 @@ namespace InsideDev
                 object raw = null; try { raw = nv.RawValue; } catch { }
                 var ro = raw as UObj;
                 if (ro != null) return ro.name;
-                return raw == null ? null : raw.ToString();
+                return raw == null ? null : Fmt.Any(raw);
             }
             var fe = v as FsmEvent; if (fe != null) return "event:" + fe.Name;
             var fo = v as FsmOwnerDefault; if (fo != null) { var g = fo.GameObject != null ? fo.GameObject.Value : null; return g != null ? g.name : "owner"; }
-            if (v is string || v.GetType().IsPrimitive || v.GetType().IsEnum) return v.ToString();
+            if (v is string || v.GetType().IsPrimitive || v.GetType().IsEnum) return Fmt.Any(v);
             var uo = v as UObj; if (uo != null) return uo.name;
             if (ValueDump.IsNested(v)) return ValueDump.Compact(v, 4);
             return null;
         }
 
         // ---------------------------------------------------------------- helpers
-        public static GameObject Resolve(string q)
+        // seconds after which the records of the object database are refreshed before a lookup instead of trusted
+        const float StaleRecords = 10f;
+
+        public static GameObject Resolve(string q) { int n; return Resolve(q, out n); }
+
+        // "#instanceID", "path/with/slashes" (exact, then as the end of a path), an exact name (the nearest to the boy), then a
+        // part of a name (the nearest). candidates = how many objects the winner was picked from.
+        // Answered from the records of the object database, without walking the scene: the records are brought up to date
+        // first when the database has slept (not from inside a capture, where a full pass would be a hitch), and once
+        // more when nothing matched. "Nearest" is ranked with the positions of the last pass.
+        public static GameObject Resolve(string q, out int candidates)
         {
+            candidates = 0;
             if (string.IsNullOrEmpty(q)) return null;
             q = q.Trim().Trim('"');
-            var all = Inspector.AllSceneTransforms();
+            if (q.Length == 0) return null;
+            bool fresh = false;
+            try
+            {
+                ObjectDatabase.Demand(30f);
+                Background.Want(Background.Objects, 30f);
+                if (!ObjectDatabase.Ready || (internalDepth == 0 && ObjectDatabase.Age > StaleRecords)) { ObjectDatabase.EnsureFresh(3f); fresh = true; }
+            }
+            catch (Exception e) { DevLog.Error("resolve: object database", e); }
+            if (!ObjectDatabase.Ready) return ResolveLive(q, out candidates);
+            var go = ResolveRecords(q, out candidates);
+            if (go != null || fresh) return go;
+            int passes = ObjectDatabase.completedPasses;
+            try { ObjectDatabase.EnsureFresh(3f); } catch (Exception e) { DevLog.Error("resolve: object database", e); }
+            return ObjectDatabase.completedPasses == passes ? null : ResolveRecords(q, out candidates);
+        }
+
+        static GameObject ResolveRecords(string q, out int candidates)
+        {
+            candidates = 0;
+            if (q[0] == '#')
+            {
+                int id;
+                if (!Fmt.TryI(q.Substring(1), out id)) return null;
+                var r = ObjectDatabase.Get(id);
+                if (r == null) return null;
+                candidates = 1;
+                return r.go;
+            }
+            var all = ObjectDatabase.all;
+            var ch = G.MainCharacter; var o = ch != null ? ch.pos3 : Vector3.zero;
+            ObjRecord best = null; float bd = float.MaxValue; int n = 0;
+            if (q.IndexOf('/') >= 0)
+            {
+                foreach (var r in ObjectDatabase.ByPath(q)) { n++; float d = (r.pos - o).sqrMagnitude; if (d < bd) { bd = d; best = r; } }
+                if (best == null)
+                {
+                    string pl = q.ToLowerInvariant();
+                    for (int i = 0; i < all.Count; i++)
+                    {
+                        var r = all[i];
+                        if (r.pathLower == null || !r.pathLower.EndsWith(pl, StringComparison.Ordinal) || r.go == null) continue;
+                        n++;
+                        float d = (r.pos - o).sqrMagnitude; if (d < bd) { bd = d; best = r; }
+                    }
+                }
+                if (best != null) { candidates = n; return best.go; }
+            }
+            for (int i = 0; i < all.Count; i++)
+            {
+                var r = all[i];
+                if (r.name != q || r.go == null) continue;
+                n++;
+                float d = (r.pos - o).sqrMagnitude; if (d < bd) { bd = d; best = r; }
+            }
+            if (best == null)
+            {
+                string ql = q.ToLowerInvariant();
+                for (int i = 0; i < all.Count; i++)
+                {
+                    var r = all[i];
+                    if (r.nameLower == null || r.nameLower.IndexOf(ql, StringComparison.Ordinal) < 0 || r.go == null) continue;
+                    n++;
+                    float d = (r.pos - o).sqrMagnitude; if (d < bd) { bd = d; best = r; }
+                }
+            }
+            candidates = n;
+            return best != null ? best.go : null;
+        }
+
+        // the same search over the live scene, for the moments when the object database has no pass yet
+        static GameObject ResolveLive(string q, out int candidates)
+        {
+            candidates = 0;
+            var all = Inspector.WalkSceneTransforms();
             if (q.StartsWith("#"))
             {
                 int id;
-                if (int.TryParse(q.Substring(1), out id)) foreach (var t in all) if (t != null && t.gameObject.GetInstanceID() == id) return t.gameObject;
+                if (Fmt.TryI(q.Substring(1), out id)) foreach (var t in all) if (t != null && t.gameObject.GetInstanceID() == id) { candidates = 1; return t.gameObject; }
                 return null;
             }
             var ch = G.MainCharacter; var o = ch != null ? ch.pos3 : Vector3.zero;
             if (q.IndexOf('/') >= 0)
             {
                 string leaf = q.Substring(q.LastIndexOf('/') + 1);
-                foreach (var t in all) if (t != null && t.name.EndsWith(leaf, StringComparison.Ordinal) && Inspector.PathOf(t) == q) return t.gameObject;
-                foreach (var t in all) if (t != null && t.name.EndsWith(leaf, StringComparison.OrdinalIgnoreCase) && Inspector.PathOf(t).EndsWith(q, StringComparison.OrdinalIgnoreCase)) return t.gameObject;
+                foreach (var t in all) if (t != null && t.name.EndsWith(leaf, StringComparison.Ordinal) && Inspector.PathOf(t) == q) { candidates = 1; return t.gameObject; }
+                foreach (var t in all) if (t != null && t.name.EndsWith(leaf, StringComparison.OrdinalIgnoreCase) && Inspector.PathOf(t).EndsWith(q, StringComparison.OrdinalIgnoreCase)) { candidates = 1; return t.gameObject; }
             }
-            Transform best = null; float bd = float.MaxValue;
-            foreach (var t in all) if (t != null && t.name == q) { float d = (t.position - o).sqrMagnitude; if (d < bd) { bd = d; best = t; } }
-            if (best == null) foreach (var t in all) if (t != null && t.name.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0) { float d = (t.position - o).sqrMagnitude; if (d < bd) { bd = d; best = t; } }
+            Transform best = null; float bd = float.MaxValue; int n = 0;
+            foreach (var t in all) if (t != null && t.name == q) { n++; float d = (t.position - o).sqrMagnitude; if (d < bd) { bd = d; best = t; } }
+            if (best == null) foreach (var t in all) if (t != null && t.name.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0) { n++; float d = (t.position - o).sqrMagnitude; if (d < bd) { bd = d; best = t; } }
+            candidates = n;
             return best != null ? best.gameObject : null;
         }
 
@@ -1367,7 +1771,19 @@ namespace InsideDev
             if (t == typeof(Vector3)) { var p = s.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries); return new Vector3(F(p[0]), F(p[1]), F(p[2])); }
             if (t == typeof(Vector2)) { var p = s.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries); return new Vector2(F(p[0]), F(p[1])); }
             if (typeof(NamedVariable).IsAssignableFrom(t) && current != null) { SetFsmVar((NamedVariable)current, s); return current; }
+            // floats the same way everywhere: "0,5" is refused, not read as 5 (Convert would take the comma as a group separator)
+            if (t == typeof(float)) return F(s);
+            if (t == typeof(double)) return double.Parse(s, NumberStyles.Float, IC);
             return Convert.ChangeType(s, t, IC);
+        }
+
+        static void WriteFsmVar(NamedVariable v, object x)
+        {
+            if (v is FsmBool) ((FsmBool)v).Value = (bool)x;
+            else if (v is FsmFloat) ((FsmFloat)v).Value = (float)x;
+            else if (v is FsmInt) ((FsmInt)v).Value = (int)x;
+            else if (v is FsmString) ((FsmString)v).Value = (string)x;
+            else if (v is FsmVector3) ((FsmVector3)v).Value = (Vector3)x;
         }
 
         static void SetFsmVar(NamedVariable v, string s)
@@ -1382,20 +1798,19 @@ namespace InsideDev
         public static string Describe(object v)
         {
             if (v == null) return "null";
-            var uo = v as UObj; if (uo != null) return uo == null ? "null(destroyed)" : uo.name + " (" + uo.GetType().Name + ")";
-            if (v is UObj) return "null";
-            var nv = v as NamedVariable; if (nv != null) { try { return "fsmvar " + nv.Name + "=" + nv.RawValue; } catch { return "fsmvar"; } }
+            if (v is UObj) { var uo = (UObj)v; return uo == null ? "null (destroyed)" : uo.name + " (" + uo.GetType().Name + ")"; }
+            var nv = v as NamedVariable; if (nv != null) { try { return "fsmvar " + nv.Name + "=" + Fmt.Any(nv.RawValue); } catch { return "fsmvar"; } }
             if (v is Vector3) return V((Vector3)v);
             var col = v as ICollection;
             if (col != null && !(v is string))
             {
                 var sb = new StringBuilder(v.GetType().Name + "[" + col.Count + "]");
                 int i = 0;
-                foreach (var x in col) { if (i++ >= 6) { sb.Append(" ..."); break; } sb.Append(i == 1 ? " { " : ", ").Append(x == null ? "null" : (x is UObj ? ((UObj)x) != null ? ((UObj)x).name : "null" : x.ToString())); }
+                foreach (var x in col) { if (i++ >= 6) { sb.Append(" ..."); break; } sb.Append(i == 1 ? " { " : ", ").Append(x == null ? "null" : (x is UObj ? ((UObj)x) != null ? ((UObj)x).name : "null" : Fmt.Any(x))); }
                 if (i > 0 && i <= 6) sb.Append(" }");
                 return sb.ToString();
             }
-            string s; try { s = Convert.ToString(v, IC); } catch { s = "?"; }
+            string s; try { s = Fmt.Any(v); } catch { s = "?"; }
             return s.Length > 160 ? s.Substring(0, 160) + "..." : s;
         }
 

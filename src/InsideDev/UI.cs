@@ -34,6 +34,7 @@ namespace InsideDev
         public bool click, held, released, rightClick;
         float wheel;
         public string focus;            // focused text field id
+        string focusSeenId; int focusSeenFrame;   // the focused field and the last frame it was laid out
         string activeDrag;              // slider / window / splitter / scrollbar drag
         Vector2 dragOffset;
         public bool mouseOverUI;
@@ -62,6 +63,11 @@ namespace InsideDev
             for (int i = areasNow.Count - 1; i >= 0; i--) if (areasNow[i].Value.Contains(mouse)) { hotArea = areasNow[i].Key; break; }
             mouseOverUI = hotArea != null;
             areasNow.Clear();
+            // a focused field that was not laid out for more than two frames is gone (its panel, tab or row went away): the
+            // keyboard goes back to the game. A focus set from outside (BackQuote, palette, "ui focus") gets the same grace.
+            int fnow = Time.frameCount;
+            if (focus != focusSeenId) { focusSeenId = focus; focusSeenFrame = fnow; }
+            else if (focus != null && fnow - focusSeenFrame > 2) { focus = null; focusSeenId = null; }
             if (click && hotArea == null && focus != null) focus = null;
             // widget log of the previous frame (bridge UI tests: "ui find <text>", "ui clicktext <text>")
             if (recordWidgets) { lastWidgets.Clear(); lastWidgets.AddRange(widgetsNow); }
@@ -69,6 +75,8 @@ namespace InsideDev
             widgetsNow.Clear();
         }
 
+        // widget log: callers that build the text ("[toggle] " + s) test recordWidgets first, so nothing is concatenated
+        // while recording is off
         public bool recordWidgets;
         readonly List<KeyValuePair<string, Rect>> widgetsNow = new List<KeyValuePair<string, Rect>>(512);
         public readonly List<KeyValuePair<string, Rect>> lastWidgets = new List<KeyValuePair<string, Rect>>(512);
@@ -232,7 +240,7 @@ namespace InsideDev
             if (w == -2) w = d.Measure(s) + 14;
             var r = Place(w, LineH);
             if (!Visible(r)) return;
-            Log("[disabled] " + s, r);
+            if (recordWidgets) Log("[disabled] " + s, r);
             d.Fill(r, BtnOff);
             d.PushClip(r); d.Text(r.x + 7, r.y + 3, s, new Color(Dim.r, Dim.g, Dim.b, 0.6f)); d.PopClip();
             if (Hover(r) && why != null) Tip(r, why);
@@ -327,7 +335,7 @@ namespace InsideDev
             if (w == -2) w = d.Measure(s) + 26;
             var r = Place(w, LineH);
             if (!Visible(r)) return v;
-            Log("[toggle] " + s, r);
+            if (recordWidgets) Log("[toggle] " + s, r);
             var box = new Rect(r.x + 2, r.y + 4, 12, 12);
             d.Fill(box, Btn);
             if (v) d.Fill(new Rect(box.x + 2, box.y + 2, 8, 8), Accent);
@@ -354,7 +362,7 @@ namespace InsideDev
         {
             var r = Place(w, LineH);
             if (!Visible(r)) return v;
-            Log("[slider] " + id, r);
+            if (recordWidgets) Log("[slider] " + id, r);
             var track = new Rect(r.x, r.y + 8, r.width, 4);
             d.Fill(track, Btn);
             float t = Mathf.InverseLerp(min, max, v);
@@ -368,6 +376,7 @@ namespace InsideDev
         // returns true on Enter
         public bool TextField(string id, ref string value, float w = -1)
         {
+            if (focus == id) focusSeenFrame = Time.frameCount;
             var r = Place(w, LineH);
             if (!Visible(r)) return false;
             bool focused = focus == id;
@@ -389,7 +398,8 @@ namespace InsideDev
                 }
                 foreach (char ch in EditorInput.chars)
                 {
-                    if (EditorInput.ctrl && ch != '\b') continue;   // Ctrl+letter shortcuts are not text
+                    // Ctrl+letter shortcuts are not text; AltGr arrives as Ctrl+Alt and types @ [ ] { } \ | ~ on many layouts
+                    if (EditorInput.ctrl && !EditorInput.alt && ch != '\b') continue;
                     if (ch == '\b') { if (value.Length > 0) value = value.Substring(0, value.Length - 1); }
                     else if (ch == '\n' || ch == '\r') enter = true;
                     else if (ch == '`' || ch == 27) { }
@@ -399,12 +409,28 @@ namespace InsideDev
             }
             string shown = value ?? "";
             float maxW = r.width - 10;
-            while (shown.Length > 0 && d.Measure(shown) > maxW) shown = shown.Substring(1);
+            if (shown.Length > 0)
+            {
+                // a text longer than the field shows its end; the cut is searched once per text and width, not every frame
+                if (ReferenceEquals(tailFor, shown) && tailW == maxW) shown = tailText;
+                else if (d.Measure(shown) > maxW)
+                {
+                    int lo = 1, hi = shown.Length;
+                    while (lo < hi)
+                    {
+                        int mid = (lo + hi) / 2;
+                        if (d.Measure(shown.Substring(mid)) > maxW) lo = mid + 1; else hi = mid;
+                    }
+                    tailFor = shown; tailW = maxW; tailText = shown = shown.Substring(lo);
+                }
+            }
             d.PushClip(r);
             d.Text(r.x + 4, r.y + 3, shown + (focused && (Time.realtimeSinceStartup % 1f) < 0.55f ? "|" : ""), Txt);
             d.PopClip();
             return enter;
         }
+
+        string tailFor, tailText; float tailW;
 
         // ---------------------------------------------------------------- scroll regions
         string scrollId;
@@ -461,6 +487,8 @@ namespace InsideDev
         // Virtualized list: only rows intersecting the viewport are laid out. `pitch` = default row height; rows that
         // wrap onto more lines are measured when drawn and keep their real height (variable-height rows).
         readonly Dictionary<string, List<float>> vlHeights = new Dictionary<string, List<float>>();
+        // a row that throws is logged at most once a second per list (it would throw again for every row, every frame)
+        readonly Dictionary<string, float> vlErrorAt = new Dictionary<string, float>();
         public void VirtualList(string id, int count, float pitch, float height, Action<int> row)
         {
             List<float> hs;
@@ -475,7 +503,13 @@ namespace InsideDev
             for (; i < count && y < bottom; i++)
             {
                 cy = top + y; float c0 = cy;
-                try { row(i); } catch (Exception e) { if (inRow) EndRow(); DevLog.Error("virtual list row", e); }
+                try { row(i); }
+                catch (Exception e)
+                {
+                    if (inRow) EndRow();
+                    float last, now = Time.realtimeSinceStartup;
+                    if (!vlErrorAt.TryGetValue(id, out last) || now - last > 1f) { vlErrorAt[id] = now; DevLog.Error("virtual list row (" + id + ")", e); }
+                }
                 if (inRow) EndRow();
                 float h = cy - c0; if (h <= 0.5f) h = pitch;
                 hs[i] = h; y += h;
@@ -494,7 +528,7 @@ namespace InsideDev
         {
             var r = Place(w, LineH);
             if (!Visible(r)) return v;
-            Log("[drag] " + id, r);
+            if (recordWidgets) Log("[drag] " + id, r);
             string key = "dv:" + id;
             bool active = activeDrag == key;
             bool hot = Hover(r);
@@ -518,6 +552,9 @@ namespace InsideDev
         public float ScrollOf(string id) { float s; return scrolls.TryGetValue(id, out s) ? s : 0f; }
         // true when the last placed widget/row rect is under the mouse (used for hover highlighting)
         public bool LastHover { get { return lastRect.Contains(mouse) && AreaHot; } }
+        // the same, but only where the widget can be seen and clicked: inside the current clip (a list row that is half
+        // scrolled out) and with no drag going on
+        public bool LastHoverVisible { get { return AreaHot && activeDrag == null && lastRect.Contains(mouse) && ClipNow.Contains(mouse); } }
 
         // ---------------------------------------------------------------- splitters
         // draggable bar; returns the drag delta along its axis this frame (0 if not dragging)

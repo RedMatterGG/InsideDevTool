@@ -13,13 +13,17 @@ namespace InsideDev
     //  * components that read the music position directly (rotating covers, elevator, voice reactions...)
     //  * PlayMaker WaitForMusicTime / WaitForMusicCueOrMarker / WaitForBeat (via AudioLinks)
     // For each timer: live countdown, fire log, Fire now (retime just ahead), Mute (never fires), retime slider.
+    // The list is kept up to date and firings are logged only while somebody uses the tool (Background.Timed, the Audio
+    // tab, a command) or with editor.cfg audio.timed=always; asleep it costs one test per frame.
     public static class AudioTimed
     {
         public class Timer
         {
             public string field;
             public MusicEventChecker chk;
-            public float original;
+            public MonoBehaviour owner;     // the component that holds the checker
+            public float original;          // the time it fires at (follows every edit, also undo and the Inspector)
+            public float game;              // the time the game gave it when it was first seen
             public bool muted;
             public float forcedUntil = -1;
             public float lastFired = -1;
@@ -34,9 +38,20 @@ namespace InsideDev
         }
 
         public static readonly List<Sys> systems = new List<Sys>();
+        // number of completed scans (the catalog records after each one)
+        public static int ScanCount;
         static readonly Dictionary<Type, FieldInfo[]> checkerFields = new Dictionary<Type, FieldInfo[]>();
-        static float nextScan; static int scannedStream = -1;
+        static readonly Dictionary<Type, FieldInfo[]> tunableFields = new Dictionary<Type, FieldInfo[]>();
+        static readonly Dictionary<int, Sys> oldById = new Dictionary<int, Sys>();
+        static readonly List<Timer> forcedTimers = new List<Timer>();
+        static HashSet<string> timedTypeNames;
+        static int scannedStream = -1, needPass;
+        static bool everScanned, pending;
+        static float pendingSince, retryAt;
+        static int mode = -1;   // 0 auto, 1 always
         static readonly CultureInfo IC = CultureInfo.InvariantCulture;
+        // seconds the background scan waits for a fresh object database pass before it searches the engine itself
+        const float DatabaseWait = 10f;
 
         // types that read the music position without a MusicEventChecker (found in the decompiled code)
         static readonly Dictionary<string, string> known = new Dictionary<string, string>
@@ -60,41 +75,106 @@ namespace InsideDev
             { "MusicTimeTest", "Dev test: music time" },
         };
 
+        public static void ReloadConfig() { mode = -1; }
+
+        // somebody looks at the timed systems (panel, command, client, the catalog), or the user asked for it for good
+        static bool Awake
+        {
+            get
+            {
+                if (mode < 0) mode = EditorState.Get("audio.timed", "auto") == "always" ? 1 : 0;
+                return mode == 1 || AudioCatalog.Always || Background.WantedOrInUse(Background.Timed) || Background.Wanted(Background.Catalog);
+            }
+        }
+
+        // force: search the engine now (a command, the Rescan button, a catalog job). Otherwise the background refresh: it runs
+        // once after a streaming change (new areas bring new music-timed systems) and takes its candidates from the object
+        // database, because Resources.FindObjectsOfTypeAll(MonoBehaviour) is a 10-20 ms search that leaves a large array behind.
         public static void Scan(bool force = false)
         {
-            // Phase 12: FindObjectsOfTypeAll(MonoBehaviour) costs 10-20 ms, so the background scan runs only when
-            // streaming changed (new areas bring new music-timed systems) or every 60 s; the Audio tab forces it
-            if (!force && Time.realtimeSinceStartup < nextScan && !Levels.Changed(ref scannedStream, 1f)) return;
-            nextScan = Time.realtimeSinceStartup + (force ? 1f : 60f);
-            // keep existing Timer objects (their mute/force state) for components that still exist
-            var old = new Dictionary<int, Sys>();
-            foreach (var s in systems) if (s.comp != null) old[s.comp.GetInstanceID()] = s;
+            if (force) { FullScan(); return; }
+            float now = Time.realtimeSinceStartup;
+            if (now < retryAt) return;
+            if (!DevCore.BackgroundOk) { if (pending) pendingSince = now; return; }
+            if (Levels.Changed(ref scannedStream, 1f) || (!everScanned && !pending))
+            {
+                if (!pending) pendingSince = now;
+                pending = true;
+                needPass = ObjectDatabase.completedPasses + (ObjectDatabase.Scanning ? 2 : 1);
+            }
+            if (!pending) return;
+            if (ObjectDatabase.completedPasses >= needPass) { ScanRecords(); return; }
+            if (now - pendingSince > DatabaseWait) { FullScan(); return; }
+            ObjectDatabase.Demand(2f);
+            Background.Want(Background.Objects, 2f);
+        }
+
+        static void BeginScan()
+        {
+            // keep existing Timer objects (their fire counts and forced state) for components that still exist
+            oldById.Clear();
+            foreach (var s in systems) if (s.comp != null) oldById[s.comp.GetInstanceID()] = s;
             systems.Clear();
+        }
+
+        static void EndScan()
+        {
+            oldById.Clear();
+            systems.Sort((a, b) => string.CompareOrdinal(a.typeName, b.typeName));
+            everScanned = true; pending = false;
+            scannedStream = Levels.StreamVersion;
+            ScanCount++;
+            foreach (var s in systems) foreach (var tm in s.timers) Sync(tm);
+        }
+
+        static void FullScan()
+        {
+            BeginScan();
             try
             {
                 // FindObjectsOfTypeAll also returns components on inactive (hidden) objects and disabled components
-                foreach (var o in Resources.FindObjectsOfTypeAll(typeof(MonoBehaviour)))
-                {
-                    var mb = o as MonoBehaviour;
-                    if (mb == null || mb.hideFlags != HideFlags.None || mb.gameObject.hideFlags != HideFlags.None) continue;
-                    var t = mb.GetType();
-                    var fields = CheckerFields(t);
-                    string desc;
-                    bool isKnown = known.TryGetValue(t.Name, out desc);
-                    if (fields.Length == 0 && !isKnown) continue;
-                    Sys prev;
-                    if (old.TryGetValue(mb.GetInstanceID(), out prev)) { systems.Add(prev); continue; }
-                    var sys = new Sys { comp = mb, typeName = t.Name, desc = desc ?? "Has music-time triggers" };
-                    foreach (var f in fields)
-                    {
-                        var c = f.GetValue(mb) as MusicEventChecker;
-                        if (c != null) sys.timers.Add(new Timer { field = f.Name, chk = c, original = c.eventTime_s });
-                    }
-                    systems.Add(sys);
-                }
-                systems.Sort((a, b) => string.CompareOrdinal(a.typeName, b.typeName));
+                foreach (var o in Resources.FindObjectsOfTypeAll(typeof(MonoBehaviour))) Consider(o as MonoBehaviour);
+                EndScan();
             }
-            catch (Exception e) { DevLog.Error("AudioTimed.Scan", e); nextScan = Time.realtimeSinceStartup + 30f; }
+            catch (Exception e) { DevLog.Error("AudioTimed.Scan", e); pending = false; retryAt = Time.realtimeSinceStartup + 30f; }
+        }
+
+        static void ScanRecords()
+        {
+            BeginScan();
+            try
+            {
+                var names = TimedTypeNames();
+                foreach (var r in ObjectDatabase.all)
+                {
+                    var comps = r.comps;
+                    bool hit = false;
+                    for (int i = 0; i < comps.Length; i++) if (names.Contains(comps[i])) { hit = true; break; }
+                    if (!hit || r.go == null) continue;
+                    foreach (var mb in r.go.GetComponents<MonoBehaviour>()) Consider(mb);
+                }
+                EndScan();
+            }
+            catch (Exception e) { DevLog.Error("AudioTimed.Scan", e); pending = false; retryAt = Time.realtimeSinceStartup + 30f; }
+        }
+
+        static void Consider(MonoBehaviour mb)
+        {
+            if (mb == null || mb.hideFlags != HideFlags.None || mb.gameObject.hideFlags != HideFlags.None) return;
+            var t = mb.GetType();
+            var fields = CheckerFields(t);
+            string desc;
+            bool isKnown = known.TryGetValue(t.Name, out desc);
+            if (fields.Length == 0 && !isKnown) return;
+            Sys prev;
+            if (oldById.TryGetValue(mb.GetInstanceID(), out prev)) { systems.Add(prev); return; }
+            var sys = new Sys { comp = mb, typeName = t.Name, desc = desc ?? "Has music-time triggers" };
+            foreach (var f in fields)
+            {
+                var c = f.GetValue(mb) as MusicEventChecker;
+                if (c != null) sys.timers.Add(new Timer { field = f.Name, chk = c, owner = mb, original = c.eventTime_s, game = c.eventTime_s });
+            }
+            systems.Add(sys);
         }
 
         static FieldInfo[] CheckerFields(Type t)
@@ -110,51 +190,135 @@ namespace InsideDev
             return r;
         }
 
+        // Names of the component types a scan looks for: the known ones and every game script that holds (or inherits) a
+        // MusicEventChecker field. Built once from the game's assemblies; the object database stores type names per object.
+        static HashSet<string> TimedTypeNames()
+        {
+            if (timedTypeNames != null) return timedTypeNames;
+            var set = new HashSet<string>(known.Keys);
+            var declares = new Dictionary<Type, bool>();
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type[] types;
+                try
+                {
+                    if (!asm.GetName().Name.StartsWith("Assembly-CSharp", StringComparison.Ordinal)) continue;
+                    types = asm.GetTypes();
+                }
+                catch (ReflectionTypeLoadException e) { types = e.Types; }
+                catch { continue; }
+                foreach (var t in types)
+                {
+                    if (t == null || !typeof(MonoBehaviour).IsAssignableFrom(t)) continue;
+                    for (var ty = t; ty != null && ty != typeof(MonoBehaviour); ty = ty.BaseType)
+                    {
+                        bool d;
+                        if (!declares.TryGetValue(ty, out d))
+                        {
+                            try
+                            {
+                                foreach (var f in ty.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+                                    if (f.FieldType == typeof(MusicEventChecker)) { d = true; break; }
+                            }
+                            catch { }
+                            declares[ty] = d;
+                        }
+                        if (d) { set.Add(t.Name); break; }
+                    }
+                }
+            }
+            timedTypeNames = set;
+            return set;
+        }
+
         static MusicManager Music { get { try { return PersistentBehaviour<GlobalAudio>.instance.music; } catch { return null; } } }
+
+        // The game's own value is the truth: an undo, a mod or the Inspector may have written the time meanwhile.
+        static void Sync(Timer tm)
+        {
+            if (tm.forcedUntil > 0) return;
+            float cur = tm.chk.eventTime_s;
+            if (float.IsNaN(cur)) tm.muted = true;
+            else { tm.muted = false; tm.original = cur; }
+        }
 
         // LateUpdate: owners call checker.Update() in their Update, so the flag is visible now
         public static void LateUpdate()
         {
-            if (DevCore.BackgroundOk) Scan();   // background refresh (every 60 s or after streaming) so TIMED firings are logged even when the tab is closed
+            if (forcedTimers.Count > 0) RestoreForced();
+            if (!Awake) return;
+            Scan();   // background refresh after a streaming change, so TIMED firings are logged while the tab is closed
             float now = Time.realtimeSinceStartup;
-            foreach (var s in systems)
+            for (int si = 0; si < systems.Count; si++)
             {
+                var s = systems[si];
                 if (s.comp == null) continue;
-                foreach (var tm in s.timers)
+                for (int ti = 0; ti < s.timers.Count; ti++)
                 {
+                    var tm = s.timers[ti];
                     bool fired = false;
                     try { fired = tm.chk.didEventOccurThisUpdate; } catch { }
                     if (fired)
                     {
                         tm.lastFired = now; tm.fireCount++;
-                        AudioSpy.AddTimed(s.typeName + "." + tm.field + " @" + tm.original.ToString("0.00", IC) + "s", s.comp.gameObject.name, Outgoing(s.comp.gameObject));
-                        if (tm.forcedUntil > 0) { tm.chk.SetEventTime(tm.muted ? float.NaN : tm.original); tm.forcedUntil = -1; }
+                        if (AudioSpy.Listening) AudioSpy.AddTimed(s.typeName + "." + tm.field + " @" + tm.original.ToString("0.00", IC) + "s", s.comp.gameObject.name, Outgoing(s.comp.gameObject));
                     }
-                    else if (tm.forcedUntil > 0 && now > tm.forcedUntil)
-                    {
-                        tm.chk.SetEventTime(tm.muted ? float.NaN : tm.original); tm.forcedUntil = -1;
-                    }
+                    Sync(tm);
                 }
+            }
+        }
+
+        // A timer retimed by "Fire now" goes back to its own time once it fired or after 1.5 s, also while nobody watches.
+        static void RestoreForced()
+        {
+            float now = Time.realtimeSinceStartup;
+            for (int i = forcedTimers.Count - 1; i >= 0; i--)
+            {
+                var tm = forcedTimers[i];
+                bool gone = tm.owner == null, fired = false;
+                if (!gone) { try { fired = tm.chk.didEventOccurThisUpdate; } catch { } }
+                if (!gone && !fired && now <= tm.forcedUntil) continue;
+                if (!gone) tm.chk.SetEventTime(tm.muted ? float.NaN : tm.original);
+                tm.forcedUntil = -1;
+                forcedTimers.RemoveAt(i);
             }
         }
 
         public static void FireNow(Timer tm)
         {
             var m = Music; if (m == null) return;
+            Sync(tm);
             float pos = m.GetMusicPosition_s();
             float loop = m.GetLoopLength_s();
             float t = pos + 0.12f;
             if (loop > 0.2f) t = Mathf.Repeat(t, loop);
             tm.chk.SetEventTime(t);
             tm.forcedUntil = Time.realtimeSinceStartup + 1.5f;
-            DevLog.Write("audio-timed: forcing " + tm.field + " (was @" + tm.original.ToString("0.00", IC) + "s)");
+            if (!forcedTimers.Contains(tm)) forcedTimers.Add(tm);
+            DevLog.Write("audio-timed: forcing " + tm.field + " (was @" + (tm.muted ? "MUTED" : tm.original.ToString("0.00", IC) + "s") + ")");
         }
 
-        public static void SetMuted(Timer tm, bool mute)
+        // the change goes into the history (undo, revert all, record as mod) as a field edit of the owner component
+        static void BeforeEdit(Timer tm, string source)
         {
+            if (tm.owner != null) ChangeRecorder.BeforeField(tm.owner, tm.field + ".eventTime_s", source);
+        }
+
+        public static void SetMuted(Timer tm, bool mute) { SetMuted(tm, mute, "audio"); }
+        public static void SetMuted(Timer tm, bool mute, string source)
+        {
+            Sync(tm);
+            if (tm.forcedUntil <= 0) { BeforeEdit(tm, source); tm.chk.SetEventTime(mute ? float.NaN : tm.original); }
             tm.muted = mute;
-            tm.chk.SetEventTime(mute ? float.NaN : tm.original);
             DevLog.Write("audio-timed: " + tm.field + (mute ? " muted (will never fire)" : " restored"));
+        }
+
+        // new time in seconds; also ends a mute
+        public static void SetTime(Timer tm, float seconds, string source)
+        {
+            if (tm.forcedUntil <= 0) { BeforeEdit(tm, source); tm.chk.SetEventTime(seconds); }
+            tm.muted = false;
+            tm.original = seconds;
         }
 
         public static string Outgoing(GameObject go)
@@ -178,9 +342,61 @@ namespace InsideDev
         static readonly Dictionary<string, string> exact = new Dictionary<string, string>();
         static readonly HashSet<string> openAreas = new HashSet<string>();
         static string filter = "";
+        // lists of the catalog part, rebuilt when the catalog or the filter changes
+        static readonly Dictionary<string, int> subIdx = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        static int subIdxCount = -1;
+        static readonly List<string> catAreas = new List<string>();
+        static readonly Dictionary<string, List<AudioCatalog.Entry>> catShown = new Dictionary<string, List<AudioCatalog.Entry>>();
+        static int catVersion = -1, catTotal;
+        static string catFilter;
+
+        static FieldInfo[] Tunable(Type t)
+        {
+            FieldInfo[] r;
+            if (tunableFields.TryGetValue(t, out r)) return r;
+            var list = new List<FieldInfo>();
+            foreach (var fi in t.GetFields(BindingFlags.Instance | BindingFlags.Public))
+            {
+                if (fi.FieldType != typeof(float) && fi.FieldType != typeof(int)) continue;
+                string n = fi.Name.ToLowerInvariant();
+                if (n.Contains("cycle") || n.Contains("offset") || n.Contains("time") || n.Contains("speed") || n.Contains("strength")) list.Add(fi);
+            }
+            r = list.ToArray();
+            tunableFields[t] = r;
+            return r;
+        }
+
+        static void BuildCatalogLists(string f)
+        {
+            if (G.SavepointsReady && SavepointManager.SubsceneCount != subIdxCount)
+            {
+                subIdxCount = SavepointManager.SubsceneCount;
+                subIdx.Clear();
+                for (int i = 0; i < subIdxCount; i++) { string b = SavepointManager.GetSubsceneName(i).TrimStart('#'); if (!subIdx.ContainsKey(b)) subIdx[b] = i; }
+            }
+            if (catVersion == AudioCatalog.Version && catFilter == f) return;
+            catVersion = AudioCatalog.Version; catFilter = f;
+            catAreas.Clear(); catShown.Clear(); catTotal = 0;
+            foreach (var kv in AudioCatalog.byArea)
+            {
+                catTotal += kv.Value.Count;
+                List<AudioCatalog.Entry> shown = kv.Value;
+                if (f.Length > 0 && !kv.Key.ToLowerInvariant().Contains(f))
+                {
+                    shown = new List<AudioCatalog.Entry>();
+                    foreach (var e in kv.Value) if ((e.obj + " " + e.detail).ToLowerInvariant().Contains(f)) shown.Add(e);
+                }
+                if (shown.Count == 0) continue;
+                catAreas.Add(kv.Key);
+                catShown[kv.Key] = shown;
+            }
+            catAreas.Sort(StringComparer.OrdinalIgnoreCase);
+        }
 
         public static void Draw(UI ui, DevCore core)
         {
+            Background.Want(Background.Timed, 5f);
+            Background.Want(Background.Catalog, 5f);
             Scan();
             AudioLinks.Scan();
             var m = Music;
@@ -246,12 +462,12 @@ namespace InsideDev
                         if (ui.Button("set", 40) || enter)
                         {
                             float v;
-                            if (float.TryParse(txt, NumberStyles.Float, IC, out v)) { tm.original = v; tm.chk.SetEventTime(v); exact.Remove(key); DevLog.Write("audio-timed: " + tm.field + " -> " + v.ToString("0.###", IC) + "s"); }
+                            if (Fmt.TryF(txt, out v)) { SetTime(tm, v, "audio"); exact.Remove(key); DevLog.Write("audio-timed: " + tm.field + " -> " + v.ToString("0.###", IC) + "s"); }
                         }
                         if (loop > 0.2f)
                         {
                             float nv = ui.Slider(key + "s", Mathf.Clamp(tm.original, 0f, loop), 0f, loop, ui.Width - 10);
-                            if (Mathf.Abs(nv - Mathf.Clamp(tm.original, 0f, loop)) > 0.01f) { tm.original = nv; tm.chk.SetEventTime(nv); exact.Remove(key); }
+                            if (Mathf.Abs(nv - Mathf.Clamp(tm.original, 0f, loop)) > 0.01f) { SetTime(tm, nv, "audio"); exact.Remove(key); }
                         }
                         ui.EndRow();
                     }
@@ -259,11 +475,8 @@ namespace InsideDev
                 string outs = Outgoing(s.comp.gameObject);
                 if (outs.Length > 0) ui.Label("      signals: " + outs, new Color(1f, 0.75f, 0.35f, 1f));
                 // tunable public floats (cycle lengths, offsets, speeds)
-                foreach (var fi in s.comp.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public))
+                foreach (var fi in Tunable(s.comp.GetType()))
                 {
-                    if (fi.FieldType != typeof(float) && fi.FieldType != typeof(int)) continue;
-                    string n = fi.Name.ToLowerInvariant();
-                    if (!(n.Contains("cycle") || n.Contains("offset") || n.Contains("time") || n.Contains("speed") || n.Contains("strength"))) continue;
                     ui.BeginRow();
                     ui.Label("      " + fi.Name + " = " + Convert.ToString(fi.GetValue(s.comp), IC), UI.Dim, 280);
                     if (ui.Button("-", 24)) Nudge(s.comp, fi, -1);
@@ -286,32 +499,24 @@ namespace InsideDev
                 if (w.isCue) { if (ui.Button("Inject cue", 90)) AudioSpy.InjectCue(w.any || string.IsNullOrEmpty(w.cue) ? "__any__" : w.cue); }
                 else if (w.isBeat) { if (ui.Button("Inject beat", 90)) AudioSpy.InjectBeat(); }
                 else ui.Space(94);
-                if (ui.Button("Send event", 90)) { DevLog.Write("fsm " + w.fsm.gameObject.name + " <- " + w.finishEvent); w.fsm.SendEvent(w.finishEvent); }
+                if (ui.Button("Send event", 90)) { DevLog.Write("fsm " + w.fsm.gameObject.name + " <- " + w.finishEvent); ChangeRecorder.Action(w.fsm.gameObject, "fsmEvent", w.fsm.FsmName, w.finishEvent, "audio"); w.fsm.SendEvent(w.finishEvent); }
                 if (ui.Item(head + (live ? "   <- WAITING NOW" : "") + "   [" + AudioCatalog.AreaOf(w.fsm.gameObject) + "]", live ? new Color(0.5f, 1f, 0.6f, 1f) : UI.Txt)) core.SelectInInspector(w.fsm.gameObject);
                 ui.EndRow();
             }
 
             // ---- whole game (catalog)
             AudioCatalog.Load();
+            BuildCatalogLists(f);
             ui.Space(12);
             ui.BeginRow();
-            int total = 0; foreach (var kv in AudioCatalog.byArea) total += kv.Value.Count;
-            ui.Label("ALL AREAS (catalog): " + AudioCatalog.byArea.Count + " area(s), " + total + " audio trigger(s) recorded", new Color(1f, 0.85f, 0.3f, 1f), ui.Width - 330);
+            ui.Label("ALL AREAS (catalog): " + AudioCatalog.byArea.Count + " area(s), " + catTotal + " audio trigger(s) recorded", new Color(1f, 0.85f, 0.3f, 1f), ui.Width - 330);
             if (Discovery.Busy) { ui.Label(Discovery.status, new Color(1f, 0.85f, 0.4f, 1f), 250); if (ui.Button("Cancel", 60)) Discovery.Cancel(); }
             else if (ui.Button("Catalog all areas", 150)) AudioCatalog.CatalogAll();
             ui.EndRow();
-            ui.Label("Areas get recorded automatically as you play; 'Catalog all areas' loads each area once (takes a few minutes) so the list covers the whole game.", UI.Dim);
-            var subIdx = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            if (G.SavepointsReady) for (int i = 0; i < SavepointManager.SubsceneCount; i++) { string b = SavepointManager.GetSubsceneName(i).TrimStart('#'); if (!subIdx.ContainsKey(b)) subIdx[b] = i; }
-            var areas = new List<string>(AudioCatalog.byArea.Keys);
-            areas.Sort(StringComparer.OrdinalIgnoreCase);
-            foreach (var area in areas)
+            ui.Label("Areas you play through are added while the editor is in use; 'Catalog all areas' loads each area once (takes a few minutes) so the list covers the whole game.", UI.Dim);
+            foreach (var area in catAreas)
             {
-                var list = AudioCatalog.byArea[area];
-                bool areaMatch = f.Length == 0 || area.ToLowerInvariant().Contains(f);
-                var shown = new List<AudioCatalog.Entry>();
-                foreach (var e in list) if (areaMatch || (e.obj + " " + e.detail).ToLowerInvariant().Contains(f)) shown.Add(e);
-                if (shown.Count == 0) continue;
+                var shown = catShown[area];
                 bool isOpen = openAreas.Contains(area) || f.Length > 0;
                 int sub;
                 bool hasSub = subIdx.TryGetValue(area, out sub);
@@ -330,11 +535,12 @@ namespace InsideDev
             ui.EndScroll();
         }
 
-        static void Nudge(object o, FieldInfo fi, int dir)
+        static void Nudge(MonoBehaviour o, FieldInfo fi, int dir)
         {
+            ChangeRecorder.BeforeField(o, fi.Name, "audio");
             if (fi.FieldType == typeof(int)) fi.SetValue(o, (int)fi.GetValue(o) + dir);
             else { float v = (float)fi.GetValue(o); float step = Mathf.Max(0.05f, Mathf.Abs(v) * 0.1f); fi.SetValue(o, v + dir * step); }
-            DevLog.Write("set " + fi.DeclaringType.Name + "." + fi.Name + " = " + fi.GetValue(o));
+            DevLog.Write("set " + fi.DeclaringType.Name + "." + fi.Name + " = " + Fmt.Any(fi.GetValue(o)));
         }
     }
 }

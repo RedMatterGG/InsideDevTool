@@ -23,8 +23,17 @@ namespace InsideDev
         public readonly Vector3[] w = new Vector3[8];   // world corners, or w[0] = sphere centre
         public float wr;         // sphere radius (world)
         public Bounds b;
+        public Vector3 bc, be;   // centre and extents of b
+        public float br;         // length of be
         public bool alive, active, on;
         public int checkAt;
+        public string label;     // overlay label text, built when it is first drawn and again when 'on' changes
+        public bool labelOn;
+        public string[] typeList;   // the component type names behind types, for short and full labels
+        public string labelFull;    // label with every component, wrapped, for the selected object
+        public int labelTypes = -2; // overlay.label.types value the label was built with
+        public float labelW;        // width of label in pixels at the label size
+        public int hop, hopStamp = -1;   // hop distance from the selection, valid while hopStamp matches the overlay's
     }
 
     // World overlay: trigger/collider wireframes, labels, savepoint markers.
@@ -33,6 +42,8 @@ namespace InsideDev
     // object, shape, world corners and bounds and asks the engine (alive, active, enabled, transform) only every
     // CheckEvery frames, staggered; frustum culling and the projection run in C# from one view-projection matrix per
     // frame (WorldToScreenPoint per line end was 24 engine calls per box). A rescan classifies new colliders only.
+    // The choices (what is shown, filter, distance) are kept in editor.cfg: LoadChoices at start, SaveChoices whenever
+    // the user changes one. Code that hides the overlay for a while (clean frames) sets the fields and does not save.
     public class Overlay
     {
         public bool showTriggers = true;
@@ -54,7 +65,15 @@ namespace InsideDev
         public bool showLabels = true;
         // label level: 0 off, 1 selected object only, 2 near the boy (15 m), 3 all visible
         public int labelLevel = 3;
+        int lastLabelLevel = 3;
         public static readonly string[] LabelLevels = { "OFF", "SELECTED", "NEARBY", "ALL" };
+        public void SetLabelLevel(int level)
+        {
+            labelLevel = Mathf.Clamp(level, 0, 3); showLabels = labelLevel > 0;
+            if (labelLevel > 0) lastLabelLevel = labelLevel;
+        }
+        // labels on = the level used last (ALL at first), off = OFF
+        public void SetLabels(bool on) { SetLabelLevel(on ? (labelLevel > 0 ? labelLevel : lastLabelLevel) : 0); }
         // Phase B: relationship scope around the selection. In-scope objects are drawn normally, everything else faint.
         // 0 SELECTED, 1 SELECTED + 1 HOP (default), 2 SELECTED + 2 HOPS, 3 NEARBY (15 m of the boy), 4 ALL
         public int scope = 1;
@@ -69,14 +88,64 @@ namespace InsideDev
         public bool showDisabled = true;
         public List<DevCore.HiddenEntry> hiddenEntries;
 
+        // ---------------------------------------------------------------- persisted choices (editor.cfg)
+        public static void DescribeKeys()
+        {
+            EditorState.Describe("core", "overlay.triggers", "1", "world overlay: trigger volumes drawn (F2 cycles the categories, then off)");
+            EditorState.Describe("core", "overlay.filter", "all", "world overlay: trigger category shown: all, trigger, save, camera, kill, audio, logic, water, fx or stream");
+            EditorState.Describe("core", "overlay.solids", "0", "world overlay: solid colliders drawn (F3)");
+            EditorState.Describe("core", "overlay.labels", "3", "world overlay: label level 0 off, 1 selected, 2 near the boy, 3 all (F4)");
+            EditorState.Describe("core", "overlay.label.types", "3", "world overlay: component names in a label, the rest as +N (0 only the count, -1 all); the selected object always shows all");
+            EditorState.Describe("core", "overlay.scope", "1", "world overlay: scope around the selection 0 selected, 1 one hop, 2 two hops, 3 near the boy, 4 all (Shift+F4)");
+            EditorState.Describe("core", "overlay.savepoints", "1", "world overlay: savepoint markers drawn (F6)");
+            EditorState.Describe("core", "overlay.links", "1", "world overlay: lines from the selection to its related objects");
+            EditorState.Describe("core", "overlay.distance", "60", "world overlay: draw distance from the camera in metres (5 to 300)");
+            EditorState.Describe("core", "overlay.hidden", "0", "world overlay: markers on switched-off objects (F10); keeps the object scan running");
+        }
+
+        public void LoadChoices()
+        {
+            SetLabelLevel(EditorState.Get("overlay.labels", 3));
+            labelTypes = Mathf.Clamp(EditorState.Get("overlay.label.types", 3), -1, 50);
+            scope = Mathf.Clamp(EditorState.Get("overlay.scope", 1), 0, 4);
+            showTriggers = EditorState.Get("overlay.triggers", true);
+            string kind = EditorState.Get("overlay.filter", "all");
+            triggerFilter = 0;
+            for (int i = 1; i < triggerFilterKinds.Length; i++) if (triggerFilterKinds[i] == kind) triggerFilter = i;
+            showSolids = EditorState.Get("overlay.solids", false);
+            showSavepoints = EditorState.Get("overlay.savepoints", true);
+            showLinks = EditorState.Get("overlay.links", true);
+            maxDistance = Mathf.Clamp(EditorState.Get("overlay.distance", 60f), 5f, 300f);
+            showHidden = EditorState.Get("overlay.hidden", false);
+        }
+
+        // call after the user changed a choice; a key whose value did not change is not written. While clean frames are
+        // on the fields hold their temporary "everything hidden" state, which must not reach the file.
+        public void SaveChoices()
+        {
+            if (MultiCamClean.on) return;
+            EditorState.Set("overlay.labels", labelLevel);
+            EditorState.Set("overlay.scope", scope);
+            EditorState.Set("overlay.triggers", showTriggers);
+            EditorState.Set("overlay.filter", triggerFilterKinds[triggerFilter] ?? "all");
+            EditorState.Set("overlay.solids", showSolids);
+            EditorState.Set("overlay.savepoints", showSavepoints);
+            EditorState.Set("overlay.links", showLinks);
+            EditorState.Set("overlay.distance", Mathf.Round(maxDistance));
+            EditorState.Set("overlay.hidden", showHidden);
+        }
+
         public readonly List<ColliderEntry> entries = new List<ColliderEntry>();
         readonly Dictionary<int, ColliderEntry> known = new Dictionary<int, ColliderEntry>();
-        float nextRefresh; int seenStream = -1;
-        Plane[] planes;
+        readonly HashSet<int> seenIds = new HashSet<int>();
+        readonly List<int> goneIds = new List<int>();
+        readonly StringBuilder typesSb = new StringBuilder();
+        float nextRefresh, refreshedAt = -1e9f; int seenStream = -1;
+        bool wasInUse;
         Camera cam;
         Matrix4x4 vp;
         Rect pr;
-        float sh;
+        float sh, sw;
         readonly Vector4[] fpl = new Vector4[6];
         readonly Vector3[] proj = new Vector3[8];
         const int CheckEvery = 8;
@@ -95,13 +164,25 @@ namespace InsideDev
         static readonly Color cSolid = new Color(0.7f, 0.7f, 0.7f, 0.35f);
         static readonly Color cSpawn = new Color(0.2f, 1f, 1f, 1f);
 
+        // FindObjectsOfType(Collider) costs milliseconds. With no boxes to draw it does not run at all. Otherwise the list
+        // is refreshed when streaming changed, every second while the editor is open and every 10 s while the tool is in
+        // use; with nobody using the tool the timer is only a 30 s safety net for colliders the game switched on itself.
         public void Update()
         {
-            // Phase 12: FindObjectsOfType(Collider) every second only while the editor is open; with it closed the
-            // list is refreshed when streaming changes, or every 10 s
-            if (Time.realtimeSinceStartup >= nextRefresh || Levels.Changed(ref seenStream))
+            if (!showTriggers && !showSolids)
             {
-                nextRefresh = Time.realtimeSinceStartup + (Perf.editorOpen ? 1f : 10f);
+                if (entries.Count > 0 || known.Count > 0) { entries.Clear(); known.Clear(); }
+                nextRefresh = 0f;
+                return;
+            }
+            float now = Time.realtimeSinceStartup;
+            bool inUse = Perf.editorOpen || Background.InUse;
+            if (inUse && !wasInUse && now - refreshedAt > 10f) nextRefresh = 0f;   // somebody came back: bring the list up to date
+            wasInUse = inUse;
+            if (now >= nextRefresh || Levels.Changed(ref seenStream))
+            {
+                nextRefresh = now + (Perf.editorOpen ? 1f : inUse ? 10f : 30f);
+                refreshedAt = now;
                 try { Refresh(); } catch (Exception e) { DevLog.Error("Overlay.Refresh", e); }
             }
         }
@@ -113,8 +194,8 @@ namespace InsideDev
             entries.Clear();
             if (!showTriggers && !showSolids) { known.Clear(); return; }
             var all = UObj.FindObjectsOfType(typeof(Collider));
-            var sb = new StringBuilder();
-            var seen = new HashSet<int>();
+            var sb = typesSb;
+            var seen = seenIds; seen.Clear();
             foreach (var o in all)
             {
                 var c = o as Collider;
@@ -138,6 +219,7 @@ namespace InsideDev
                         sb.Append(tn);
                     }
                     e.types = sb.ToString();
+                    e.typeList = typeNames.ToArray();
                     Classify(e, typeNames);
                     Shape(e);
                     e.checkAt = 0;
@@ -145,7 +227,7 @@ namespace InsideDev
                 }
                 entries.Add(e);
             }
-            var gone = new List<int>();
+            var gone = goneIds; gone.Clear();
             foreach (var k in known.Keys) if (!seen.Contains(k)) gone.Add(k);
             foreach (var k in gone) known.Remove(k);
         }
@@ -177,30 +259,32 @@ namespace InsideDev
             e.active = e.go.activeInHierarchy;
             if (!e.active) return;
             e.on = c.enabled;
+            e.hopStamp = -1;   // the parent chain may have changed since the last check
             var t = e.t;
+            Bounds b;
             if (e.shape == 0)
             {
                 Vector3 h = e.ls * 0.5f;
                 for (int i = 0; i < 8; i++)
                     e.w[i] = t.TransformPoint(e.lc + new Vector3((i & 1) != 0 ? h.x : -h.x, (i & 2) != 0 ? h.y : -h.y, (i & 4) != 0 ? h.z : -h.z));
-                var bb = new Bounds(e.w[0], Vector3.zero);
-                for (int i = 1; i < 8; i++) bb.Encapsulate(e.w[i]);
-                e.b = bb;
-                return;
+                b = new Bounds(e.w[0], Vector3.zero);
+                for (int i = 1; i < 8; i++) b.Encapsulate(e.w[i]);
             }
-            if (e.shape == 1)
+            else if (e.shape == 1)
             {
                 Vector3 s = t.lossyScale;
                 e.wr = e.lr * Mathf.Max(Mathf.Abs(s.x), Mathf.Max(Mathf.Abs(s.y), Mathf.Abs(s.z)));
                 e.w[0] = t.TransformPoint(e.lc);
-                e.b = new Bounds(e.w[0], Vector3.one * e.wr * 2f);
-                return;
+                b = new Bounds(e.w[0], Vector3.one * e.wr * 2f);
             }
-            Bounds b;
-            try { b = c.bounds; } catch { e.alive = false; return; }
-            if (!e.on && b.size == Vector3.zero) b = new Bounds(t.position, t.lossyScale);
-            e.b = b;
-            for (int i = 0; i < 8; i++) e.w[i] = new Vector3((i & 1) != 0 ? b.max.x : b.min.x, (i & 2) != 0 ? b.max.y : b.min.y, (i & 4) != 0 ? b.max.z : b.min.z);
+            else
+            {
+                try { b = c.bounds; } catch { e.alive = false; return; }
+                if (!e.on && b.size == Vector3.zero) b = new Bounds(t.position, t.lossyScale);
+                Vector3 mn = b.min, mx = b.max;
+                for (int i = 0; i < 8; i++) e.w[i] = new Vector3((i & 1) != 0 ? mx.x : mn.x, (i & 2) != 0 ? mx.y : mn.y, (i & 4) != 0 ? mx.z : mn.z);
+            }
+            e.b = b; e.bc = b.center; e.be = b.extents; e.br = e.be.magnitude;
         }
 
         // category of one trigger collider, same rules as the overlay colours (for picking)
@@ -256,78 +340,129 @@ namespace InsideDev
         }
 
         // ---------------------------------------------------------------- drawing (called at end of frame)
+        // This runs every submitted frame with the default settings and the editor closed, so nothing in it allocates or
+        // asks the engine per collider: lists are reused, label and savepoint texts are kept, the scope hop is kept per
+        // entry, culling and projection run in C#.
         Draw d;
+        struct LabelAt { public float d; public Vector2 p; public ColliderEntry e; }
+        readonly List<LabelAt> labels = new List<LabelAt>(256);
+        static readonly Comparison<LabelAt> nearestCentreFirst = (a, b) => a.d.CompareTo(b.d);
+        const int MaxLabels = 60;
+        const float NearBoy = 15f;
+        bool boyKnown; Vector3 boyPos;
+
         public void Emit(Draw draw)
         {
             d = draw;
             visibleTriggers = visibleSolids = 0; inScopeCount = 0;
             RebuildHops();
-            if (!showTriggers && !showSolids && !showSavepoints) return;
+            var sel = Selection.Current;
+            bool hasSel = sel != null;
+            bool boxes = showTriggers || showSolids;
+            bool hiddenMarks = showHidden && hiddenEntries != null;
+            float now = Time.realtimeSinceStartup;
+            // hidden markers, the selection's lines and labels, Audio DB emitters and the graph hover line do not depend on
+            // the box toggles; with nothing at all to draw the camera is not even looked up
+            if (!boxes && !showSavepoints && !hiddenMarks && !hasSel && AudioDbPanel.Current == null && now - GraphView.HoverAt > 0.15f) return;
             cam = G.Cam();
             if (cam == null) return;
-            planes = GeometryUtility.CalculateFrustumPlanes(cam);
             vp = cam.projectionMatrix * cam.worldToCameraMatrix;
             pr = cam.pixelRect;
-            sh = Screen.height;
+            sh = Screen.height; sw = Screen.width;
             FrustumPlanes();
-
-            var labels = new List<KeyValuePair<Vector3, ColliderEntry>>();
             Vector3 camPos = cam.transform.position;
             int f = Time.frameCount;
-            foreach (var e in entries)
-            {
-                if (f >= e.checkAt) Check(e, f);
-                if (!e.alive || !e.active) continue;
-                if (!e.on && !showDisabled) continue;
-                if (e.trigger && triggerFilter != 0 && e.kind != triggerFilterKinds[triggerFilter]) continue;
-                var b = e.b;
-                if (!InFrustum(b)) continue;
-                if ((b.center - camPos).magnitude > maxDistance + b.extents.magnitude) continue;
-                if (e.trigger) visibleTriggers++; else visibleSolids++;
-                int hop = ScopeHop(e.go, b);
-                float a = e.on ? e.color.a : 0.3f;
-                if (hop < 0) a *= 0.18f; else inScopeCount++;
-                curColor = new Color(e.color.r, e.color.g, e.color.b, a);
-                DrawEntry(e);
-                if (showLabels && e.trigger && LabelWanted(e.col, b, hop)) labels.Add(new KeyValuePair<Vector3, ColliderEntry>(b.center, e));
-            }
-            if (showLinks) DrawLinks();
-            DrawAudioEmitters();
-            if (showSavepoints) DrawSavepoints();
-            if (showHidden && hiddenEntries != null) DrawHidden(camPos);
             var ch = G.MainCharacter;
-            if (ch != null)
+            boyKnown = (object)ch != null;
+            if (boyKnown) boyPos = ch.pos3;
+
+            labels.Clear();
+            if (boxes)
+            {
+                string kindFilter = triggerFilter != 0 ? triggerFilterKinds[triggerFilter] : null;
+                bool scoped = hasSel && scope != 4;
+                bool wantLabels = showLabels && labelLevel > 0;
+                for (int k = 0; k < entries.Count; k++)
+                {
+                    var e = entries[k];
+                    bool checkedNow = f >= e.checkAt;
+                    if (checkedNow) Check(e, f);
+                    if (!e.alive || !e.active) continue;
+                    if (!e.on && !showDisabled) continue;
+                    if (e.trigger && kindFilter != null && e.kind != kindFilter) continue;
+                    if (!InFrustum(e.bc, e.be)) continue;
+                    float reach = maxDistance + e.br;
+                    if ((e.bc - camPos).sqrMagnitude > reach * reach) continue;
+                    int hop = 0;
+                    if (scoped)
+                    {
+                        if (scope == 3) hop = boyKnown && Near(boyPos, e.bc, e.be) ? 0 : -1;
+                        else
+                        {
+                            if (e.hopStamp != hopStamp)
+                            {
+                                // the object may have been destroyed since its last check
+                                if (!checkedNow && e.col == null) { e.alive = false; continue; }
+                                e.hop = HopOf(e.t); e.hopStamp = hopStamp;
+                            }
+                            hop = e.hop;
+                        }
+                    }
+                    if (e.trigger) visibleTriggers++; else visibleSolids++;
+                    float a = e.on ? e.color.a : 0.3f;
+                    if (hop < 0) a *= 0.18f; else inScopeCount++;
+                    curColor = new Color(e.color.r, e.color.g, e.color.b, a);
+                    DrawEntry(e);
+                    if (wantLabels && e.trigger)
+                    {
+                        bool want = labelLevel == 3
+                                    || (labelLevel == 1 ? hasSel && (ReferenceEquals(e.go, sel) || (hop >= 0 && scope <= 2))
+                                                        : boyKnown && Near(boyPos, e.bc, e.be));
+                        if (want) AddLabel(e);
+                    }
+                }
+            }
+            if (hasSel && showLinks) DrawLinks(sel);
+            DrawGraphHover(now);
+            if (hasSel) DrawSelectionAudio(sel, now);
+            DrawAudioEmitters(now);
+            if (showSavepoints) DrawSavepoints(now);
+            if (hiddenMarks) DrawHidden(camPos, f);
+            if (boyKnown && (boxes || showSavepoints))
             {
                 curColor = Color.white;
-                var p = ch.pos3;
+                var p = boyPos;
                 Line(p + new Vector3(-0.4f, 0, 0), p + new Vector3(0.4f, 0, 0));
                 Line(p + new Vector3(0, -0.4f, 0), p + new Vector3(0, 0.4f, 0));
             }
-            if (labels.Count > 0) DrawLabels(labels);
+            if (labels.Count > 0) DrawLabels();
         }
 
         // ---------------------------------------------------------------- relationship scope
         // BFS over the reference index (both directions, noise edges skipped) from the selection.
+        readonly List<int> hopFrontier = new List<int>(), hopNext = new List<int>();
+        int hopStamp;
         void RebuildHops()
         {
             var sel = Selection.Current;
             int want = scope == 1 ? 1 : scope == 2 ? 2 : 0;
             if (hopVersion == Selection.Version && hopScope == scope && (hopEdges == ReferenceIndex.edges || Time.realtimeSinceStartup - hopAt < 2f)) return;
             hopVersion = Selection.Version; hopScope = scope; hopEdges = ReferenceIndex.edges; hopAt = Time.realtimeSinceStartup;
-            hopOf.Clear();
+            hopOf.Clear(); hopStamp++;
             if (sel == null) return;
             int start = sel.GetInstanceID();
             hopOf[start] = 0;
-            var frontier = new List<int> { start };
+            var frontier = hopFrontier; var next = hopNext;
+            frontier.Clear(); frontier.Add(start);
             for (int h = 1; h <= want && frontier.Count > 0 && hopOf.Count < 400; h++)
             {
-                var next = new List<int>();
+                next.Clear();
                 foreach (var id in frontier)
                 {
                     foreach (var e in ReferenceIndex.References(id)) if (!e.noise && e.dstGo != 0 && !hopOf.ContainsKey(e.dstGo)) { hopOf[e.dstGo] = h; next.Add(e.dstGo); }
                     foreach (var e in ReferenceIndex.Referencers(id)) if (!e.noise && e.srcGo != 0 && !hopOf.ContainsKey(e.srcGo)) { hopOf[e.srcGo] = h; next.Add(e.srcGo); }
                 }
-                frontier = next;
+                var swap = frontier; frontier = next; next = swap;
             }
         }
 
@@ -337,8 +472,12 @@ namespace InsideDev
         {
             var sel = Selection.Current;
             if (scope == 4 || sel == null) return 0;
-            if (scope == 3) { var ch = G.MainCharacter; return ch != null && (b.ClosestPoint(ch.pos3) - ch.pos3).sqrMagnitude < 15f * 15f ? 0 : -1; }
-            var t = g.transform;
+            if (scope == 3) { var ch = G.MainCharacter; return ch != null && Near(ch.pos3, b.center, b.extents) ? 0 : -1; }
+            return g != null ? HopOf(g.transform) : -1;
+        }
+
+        int HopOf(Transform t)
+        {
             for (int i = 0; i < 4 && t != null; i++, t = t.parent)
             {
                 int h;
@@ -347,12 +486,19 @@ namespace InsideDev
             return -1;
         }
 
-        // lines from the selection to the objects one/two hops away (world <-> graph sync)
-        void DrawLinks()
+        // a box (centre, extents) comes within NearBoy metres of the point
+        static bool Near(Vector3 p, Vector3 c, Vector3 ext)
         {
-            var sel = Selection.Current;
-            if (sel == null || hopOf.Count <= 1 || scope > 2) return;
+            float dx = Mathf.Max(0f, Mathf.Abs(p.x - c.x) - ext.x), dy = Mathf.Max(0f, Mathf.Abs(p.y - c.y) - ext.y), dz = Mathf.Max(0f, Mathf.Abs(p.z - c.z) - ext.z);
+            return dx * dx + dy * dy + dz * dz < NearBoy * NearBoy;
+        }
+
+        // lines from the selection to the objects one/two hops away (world <-> graph sync)
+        void DrawLinks(GameObject sel)
+        {
+            if (hopOf.Count <= 1 || scope > 2) return;
             Vector3 from = CenterOf(sel);
+            int selId = sel.GetInstanceID();
             int n = 0;
             foreach (var kv in hopOf)
             {
@@ -360,7 +506,7 @@ namespace InsideDev
                 var r = ObjectDatabase.Get(kv.Key);
                 if (r == null || r.go == null || !r.go.activeInHierarchy) continue;
                 n++;
-                bool fired = EventMonitor.FiredAge(sel.GetInstanceID(), kv.Key) < 2.5f || EventMonitor.FiredAge(kv.Key, sel.GetInstanceID()) < 2.5f;
+                bool fired = EventMonitor.FiredAge(selId, kv.Key) < 2.5f || EventMonitor.FiredAge(kv.Key, selId) < 2.5f;
                 curColor = fired ? new Color(0.3f, 1f, 0.4f, 0.95f) : kv.Value == 1 ? new Color(0.35f, 0.9f, 1f, 0.7f) : new Color(0.35f, 0.9f, 1f, 0.3f);
                 Line(from, CenterOf(r.go));
             }
@@ -369,39 +515,39 @@ namespace InsideDev
         // §89: the Wwise event selected in the Audio DB -> its emitters in the world (game references that are loaded
         // + every object that posted it this session); flashes green while it is playing
         // §88: the selection's own audio - what it posted this session and what its game data references
-        void DrawSelectionAudio()
+        readonly List<string> selAudioNames = new List<string>();
+        void DrawSelectionAudio(GameObject sel, float now)
         {
-            var sel = Selection.Current;
-            if (sel == null) return;
             int id = sel.GetInstanceID();
-            if (selAudioFor != id || Time.realtimeSinceStartup - selAudioAt > 1f)
+            if (selAudioFor != id || now - selAudioAt > 1f)
             {
-                selAudioFor = id; selAudioAt = Time.realtimeSinceStartup; selAudioLast = -1f;
-                var names = new List<string>();
+                selAudioFor = id; selAudioAt = now; selAudioLast = -1f;
+                var names = selAudioNames; names.Clear();
                 foreach (var p in AudioTrace.plays.Values)
                     if ((int)p.gameObj == id) { string n = AudioTrace.Name(p.eventId); if (!names.Contains(n) && names.Count < 4) names.Add(n); if (p.t > selAudioLast) selAudioLast = p.t; }
-                string path = Inspector.PathOf(sel.transform);
                 int refs = 0;
-                foreach (var r in AudioDb.refs.Values) if (r.path == path && r.prov != "OBSERVED") { refs++; if (!names.Contains(r.eventName) && names.Count < 6) names.Add(r.eventName); }
+                if (AudioDb.refs.Count > 0)
+                {
+                    string path = Inspector.PathOf(sel.transform);
+                    foreach (var r in AudioDb.refs.Values) if (r.path == path && r.prov != "OBSERVED") { refs++; if (!names.Contains(r.eventName) && names.Count < 6) names.Add(r.eventName); }
+                }
                 selAudioText = names.Count > 0 ? "audio: " + string.Join(", ", names.ToArray()) + (refs > 0 ? "  (" + refs + " in its data)" : "") : null;
             }
             if (selAudioText == null) return;
-            bool live = selAudioLast >= 0 && Time.realtimeSinceStartup - selAudioLast < 2f;
-            Vector3 sp = RenderScale.W2S(cam, CenterOf(sel));
-            if (sp.z > 0) d.ShadowText(sp.x + 8, Screen.height - sp.y + 8, selAudioText, live ? new Color(0.3f, 1f, 0.45f, 1f) : new Color(0.45f, 0.85f, 1f, 1f), 12);
+            bool live = selAudioLast >= 0 && now - selAudioLast < 2f;
+            Vector3 sp = Project(CenterOf(sel));
+            if (sp.z > 0) d.ShadowText(sp.x + 8, sh - sp.y + 8, selAudioText, live ? new Color(0.3f, 1f, 0.45f, 1f) : new Color(0.45f, 0.85f, 1f, 1f), 12);
         }
         int selAudioFor; float selAudioAt, selAudioLast = -1f; string selAudioText;
 
-        void DrawAudioEmitters()
+        void DrawAudioEmitters(float now)
         {
-            DrawGraphHover();
-            DrawSelectionAudio();
             var rec = AudioDbPanel.Current;
             if (rec == null || (rec.kind != AudioDb.Kind.Event && rec.kind != AudioDb.Kind.Bank)) return;
             bool bank = rec.kind == AudioDb.Kind.Bank;
-            if (emitFor != rec.id || Time.realtimeSinceStartup - emitAt > 1f)
+            if (emitFor != rec.id || now - emitAt > 1f)
             {
-                emitFor = rec.id; emitAt = Time.realtimeSinceStartup; emitters.Clear(); emitterEvent.Clear();
+                emitFor = rec.id; emitAt = now; emitters.Clear(); emitterEvent.Clear(); emitterText.Clear();
                 if (bank)
                 {
                     // a SoundBank: loaded objects that reference any event of that bank
@@ -417,10 +563,11 @@ namespace InsideDev
                     foreach (var p in AudioTrace.plays.Values)
                         if (p.eventId == rec.id) { var u = AudioTrace.Unity(p.gameObj); if (u != null && !emitters.Contains(u)) { emitters.Add(u); emitterEvent.Add(rec.Name); } }
                 }
+                // the label of each emitter, built here once a second instead of every frame
+                for (int i = 0; i < emitters.Count; i++) emitterText.Add("audio " + emitterEvent[i] + "  on " + emitters[i].name + (bank ? "  [" + rec.Name + "]" : ""));
             }
-            AudioTrace.EvStat st; float age = !bank && AudioTrace.evStats.TryGetValue(rec.id, out st) ? Time.realtimeSinceStartup - st.lastT : 1e9f;
+            AudioTrace.EvStat st; float age = !bank && AudioTrace.evStats.TryGetValue(rec.id, out st) ? now - st.lastT : 1e9f;
             bool live = age < 2f;
-            var ch = G.MainCharacter;
             for (int ei = 0; ei < emitters.Count; ei++)
             {
                 var g = emitters[ei];
@@ -430,25 +577,26 @@ namespace InsideDev
                 float r = 0.35f;
                 Line(c + Vector3.left * r, c + Vector3.right * r); Line(c + Vector3.up * r, c + Vector3.down * r);
                 Line(c + new Vector3(-r, -r, 0) * 0.7f, c + new Vector3(r, r, 0) * 0.7f); Line(c + new Vector3(-r, r, 0) * 0.7f, c + new Vector3(r, -r, 0) * 0.7f);
-                if (ch != null) { curColor = new Color(curColor.r, curColor.g, curColor.b, 0.25f); Line(ch.pos3, c); }
-                Vector3 sp = RenderScale.W2S(cam, c);
-                if (sp.z > 0) d.ShadowText(sp.x + 8, Screen.height - sp.y - 7, "audio " + emitterEvent[ei] + "  on " + g.name + (bank ? "  [" + rec.Name + "]" : ""), live ? new Color(0.3f, 1f, 0.45f, 1f) : new Color(0.45f, 0.85f, 1f, 1f), 12);
+                if (boyKnown) { curColor = new Color(curColor.r, curColor.g, curColor.b, 0.25f); Line(boyPos, c); }
+                Vector3 sp = Project(c);
+                if (sp.z > 0) d.ShadowText(sp.x + 8, sh - sp.y - 7, emitterText[ei], live ? new Color(0.3f, 1f, 0.45f, 1f) : new Color(0.45f, 0.85f, 1f, 1f), 12);
             }
         }
-        readonly List<GameObject> emitters = new List<GameObject>(); readonly List<string> emitterEvent = new List<string>(); uint emitFor; float emitAt;
+        readonly List<GameObject> emitters = new List<GameObject>(); readonly List<string> emitterEvent = new List<string>(), emitterText = new List<string>(); uint emitFor; float emitAt;
 
         // §89: the graph edge under the mouse, drawn between the two objects in the world
-        void DrawGraphHover()
+        void DrawGraphHover(float now)
         {
-            if (Time.realtimeSinceStartup - GraphView.HoverAt > 0.15f) return;
+            if (now - GraphView.HoverAt > 0.15f) return;
             var a = ObjectDatabase.Get(GraphView.HoverA); var b = ObjectDatabase.Get(GraphView.HoverB);
             if (a == null || b == null || a.go == null || b.go == null) return;
             Vector3 pa = CenterOf(a.go), pb = CenterOf(b.go);
             curColor = new Color(1f, 0.85f, 0.3f, 1f);
             Line(pa, pb); Line(pa + Vector3.up * 0.03f, pb + Vector3.up * 0.03f);
-            float r = 0.25f;
-            foreach (var c in new[] { pa, pb }) { Line(c + Vector3.left * r, c + Vector3.right * r); Line(c + Vector3.up * r, c + Vector3.down * r); }
+            Cross(pa, 0.25f); Cross(pb, 0.25f);
         }
+
+        void Cross(Vector3 c, float r) { Line(c + Vector3.left * r, c + Vector3.right * r); Line(c + Vector3.up * r, c + Vector3.down * r); }
 
         static Vector3 CenterOf(GameObject g)
         {
@@ -459,66 +607,203 @@ namespace InsideDev
             return g.transform.position;
         }
 
-        bool LabelWanted(Collider c, Bounds b, int hop)
-        {
-            if (labelLevel <= 0) return false;
-            if (labelLevel == 1) return Selection.Current != null && (c.gameObject == Selection.Current || (hop >= 0 && scope <= 2));
-            if (labelLevel == 2) { var ch = G.MainCharacter; return ch != null && (b.ClosestPoint(ch.pos3) - ch.pos3).sqrMagnitude < 15f * 15f; }
-            return true;
-        }
-
         Color curColor;
         static readonly Color cHidden = new Color(1f, 0.35f, 0.9f, 0.95f);
 
-        void DrawHidden(Vector3 camPos)
+        // markers on switched-off objects: position and "alive" are read every CheckEvery frames (staggered), the label
+        // text once
+        void DrawHidden(Vector3 camPos, int f)
         {
-            int labels = 0;
-            foreach (var h in hiddenEntries)
+            int shown = 0;
+            float maxSq = maxDistance * maxDistance;
+            var list = hiddenEntries;
+            for (int k = 0; k < list.Count; k++)
             {
-                if (h.go == null) continue;
-                var p = h.go.transform.position;
-                if ((p - camPos).magnitude > maxDistance) continue;
-                if (!GeometryUtility.TestPlanesAABB(planes, new Bounds(p, Vector3.one * 0.5f))) continue;
+                var h = list[k];
+                if (f >= h.checkAt)
+                {
+                    h.checkAt = f + CheckEvery + (k & 3);
+                    h.alive = h.go != null;
+                    if (h.alive) h.pos = h.go.transform.position;
+                }
+                if (!h.alive) continue;
+                var p = h.pos;
+                if ((p - camPos).sqrMagnitude > maxSq) continue;
+                if (!InFrustum(p, new Vector3(0.25f, 0.25f, 0.25f))) continue;
                 curColor = cHidden;
                 float s = 0.3f;
                 Line(p + new Vector3(-s, -s, 0), p + new Vector3(s, s, 0));
                 Line(p + new Vector3(-s, s, 0), p + new Vector3(s, -s, 0));
-                if (showLabels && labels < 50)
+                if (showLabels && shown < 50)
                 {
-                    Vector3 sp = RenderScale.W2S(cam, p);
-                    if (sp.z > 0) { d.ShadowText(sp.x + 6, Screen.height - sp.y - 6, h.go.name + " [" + h.kind + "]", cHidden, 11); labels++; }
+                    Vector3 sp = Project(p);
+                    if (sp.z <= 0) continue;
+                    if (h.label == null)
+                    {
+                        if (h.go == null) { h.alive = false; continue; }
+                        h.label = h.go.name + " [" + h.kind + "]";
+                    }
+                    d.ShadowText(sp.x + 6, sh - sp.y - 6, h.label, cHidden, 11);
+                    shown++;
                 }
             }
         }
 
-        void DrawLabels(List<KeyValuePair<Vector3, ColliderEntry>> labels)
+        // screen position of a wanted label; behind the camera or off screen = no label
+        void AddLabel(ColliderEntry e)
         {
-            var center = new Vector2(Screen.width * 0.5f, Screen.height * 0.5f);
-            var scr = new List<KeyValuePair<float, KeyValuePair<Vector2, ColliderEntry>>>();
-            foreach (var kv in labels)
+            Vector3 sp = Project(e.bc);
+            if (sp.z <= 0) return;
+            float x = sp.x, y = sh - sp.y;
+            if (x < -50 || y < -20 || x > sw + 50 || y > sh + 20) return;
+            float dx = x - sw * 0.5f, dy = y - sh * 0.5f;
+            labels.Add(new LabelAt { d = dx * dx + dy * dy, p = new Vector2(x, y), e = e });
+        }
+
+        // At most MaxLabels labels, the ones nearest to the screen centre. A label names the object and its first
+        // overlay.label.types components ("+N" says how many more); the selected object gets every component, wrapped.
+        // Labels never overlap: a label that would cover one already placed moves down or up a line (a thin line then
+        // joins it to its object); one that finds no free place is left out and counted in a corner note.
+        const int LabelSize = 12;
+        const float LabelLine = 15f;
+        readonly List<Rect> placed = new List<Rect>(64);
+        public int labelTypes = 3;
+        int labelsHidden;
+        string hiddenNote;
+        int hiddenNoteFor = -1;
+
+        void DrawLabels()
+        {
+            if (labels.Count > MaxLabels) labels.Sort(nearestCentreFirst);
+            int n = Math.Min(labels.Count, MaxLabels);
+            var sel = Selection.Current;
+            placed.Clear();
+            labelsHidden = labels.Count - n;
+            if (sel != null && selAudioText != null)
             {
-                Vector3 sp = RenderScale.W2S(cam, kv.Key);
-                if (sp.z <= 0) continue;
-                var gp = new Vector2(sp.x, Screen.height - sp.y);
-                if (gp.x < -50 || gp.y < -20 || gp.x > Screen.width + 50 || gp.y > Screen.height + 20) continue;
-                scr.Add(new KeyValuePair<float, KeyValuePair<Vector2, ColliderEntry>>((gp - center).sqrMagnitude, new KeyValuePair<Vector2, ColliderEntry>(gp, kv.Value)));
+                // the selection's audio line is drawn next to it by DrawSelectionAudio: keep its place free
+                Vector3 asp = Project(CenterOf(sel));
+                if (asp.z > 0) placed.Add(new Rect(asp.x + 8, sh - asp.y + 8, d.Measure(selAudioText, LabelSize), LabelLine));
             }
-            scr.Sort((a, b) => a.Key.CompareTo(b.Key));
-            int n = Math.Min(scr.Count, 60);
             for (int i = 0; i < n; i++)
             {
-                var gp = scr[i].Value.Key;
-                var e = scr[i].Value.Value;
-                string text = e.name + (e.col != null && !e.col.enabled ? "  (off)" : "") + (e.types.Length > 0 ? "  <" + e.types + ">" : "");
-                d.ShadowText(gp.x + 4, gp.y - 7, text, e.color, 12);
+                var l = labels[i];
+                var e = l.e;
+                bool selected = sel != null && ReferenceEquals(e.go, sel);
+                if (e.label == null || e.labelOn != e.on || e.labelTypes != labelTypes)
+                {
+                    e.labelOn = e.on;
+                    e.labelTypes = labelTypes;
+                    e.label = LabelText(e, labelTypes);
+                    e.labelFull = null;
+                    e.labelW = d.Measure(e.label, LabelSize);
+                }
+                string text = e.label;
+                float w = e.labelW, h = LabelLine;
+                if (selected)
+                {
+                    if (e.labelFull == null) e.labelFull = WrapFull(e, Mathf.Max(320f, sw * 0.4f));
+                    text = e.labelFull;
+                    w = 0f;
+                    int lines = 1, start = 0;
+                    for (int k = 0; k <= text.Length; k++)
+                    {
+                        if (k < text.Length && text[k] != '\n') continue;
+                        w = Mathf.Max(w, d.Measure(text.Substring(start, k - start), LabelSize));
+                        start = k + 1;
+                        if (k < text.Length) lines++;
+                    }
+                    h = LabelLine * lines;
+                }
+                float x = l.p.x + 4, y = l.p.y - 7;
+                if (x + w > sw - 4) x = Mathf.Max(4f, sw - 4 - w);
+                if (x < 4) x = 4;
+                var r = new Rect(x, y, w, h);
+                bool ok = Free(r);
+                for (int step = 1; step <= 4 && !ok; step++)
+                {
+                    var down = new Rect(x, y + step * LabelLine, w, h);
+                    if (Free(down)) { r = down; ok = true; break; }
+                    var up = new Rect(x, y - step * LabelLine, w, h);
+                    if (Free(up)) { r = up; ok = true; break; }
+                }
+                if (!ok && !selected) { labelsHidden++; continue; }
+                placed.Add(r);
+                if (Mathf.Abs(r.y - y) > 1f) d.Line(new Vector2(l.p.x, l.p.y), new Vector2(r.x, r.y + LabelLine * 0.5f), new Color(e.color.r, e.color.g, e.color.b, 0.45f));
+                d.ShadowText(r.x, r.y, text, e.color, LabelSize);
+            }
+            if (labelsHidden > 0)
+            {
+                if (hiddenNoteFor != labelsHidden) { hiddenNoteFor = labelsHidden; hiddenNote = "+" + Fmt.I(labelsHidden) + " label(s) hidden (overlap or limit): select an object to see its full label, F4 for fewer labels"; }
+                d.ShadowText(8, sh - 22, hiddenNote, new Color(0.8f, 0.8f, 0.8f, 0.8f), 11);
             }
         }
 
-        void DrawSavepoints()
+        bool Free(Rect r)
         {
+            for (int i = 0; i < placed.Count; i++) if (placed[i].Overlaps(r)) return false;
+            return true;
+        }
+
+        // "name  (off)  <A, B, C +4>"; types < 0 = every component, 0 = only the count
+        static string LabelText(ColliderEntry e, int types)
+        {
+            var sb = new System.Text.StringBuilder(e.name);
+            if (!e.on) sb.Append("  (off)");
+            var list = e.typeList;
+            int count = list != null ? list.Length : 0;
+            if (count == 0)
+            {
+                if (!string.IsNullOrEmpty(e.types)) sb.Append("  <").Append(e.types).Append('>');
+                return sb.ToString();
+            }
+            if (types == 0) return sb.Append("  <").Append(Fmt.I(count)).Append(" component(s)>").ToString();
+            int show = types < 0 ? count : Math.Min(types, count);
+            sb.Append("  <");
+            for (int i = 0; i < show; i++) { if (i > 0) sb.Append(", "); sb.Append(list[i]); }
+            if (count > show) sb.Append(" +").Append(Fmt.I(count - show));
+            sb.Append('>');
+            return sb.ToString();
+        }
+
+        // the name line, then the components in lines no wider than maxW
+        string WrapFull(ColliderEntry e, float maxW)
+        {
+            var sb = new System.Text.StringBuilder(e.name);
+            if (!e.on) sb.Append("  (off)");
+            var list = e.typeList;
+            if (list == null || list.Length == 0) return sb.ToString();
+            sb.Append('\n');
+            var line = new System.Text.StringBuilder("  ");
+            for (int i = 0; i < list.Length; i++)
+            {
+                string part = list[i] + (i < list.Length - 1 ? ", " : "");
+                if (line.Length > 2 && d.Measure(line.ToString() + part, LabelSize) > maxW)
+                {
+                    sb.Append(line.ToString().TrimEnd()).Append('\n');
+                    line.Length = 0;
+                    line.Append("  ");
+                }
+                line.Append(part);
+            }
+            sb.Append(line.ToString().TrimEnd());
+            return sb.ToString();
+        }
+
+        // Savepoint markers. The positions and "SP s/i" texts are kept; the game is asked again when streaming changed
+        // (the savepoints of an area become known when it loads) and every SpRefreshEvery seconds as a safety net.
+        struct SpMark { public Vector3 p; public int sub, sp; public string text; }
+        SpMark[] spMarks = new SpMark[0];
+        int spCount, spStream = -1;
+        float spAt = -1e9f;
+        readonly Dictionary<int, string> spTexts = new Dictionary<int, string>();
+        const float SpRefreshEvery = 5f;
+
+        void RefreshSavepoints(float now)
+        {
+            spStream = Levels.StreamVersion; spAt = now;
+            spCount = 0;
             if (!G.SavepointsReady) return;
-            int curSub, curSp;
-            G.CurrentSavepoint(out curSub, out curSp);
             int subs;
             try { subs = SavepointManager.SubsceneCount; } catch { return; }
             for (int s = 0; s < subs; s++)
@@ -529,19 +814,37 @@ namespace InsideDev
                     Vector3 p;
                     try { p = SavepointManager.GetSavepointPosition(s, i); } catch { continue; }
                     if (p == Vector3.zero) continue;
-                    if (!GeometryUtility.TestPlanesAABB(planes, new Bounds(p, Vector3.one))) continue;
-                    curColor = (s == curSub && i == curSp) ? cSpawn : cSave;
-                    float dd = 0.5f;
-                    Line(p + new Vector3(-dd, 0, 0), p + new Vector3(0, dd, 0));
-                    Line(p + new Vector3(0, dd, 0), p + new Vector3(dd, 0, 0));
-                    Line(p + new Vector3(dd, 0, 0), p + new Vector3(0, -dd, 0));
-                    Line(p + new Vector3(0, -dd, 0), p + new Vector3(-dd, 0, 0));
-                    Line(p, p + new Vector3(0, 1.5f, 0));
-                    if (showLabels)
-                    {
-                        Vector3 sp = RenderScale.W2S(cam, p + new Vector3(0, 1.6f, 0));
-                        if (sp.z > 0) d.ShadowText(sp.x - 20, Screen.height - sp.y - 14, "SP " + s + "/" + i, curColor, 12);
-                    }
+                    if (spCount == spMarks.Length) Array.Resize(ref spMarks, Math.Max(64, spMarks.Length * 2));
+                    int key = s * 100000 + i;
+                    string text;
+                    if (!spTexts.TryGetValue(key, out text)) spTexts[key] = text = "SP " + s + "/" + i;
+                    spMarks[spCount++] = new SpMark { p = p, sub = s, sp = i, text = text };
+                }
+            }
+        }
+
+        void DrawSavepoints(float now)
+        {
+            if (spStream != Levels.StreamVersion || now - spAt > SpRefreshEvery) RefreshSavepoints(now);
+            if (spCount == 0) return;
+            int curSub, curSp;
+            G.CurrentSavepoint(out curSub, out curSp);
+            var half = new Vector3(0.5f, 0.5f, 0.5f);
+            for (int k = 0; k < spCount; k++)
+            {
+                Vector3 p = spMarks[k].p;
+                if (!InFrustum(p, half)) continue;
+                curColor = (spMarks[k].sub == curSub && spMarks[k].sp == curSp) ? cSpawn : cSave;
+                float dd = 0.5f;
+                Line(p + new Vector3(-dd, 0, 0), p + new Vector3(0, dd, 0));
+                Line(p + new Vector3(0, dd, 0), p + new Vector3(dd, 0, 0));
+                Line(p + new Vector3(dd, 0, 0), p + new Vector3(0, -dd, 0));
+                Line(p + new Vector3(0, -dd, 0), p + new Vector3(-dd, 0, 0));
+                Line(p, p + new Vector3(0, 1.5f, 0));
+                if (showLabels)
+                {
+                    Vector3 sp = Project(p + new Vector3(0, 1.6f, 0));
+                    if (sp.z > 0) d.ShadowText(sp.x - 20, sh - sp.y - 14, spMarks[k].text, curColor, 12);
                 }
             }
         }
@@ -587,14 +890,14 @@ namespace InsideDev
             fpl[0] = r3 + r0; fpl[1] = r3 - r0; fpl[2] = r3 + r1; fpl[3] = r3 - r1; fpl[4] = r3 + r2; fpl[5] = r3 - r2;
         }
 
-        bool InFrustum(Bounds b)
+        // box (centre, extents) against the six planes: the corner farthest along each plane normal decides
+        bool InFrustum(Vector3 c, Vector3 ext)
         {
-            Vector3 mn = b.min, mx = b.max;
             for (int i = 0; i < 6; i++)
             {
                 var pl = fpl[i];
-                float px = pl.x >= 0 ? mx.x : mn.x, py = pl.y >= 0 ? mx.y : mn.y, pz = pl.z >= 0 ? mx.z : mn.z;
-                if (pl.x * px + pl.y * py + pl.z * pz + pl.w < 0) return false;
+                float reach = ext.x * (pl.x >= 0 ? pl.x : -pl.x) + ext.y * (pl.y >= 0 ? pl.y : -pl.y) + ext.z * (pl.z >= 0 ? pl.z : -pl.z);
+                if (pl.x * c.x + pl.y * c.y + pl.z * c.z + pl.w + reach < 0) return false;
             }
             return true;
         }

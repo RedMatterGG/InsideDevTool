@@ -304,6 +304,14 @@ namespace InsideDev
             if (row) ui.EndRow();
         }
 
+        // before a write: the history reads and writes the variable itself, so the edit can be undone
+        static void BeforeVar(PlayMakerFSM fsm, NamedVariable v)
+        {
+            var fb = v as FsmBool; var ff = v as FsmFloat; var fi = v as FsmInt; var fs = v as FsmString;
+            ChangeRecorder.BeforeCustom(fsm.gameObject, "fsmvar:" + fsm.FsmName + ":" + v.Name, "FSM var " + v.Name, () => v.RawValue,
+                                        x => { if (ff != null) ff.Value = (float)x; else if (fi != null) fi.Value = (int)x; else if (fb != null) fb.Value = (bool)x; else if (fs != null) fs.Value = (string)x; }, "inspector");
+        }
+
         static void VarRow(UI ui, PlayMakerFSM fsm, NamedVariable v, Inspector insp)
         {
             if (v == null) return;
@@ -314,7 +322,7 @@ namespace InsideDev
             if (fb != null)
             {
                 bool nb = ui.Toggle(fb.Value, fb.Value ? "true" : "false");
-                if (nb != fb.Value) { fb.Value = nb; ModifiedPanel.NoteExternal(fsm.gameObject, "FSM var " + v.Name + " = " + nb); }
+                if (nb != fb.Value) { BeforeVar(fsm, v); fb.Value = nb; ModifiedPanel.NoteExternal(fsm.gameObject, "FSM var " + v.Name + " = " + nb); }
             }
             else if (ff != null || fi != null || fs != null)
             {
@@ -327,12 +335,14 @@ namespace InsideDev
                 {
                     try
                     {
-                        if (ff != null) ff.Value = float.Parse(nv, IC);
-                        else if (fi != null) fi.Value = int.Parse(nv, IC);
-                        else fs.Value = nv;
+                        // numbers are read strictly (decimal point, no group separators): "0,5" is an error, not 5
+                        if (ff != null) { float x = float.Parse(nv.Trim(), NumberStyles.Float, IC); BeforeVar(fsm, v); ff.Value = x; }
+                        else if (fi != null) { int x = int.Parse(nv.Trim(), NumberStyles.Integer, IC); BeforeVar(fsm, v); fi.Value = x; }
+                        else { BeforeVar(fsm, v); fs.Value = nv; }
                         edits.Remove(key);
                         ModifiedPanel.NoteExternal(fsm.gameObject, "FSM var " + v.Name + " = " + nv);
                     }
+                    catch (FormatException) { DevLog.Write("fsm var " + v.Name + ": '" + nv + "' is not a number (use a decimal point, e.g. 0.5)"); }
                     catch (Exception e) { DevLog.Write("fsm var " + v.Name + ": " + e.Message); }
                 }
             }
@@ -346,7 +356,7 @@ namespace InsideDev
             {
                 object raw = null;
                 try { raw = v.RawValue; } catch { }
-                ui.Label(raw == null ? "null" : raw.ToString());
+                ui.Label(Fmt.Any(raw));
             }
             ui.EndRow();
         }

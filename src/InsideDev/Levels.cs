@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.IO;
+using System.Reflection;
 using System.Text;
 using UnityEngine;
 using UObj = UnityEngine.Object;
@@ -107,16 +109,15 @@ namespace InsideDev
         public static string Describe(Scene s) { return s == null ? "?" : s.name + " = " + s.File + " (scene " + s.index + ")"; }
 
         // ---------------------------------------------------------------- runtime streaming state
-        static float nextScan, cullersAt = -100f;
-        static readonly List<SubsceneCuller> cullers = new List<SubsceneCuller>();
         // Phase 12: bumps whenever streaming changes (subscenes loaded / activated) or a level loads. Periodic
         // FindObjectsOfType scans elsewhere key off this instead of running on a timer.
         public static int StreamVersion;
         public static float StreamChangedAt;
-        public static void Bump(string why) { StreamVersion++; StreamChangedAt = Time.realtimeSinceStartup; if (why == "level load") cullersAt = -100f; }
-        // true once when the version moved past 'seen' and streaming has been quiet for 'settle' seconds (at least
-        // BackgroundSettle, so a level load triggers one scan at its end instead of one between every subscene), and never
-        // while mcam captures: the scans are 30-170 ms main-thread hitches that break 60 Hz record pacing; they run after it
+        public static void Bump(string why) { StreamVersion++; StreamChangedAt = Time.realtimeSinceStartup; if (why == "level load") { relist = true; registry = null; nextRegistryTry = 0f; } }
+        // true once when the version moved past 'seen' and streaming has been quiet for BackgroundSettle seconds (so a level
+        // load triggers one scan at its end instead of one between every subscene), and never while mcam captures: the scans
+        // are 30-170 ms main-thread hitches that break 60 Hz record pacing; they run after it. 'settle' can only ask for a
+        // longer quiet time than BackgroundSettle, never a shorter one.
         public const float BackgroundSettle = 3f;
         public static bool Changed(ref int seen, float settle = 0.5f)
         {
@@ -126,38 +127,148 @@ namespace InsideDev
         public static readonly Dictionary<string, string> state = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         public static int loadedCount, activeCount;
 
+        // The cullers come from the game's own registry (SubsceneCullingManager keeps every enabled culler in one list), so
+        // no scene search is needed. The registry is reached through its private singleton field: asking the public
+        // property would create the manager before the game does. Without that field the list is found with
+        // FindObjectsOfType after a level load, when a culler is gone, or every RefindEvery seconds.
+        // One sweep over all cullers is spread over SweepSeconds: a few cullers per frame, no per-frame garbage. The state
+        // of each culler is kept, so the dictionary is written and the version bumped only when something changed.
+        const float SweepSeconds = 1f, RefindEvery = 120f;
+        const byte StUnloaded = 0, StStreaming = 1, StLoaded = 2, StActive = 3;
+        static readonly string[] stateNames = { "unloaded", "streaming", "loaded", "active" };
+        static SubsceneCuller[] cullers = new SubsceneCuller[0];
+        static string[] cullerKey = new string[0];
+        static byte[] cullerState = new byte[0];
+        static int cullerCount, sweepAt, registrySize = -1;
+        static float sweepAcc, lastScanAt, listedAt, nextScan, nextRegistryTry;
+        static bool relist = true, relistNow, sweepChanged, registryTried;
+        static FieldInfo registryField;
+        static ReadOnlyCollection<SubsceneCuller> registry;
+
+        static void FindRegistry(float now)
+        {
+            if (registry != null || now < nextRegistryTry) return;
+            nextRegistryTry = now + 1f;
+            if (!registryTried)
+            {
+                registryTried = true;
+                try { registryField = typeof(SubsceneCullingManager).GetField("singletonInstance", BindingFlags.Static | BindingFlags.NonPublic); } catch { registryField = null; }
+            }
+            if (registryField == null) return;
+            var m = registryField.GetValue(null) as SubsceneCullingManager;
+            if (m != null) { registry = m.GetAllSubsceneCullers(); relist = true; }
+        }
+
+        static byte ReadState(SubsceneCuller c) { return c.IsActive ? StActive : c.IsLoaded ? StLoaded : c.InProgress ? StStreaming : StUnloaded; }
+
+        static void Relist(float now)
+        {
+            relist = relistNow = false; listedAt = now;
+            int n = 0;
+            if (registry != null)
+            {
+                int rc = registry.Count;
+                registrySize = rc;
+                if (cullers.Length < rc) Grow(rc);
+                for (int i = 0; i < rc; i++) { var c = registry[i]; if (c != null) cullers[n++] = c; }
+            }
+            else
+            {
+                var found = UObj.FindObjectsOfType(typeof(SubsceneCuller));
+                if (cullers.Length < found.Length) Grow(found.Length);
+                foreach (var o in found) { var c = o as SubsceneCuller; if (c != null) cullers[n++] = c; }
+            }
+            for (int i = n; i < cullerCount; i++) cullers[i] = null;
+            cullerCount = n;
+            state.Clear(); loadedCount = activeCount = 0;
+            for (int i = 0; i < n; i++)
+            {
+                var c = cullers[i];
+                string name = null;
+                try { name = c.SceneName; } catch { }
+                if (string.IsNullOrEmpty(name)) { cullerKey[i] = null; cullerState[i] = StUnloaded; continue; }
+                string key = name.Substring(name.LastIndexOf('/') + 1);
+                if (key.EndsWith(".unity")) key = key.Substring(0, key.Length - 6);
+                cullerKey[i] = key;
+                byte st = ReadState(c);
+                cullerState[i] = st;
+                if (st >= StLoaded) loadedCount++;
+                if (st == StActive) activeCount++;
+                state[key] = stateNames[st];
+            }
+            sweepAt = 0; sweepAcc = 0f;
+        }
+
+        static void Grow(int n)
+        {
+            n = Math.Max(n, 64);
+            cullers = new SubsceneCuller[n]; cullerKey = new string[n]; cullerState = new byte[n];
+            cullerCount = 0;
+        }
+
         public static void ScanStreaming()
         {
-            if (Time.realtimeSinceStartup < nextScan) return;
-            nextScan = Time.realtimeSinceStartup + 1f;
-            int prevLoaded = loadedCount, prevActive = activeCount;
-            state.Clear(); loadedCount = activeCount = 0;
+            float now = Time.realtimeSinceStartup;
+            if (now < nextScan) return;
+            float dt = Mathf.Clamp(now - lastScanAt, 0f, SweepSeconds);
+            lastScanAt = now;
             try
             {
-                // the culler list itself only changes with level loads; re-find it every 30 s or when one is gone
-                bool stale = Time.realtimeSinceStartup - cullersAt > 120f && !MultiCam.Running;   // level loads bump cullersAt via Bump(); the timed re-find waits for mcam runs
-                foreach (var c in cullers) if (c == null) stale = true;
-                if (stale)
+                FindRegistry(now);
+                // the registry is a live view of the game's list; a scene search (no registry) waits for mcam runs unless a
+                // culler is gone
+                bool mustRelist = registry != null ? relist || registry.Count != registrySize
+                                                   : relistNow || ((relist || now - listedAt > RefindEvery) && !MultiCam.Running);
+                if (mustRelist)
                 {
-                    cullers.Clear(); cullersAt = Time.realtimeSinceStartup;
-                    foreach (var o in UObj.FindObjectsOfType(typeof(SubsceneCuller))) { var sc = o as SubsceneCuller; if (sc != null) cullers.Add(sc); }
+                    int prevLoaded = loadedCount, prevActive = activeCount;
+                    Relist(now);
+                    sweepChanged = false;
+                    if (loadedCount != prevLoaded || activeCount != prevActive) Signal();
+                    return;
                 }
-                foreach (var c in cullers)
+                if (cullerCount == 0) return;
+                sweepAcc += cullerCount * dt / SweepSeconds;
+                int todo = (int)sweepAcc;
+                if (todo <= 0) return;
+                sweepAcc -= todo;
+                if (todo > cullerCount) todo = cullerCount;
+                for (; todo > 0; todo--)
                 {
-                    if (c == null) continue;
-                    string n;
-                    try { n = c.SceneName; } catch { continue; }
-                    if (string.IsNullOrEmpty(n)) continue;
-                    string st = c.IsActive ? "active" : c.IsLoaded ? "loaded" : c.InProgress ? "streaming" : "unloaded";
-                    if (c.IsLoaded) loadedCount++;
-                    if (c.IsActive) activeCount++;
-                    string key = n.Substring(n.LastIndexOf('/') + 1);
-                    if (key.EndsWith(".unity")) key = key.Substring(0, key.Length - 6);
-                    state[key] = st;
+                    int i = sweepAt++;
+                    var c = cullers[i];
+                    if (c == null) relist = relistNow = true;
+                    else if (cullerKey[i] != null)
+                    {
+                        byte st = ReadState(c), old = cullerState[i];
+                        if (st != old)
+                        {
+                            cullerState[i] = st;
+                            if ((st >= StLoaded) != (old >= StLoaded)) { loadedCount += st >= StLoaded ? 1 : -1; sweepChanged = true; }
+                            if ((st == StActive) != (old == StActive)) { activeCount += st == StActive ? 1 : -1; sweepChanged = true; }
+                            state[cullerKey[i]] = stateNames[st];
+                        }
+                    }
+                    if (sweepAt >= cullerCount)
+                    {
+                        sweepAt = 0;
+                        if (sweepChanged) { sweepChanged = false; Signal(); }
+                    }
                 }
             }
-            catch (Exception e) { DevLog.Error("ScanStreaming", e); nextScan = Time.realtimeSinceStartup + 30f; }
-            if (loadedCount != prevLoaded || activeCount != prevActive) { ObjectDatabase.MarkDirty("streaming " + loadedCount + " loaded / " + activeCount + " active"); Bump("streaming"); }
+            catch (Exception e) { DevLog.Error("ScanStreaming", e); nextScan = now + 30f; relist = relistNow = true; }
+        }
+
+        static void Signal()
+        {
+            ObjectDatabase.MarkDirty("streaming " + loadedCount + " loaded / " + activeCount + " active");
+            Bump("streaming");
+        }
+
+        // one line for the doctor: where the culler list comes from and what it holds
+        public static string Status()
+        {
+            return Fmt.I(cullerCount) + " cullers from " + (registry != null ? "the game's registry" : "a scene search") + ", " + Fmt.I(activeCount) + " active / " + Fmt.I(loadedCount) + " loaded, version " + Fmt.I(StreamVersion);
         }
 
         public static string StateOf(Scene s)

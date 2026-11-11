@@ -10,13 +10,14 @@ namespace InsideDev
     // Entry point called once by the version.dll proxy (via mono_runtime_invoke on the main thread).
     public static class Boot
     {
-        public const string Version = "0.10.0";
+        public const string Version = "0.11.0";
         static GameObject host;
 
         static DevCore core;
         static int tickFrame = -1;
 
-        // Called by the loader from Savegame.Update (fallback driver).
+        // Called by the loader from Savegame.Update (fallback driver). Savegame updates before DevRoot in a frame, so the
+        // fallback takes over only when Unity left DevRoot.Update out for a whole frame; a long frame alone does not count.
         public static void Tick()
         {
             try
@@ -24,7 +25,7 @@ namespace InsideDev
                 if (core == null) return;
                 if (Time.frameCount == tickFrame) return;
                 tickFrame = Time.frameCount;
-                if (Time.realtimeSinceStartup - core.unityUpdateRT > 0.25f)
+                if (Time.frameCount - core.unityUpdateFrame >= 2)
                 {
                     if (!core.fallbackUpdLogged) { core.fallbackUpdLogged = true; DevLog.Write("Update driven by loader fallback (Savegame.Update)"); }
                     RenderHost.OnUpdate();
@@ -58,38 +59,90 @@ namespace InsideDev
 
     public static class DevLog
     {
-        static readonly object gate = new object();
-        static string path;
+        // Lines holds the last MaxLines messages. Readers lock (DevLog.Lines); the writer locks the same object.
         public static readonly List<string> Lines = new List<string>();
+        static readonly object gate = Lines;
+        static StreamWriter writer;
+        static bool writerTried;
         public const int MaxLines = 400;
+        static int total, clears, errors;
 
-        static string LogPath
+        // Number of messages written since start. Lines.Count stops at MaxLines, so "what did this command log" is asked with
+        // Total before and Since(total, list) after.
+        public static int Total { get { lock (gate) return total; } }
+
+        // ERROR / [Exception] messages since start (exact, also when more than MaxLines arrive between two readers)
+        public static int Errors { get { lock (gate) return errors; } }
+
+        // Appends the messages written after the given Total to into (at most the MaxLines still kept) and returns the new Total.
+        public static int Since(int since, List<string> into)
+        {
+            lock (gate)
+            {
+                int added = total - since;
+                if (added > Lines.Count) added = Lines.Count;
+                if (into != null) for (int i = Lines.Count - added; i < Lines.Count; i++) if (i >= 0) into.Add(Lines[i]);
+                return total;
+            }
+        }
+
+        // Copy of the last n messages, oldest first.
+        public static string[] Tail(int n)
+        {
+            lock (gate)
+            {
+                if (n > Lines.Count) n = Lines.Count;
+                if (n < 0) n = 0;
+                var a = new string[n];
+                Lines.CopyTo(Lines.Count - n, a, 0, n);
+                return a;
+            }
+        }
+
+        // Number of times Clear ran: a view that shows the messages rebuilds when Total or Clears moved.
+        public static int Clears { get { lock (gate) return clears; } }
+
+        // Empties the kept messages (the console's "clear"); the log file and Total are not touched.
+        public static void Clear() { lock (gate) { Lines.Clear(); clears++; } }
+
+        // False when <game>\_mod\insidedev.log could not be opened: the messages then live in memory only.
+        public static bool FileOpen { get { lock (gate) return Writer != null; } }
+
+        // <game>\_mod\insidedev.log: started empty once per session and kept open (other programs can read it while the
+        // game runs). Every line is handed to the operating system at once, so a crash of the game loses nothing; opening
+        // and closing the file for each line cost far more than the write.
+        static StreamWriter Writer
         {
             get
             {
-                if (path == null)
+                if (writerTried) return writer;
+                writerTried = true;
+                try
                 {
-                    try
-                    {
-                        string dir = Path.Combine(Path.GetDirectoryName(Application.dataPath), "_mod");
-                        Directory.CreateDirectory(dir);
-                        path = Path.Combine(dir, "insidedev.log");
-                        File.WriteAllText(path, "");
-                    }
-                    catch { path = ""; }
+                    string dir = Path.Combine(Path.GetDirectoryName(Application.dataPath), "_mod");
+                    Directory.CreateDirectory(dir);
+                    string path = Path.Combine(dir, "insidedev.log");
+                    FileStream fs;
+                    // Delete: tools may move or remove the log while the game runs
+                    try { fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete); }
+                    catch (ArgumentException) { fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite); }
+                    writer = new StreamWriter(fs, new System.Text.UTF8Encoding(false));
                 }
-                return path;
+                catch { writer = null; }
+                return writer;
             }
         }
 
         public static void Write(string msg)
         {
-            string line = DateTime.Now.ToString("HH:mm:ss") + "  " + msg;
+            string line = DateTime.Now.ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture) + "  " + msg;
             lock (gate)
             {
                 Lines.Add(msg);
+                total++;
+                if (msg != null && (msg.StartsWith("ERROR", StringComparison.Ordinal) || msg.StartsWith("[Exception]", StringComparison.Ordinal))) errors++;
                 if (Lines.Count > MaxLines) Lines.RemoveRange(0, Lines.Count - MaxLines);
-                try { if (LogPath.Length > 0) File.AppendAllText(LogPath, line + Environment.NewLine); } catch { }
+                try { var w = Writer; if (w != null) { w.WriteLine(line); w.Flush(); } } catch { }
             }
         }
 
@@ -177,7 +230,7 @@ namespace InsideDev
             var c = MainCharacter;
             if (c == null || !c.isCharacterActive) { DevLog.Write("tp: no active character"); return false; }
             c.Teleport(p);
-            DevLog.Write(string.Format("tp: {0} -> ({1:F2}, {2:F2}, {3:F2})", c.name, p.x, p.y, p.z));
+            DevLog.Write("tp: " + c.name + " -> " + Fmt.V3(p, "F2"));
             return true;
         }
 

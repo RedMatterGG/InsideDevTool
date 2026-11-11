@@ -14,6 +14,10 @@ namespace InsideDev
     //    together with who receives it,
     //  * inject fake cue markers / beats exactly where real ones arrive (right after the engine update),
     //    which is what the level state machines' WaitForMusicCueOrMarker / WaitForBeat actions listen for.
+    // Every sound event of the game passes through here, so the log, the callback wrappers and the caller stacks are only
+    // made while somebody uses the tool (Background.Audio) or with editor.cfg audio.log=always; asleep a post is forwarded
+    // without one allocation. Audio rules and cue injection work in both states. editor.cfg audio.spy=0 leaves the
+    // wrapper out altogether (then the audio log, the audio rules and cue injection do not exist in that session).
     public class AudioSpy : ISoundEngineImplementation
     {
         public readonly ISoundEngineImplementation inner;
@@ -21,10 +25,16 @@ namespace InsideDev
 
         // ---------------------------------------------------------------- install
         public static AudioSpy Instance;
+        static bool offLogged;
         public static bool Install()
         {
             try
             {
+                if (!EditorState.Get("audio.spy", true))
+                {
+                    if (!offLogged) { offLogged = true; DevLog.Write("audio: spy not installed (editor.cfg audio.spy=0)"); }
+                    return false;
+                }
                 var cur = SoundEngine.GetImplementationDebug();
                 if (cur == null) return false;
                 if (cur is AudioSpy) { Instance = (AudioSpy)cur; return true; }
@@ -53,6 +63,65 @@ namespace InsideDev
         {
             string n;
             return names.TryGetValue(id, out n) ? n : "#" + id.ToString("X8");
+        }
+
+        // ---------------------------------------------------------------- awake / asleep
+        static int listenFrame = -1, logMode = -1;
+        static bool listening;
+        static float lastListened = -1f;
+
+        public static void ReloadConfig()
+        {
+            logMode = EditorState.Get("audio.log", "auto") == "always" ? 1 : 0;
+            listenFrame = -1;
+        }
+
+        public static void ReloadStacks()
+        {
+            string st = EditorState.Get("audio.stacks", "important");
+            stackMode = st == "off" ? 0 : st == "full" ? 2 : 1;
+        }
+
+        // True while the log is being written: the tool is in use, the audio log is wanted, or audio.log=always.
+        // Asked once per frame at most. Main thread (the game posts its sounds there).
+        public static bool Listening
+        {
+            get
+            {
+                int f = Time.frameCount;
+                if (f == listenFrame) return listening;
+                listenFrame = f;
+                if (logMode < 0) { ReloadConfig(); ReloadStacks(); }
+                bool now = logMode == 1 || Background.WantedOrInUse(Background.Audio);
+                if (now)
+                {
+                    float t = Time.realtimeSinceStartup;
+                    // a reader of the log must see where it has a hole
+                    if (!listening && totalPosts > 0)
+                        Add("wake", "log resumed", "", "nothing was recorded for the last " + Fmt.F(t - Mathf.Max(0f, lastListened), "0") + " s (the audio log sleeps while nobody uses the tool; editor.cfg audio.log=always keeps it on)");
+                    lastListened = t;
+                }
+                listening = now;
+                return listening;
+            }
+        }
+
+        // For a command that is about to read the log: wakes it now (the caller has asked for Background.Audio) so that
+        // the hole marker is in place. True when the log is recording.
+        public static bool Wake() { listenFrame = -1; return Listening; }
+
+        // an event the game posted or prepared: remembered once per id (this runs for every post)
+        static readonly HashSet<uint> knownEventIds = new HashSet<uint>();
+        static void Know(uint id, string name)
+        {
+            if (!knownEventIds.Add(id)) return;
+            names[id] = name;
+            knownEvents.Add(name);
+        }
+
+        static bool IsVoice(string name)
+        {
+            return name != null && (name.StartsWith("boy_voc", StringComparison.Ordinal) || name.StartsWith("boy_foley", StringComparison.Ordinal) || name.StartsWith("hdd_voc", StringComparison.Ordinal) || name.StartsWith("fol_", StringComparison.Ordinal));
         }
 
         // harvest every name Playdead declared in SoundEngine.RTPCs / Switches / States / Events (+ AutoEvent cue names)
@@ -85,7 +154,7 @@ namespace InsideDev
 
         static void Add(string kind, string name, string source, string detail)
         {
-            if (!logVoice && name != null && (name.StartsWith("boy_voc") || name.StartsWith("boy_foley") || name.StartsWith("hdd_voc") || name.StartsWith("fol_"))) return;
+            if (!logVoice && IsVoice(name)) return;
             if (log.Count >= MaxLog) log.RemoveRange(0, 300);
             log.Add(new Entry { time = Time.realtimeSinceStartup, frame = Time.frameCount, kind = kind, name = name, source = source, detail = detail });
         }
@@ -105,7 +174,8 @@ namespace InsideDev
         public static readonly Dictionary<uint, List<string>> postStacks = new Dictionary<uint, List<string>>();
         static readonly Dictionary<uint, int> stackTries = new Dictionary<uint, int>();
         // §84 correlation modes: 0 OFF, 1 IMPORTANT (default: first posts of each event + bank loads), 2 FULL DEBUG
-        // (every post, up to 8 distinct stacks per event). Never for continuous RTPC / switch updates.
+        // (every post, up to 8 distinct stacks per event). Never for continuous RTPC / switch updates. Start value from
+        // editor.cfg audio.stacks (off | important | full); stacks are only taken while the log is awake.
         public static int stackMode = 1;
         public static readonly string[] StackModes = { "OFF", "IMPORTANT", "FULL DEBUG" };
         static void CaptureCaller(uint id)
@@ -185,11 +255,9 @@ namespace InsideDev
         }
 
         // ---------------------------------------------------------------- callback wrapping
-        AudioCallbackHandler Wrap(string eventName, AkGameObj go, AudioCallbackHandler cb)
+        AudioCallbackHandler Wrap(string eventName, string src, string who, AudioCallbackHandler cb)
         {
             if (cb == null) return null;
-            string who = Who(cb);
-            string src = Src(go);
             return delegate (AudioCallbackType t, CallbackInfo info)
             {
                 try
@@ -198,7 +266,7 @@ namespace InsideDev
                     if (t == AudioCallbackType.CueMarker) Add("CUE", Resolve(info.labelHash), src, "from '" + eventName + "' -> " + who + "   " + Listeners(info.labelHash));
                     else if (t == AudioCallbackType.MusicSyncBeat) { if (logRtpc) Add("beat", eventName, src, who); }
                     else if (t == AudioCallbackType.EndOfEvent) Add("end", eventName, src, who);
-                    else if (t == AudioCallbackType.Duration) { if (logVoice) Add("dur", eventName, src, info.duration.ToString("0.00") + "s -> " + who); }
+                    else if (t == AudioCallbackType.Duration) { if (logVoice) Add("dur", eventName, src, Fmt.F(info.duration, "0.00") + "s -> " + who); }
                     else Add(t.ToString(), eventName, src, who);
                 }
                 catch { }
@@ -221,8 +289,9 @@ namespace InsideDev
         public uint PostEventID(uint eventID, string eventName, AkGameObj gameObject, AudioCallbackType callbackTypes, AudioCallbackHandler callback)
         {
             totalPosts++;
-            if (eventName != null) { names[eventID] = eventName; knownEvents.Add(eventName); }
-            try { CaptureCaller(eventID); } catch { }
+            if (eventName != null) Know(eventID, eventName);
+            bool listen = Listening;
+            if (listen) { try { CaptureCaller(eventID); } catch { } }
             // phase N rules (managed wrapper only; the native hooks stay observation-only)
             bool muteIt = false;
             if (AudioRules.Active)
@@ -234,31 +303,51 @@ namespace InsideDev
                 {
                     // nuked: never reaches Wwise; the game sees a failed post and gets no callbacks at all
                     AudioRules.nuked++;
-                    try { Add("post", (eventName ?? Resolve(eventID)) + " [NUKED]", Src(gameObject), "blocked by audio rule (no sound, no callbacks)"); } catch { }
+                    if (listen) { try { Add("post", (eventName ?? Resolve(eventID)) + " [NUKED]", Src(gameObject), "blocked by audio rule (no sound, no callbacks)"); } catch { } }
                     return 0;
                 }
             }
-            uint r = inner.PostEventID(eventID, eventName, gameObject, callbackTypes, Wrap(eventName ?? Resolve(eventID), gameObject, callback));
+            if (!listen)
+            {
+                // nobody looks: the game's own callback goes to the engine untouched, nothing is built
+                uint q = inner.PostEventID(eventID, eventName, gameObject, callbackTypes, callback);
+                if (muteIt && q != 0) { inner.StopPlayingID(q, 0f); AudioRules.muted++; }
+                if (EventMonitor.Awake) { try { if (gameObject != null) EventMonitor.AudioPost(gameObject.gameObject, eventName ?? Resolve(eventID)); } catch { } }
+                return q;
+            }
+            string name = eventName ?? Resolve(eventID);
+            // voice and foley posts are the bulk of the traffic and are not logged unless asked: decide before any text is
+            // built. Their callbacks are wrapped only when a cue marker can come back (the one callback logged for them).
+            bool keep = logVoice || !IsVoice(name);
+            string src = null, who = null;
+            var cb = callback;
+            if (callback != null && (keep || (callbackTypes & AudioCallbackType.CueMarker) != 0))
+            {
+                src = Src(gameObject); who = Who(callback);
+                cb = Wrap(name, src, who, callback);
+            }
+            uint r = inner.PostEventID(eventID, eventName, gameObject, callbackTypes, cb);
             if (muteIt && r != 0) { inner.StopPlayingID(r, 0f); AudioRules.muted++; }   // callbacks (EndOfEvent) still reach the game
-            try { SoundLibrary.OnPosted(eventName ?? Resolve(eventID), gameObject != null ? gameObject.gameObject : null); } catch { }
-            try { if (gameObject != null) EventMonitor.AudioPost(gameObject.gameObject, eventName ?? Resolve(eventID)); } catch { }
-            try { Add("post", eventName ?? Resolve(eventID), Src(gameObject), (callback != null ? "callbacks " + callbackTypes + " -> " + Who(callback) : "") + (r == 0 ? "  [FAILED]" : "")); } catch { }
+            try { SoundLibrary.OnPosted(name, gameObject != null ? gameObject.gameObject : null); } catch { }
+            try { if (gameObject != null) EventMonitor.AudioPost(gameObject.gameObject, name); } catch { }
+            if (keep) { try { Add("post", name, src ?? Src(gameObject), (callback != null ? "callbacks " + callbackTypes + " -> " + who : "") + (r == 0 ? "  [FAILED]" : "")); } catch { } }
             return r;
         }
         public void StopPlayingID(uint playingID, float t) { inner.StopPlayingID(playingID, t); }
         public void CancelEventCallback(uint playingID) { inner.CancelEventCallback(playingID); }
         public void InnerSetRtpc(uint id, float v, AkGameObj go, float t) { inner.SetRTPCValueID(id, v, go, t); }
         public void InnerSetState(uint g, uint s) { inner.SetStateID(g, s); }
-        public void SetRTPCValueID(uint rtpcID, float v, AkGameObj go, float t) { v = AudioRules.Rtpc(rtpcID, v, go == null); inner.SetRTPCValueID(rtpcID, v, go, t); if (logRtpc) Add("rtpc", Resolve(rtpcID), Src(go), v.ToString("0.###")); }
+        public void SetRTPCValueID(uint rtpcID, float v, AkGameObj go, float t) { v = AudioRules.Rtpc(rtpcID, v, go == null); inner.SetRTPCValueID(rtpcID, v, go, t); if (logRtpc && Listening) Add("rtpc", Resolve(rtpcID), Src(go), Fmt.F(v)); }
         public void ResetGlobalRTPCValue(uint rtpcID) { inner.ResetGlobalRTPCValue(rtpcID); }
-        public void SetSwitchID(uint g, uint s, AkGameObj go) { s = AudioRules.Switch(g, s); inner.SetSwitchID(g, s, go); if (logSwitches) Add("switch", Resolve(g), Src(go), "= " + Resolve(s)); }
-        public void SetStateID(uint g, uint s) { s = AudioRules.State(g, s); inner.SetStateID(g, s); if (logStates) Add("state", Resolve(g), "global", "= " + Resolve(s)); }
-        public bool LoadBank(string bankName, OperationType op) { Add("bank+", bankName, "", op.ToString()); try { if (bankName != null) CaptureCaller(AudioTrace.Hash(bankName)); } catch { } return inner.LoadBank(bankName, op); }
+        public void SetSwitchID(uint g, uint s, AkGameObj go) { s = AudioRules.Switch(g, s); inner.SetSwitchID(g, s, go); if (logSwitches && Listening) Add("switch", Resolve(g), Src(go), "= " + Resolve(s)); }
+        public void SetStateID(uint g, uint s) { s = AudioRules.State(g, s); inner.SetStateID(g, s); if (logStates && Listening) Add("state", Resolve(g), "global", "= " + Resolve(s)); }
+        // bank loads are rare and explain missing sounds later: they are logged in both states
+        public bool LoadBank(string bankName, OperationType op) { Add("bank+", bankName, "", op.ToString()); try { if (bankName != null && Listening) CaptureCaller(AudioTrace.Hash(bankName)); } catch { } return inner.LoadBank(bankName, op); }
         public bool UnloadBank(string bankName) { Add("bank-", bankName, "", ""); return inner.UnloadBank(bankName); }
         public void UnloadUnrequiredBanks(List<string> req) { inner.UnloadUnrequiredBanks(req); }
         public void LoadRequiredBanks(List<string> req, OperationType op) { inner.LoadRequiredBanks(req, op); }
         public bool CheckIfBankOperationsComplete() { return inner.CheckIfBankOperationsComplete(); }
-        public void PrepareEvent(uint eventID, string eventName) { if (eventName != null) { names[eventID] = eventName; knownEvents.Add(eventName); } inner.PrepareEvent(eventID, eventName); }
+        public void PrepareEvent(uint eventID, string eventName) { if (eventName != null) Know(eventID, eventName); inner.PrepareEvent(eventID, eventName); }
         public bool RegisterGameObject(GameObject go) { return inner.RegisterGameObject(go); }
         public bool UnregisterGameObject(GameObject go) { return inner.UnregisterGameObject(go); }
         public void SendGameObjectTransform(GameObject go, Vector3 p, Vector3 f) { inner.SendGameObjectTransform(go, p, f); }
@@ -280,9 +369,10 @@ namespace InsideDev
         public bool StopOutputCapture() { return inner.StopOutputCapture(); }
         public uint CreateNewSequence(GameObject go, AudioCallbackType t, AudioCallbackHandler cb)
         {
+            if (cb == null || !Listening) return inner.CreateNewSequence(go, t, cb);
             AkGameObj ak = null;
             try { ak = go != null ? go.GetComponent<AkGameObj>() : null; } catch { }
-            return inner.CreateNewSequence(go, t, Wrap("sequence@" + (go != null ? go.name : "?"), ak, cb));
+            return inner.CreateNewSequence(go, t, Wrap("sequence@" + (go != null ? go.name : "?"), Src(ak), Who(cb), cb));
         }
         public void DestroySequence(uint id) { inner.DestroySequence(id); }
         public void PlaySequence(uint id) { inner.PlaySequence(id); }
@@ -324,11 +414,41 @@ namespace InsideDev
         public static readonly List<Wait> waits = new List<Wait>();
         public static readonly List<PostRef> posts = new List<PostRef>();
         static float nextScan;
+        static bool scanned;
+        static int scannedStream = -1;
+        // per action type: the fields that can name a Wwise event (the scan visits every action of every loaded FSM)
+        static readonly Dictionary<Type, FieldInfo[]> eventFields = new Dictionary<Type, FieldInfo[]>();
+        static readonly FieldInfo[] noFields = new FieldInfo[0];
 
+        static FieldInfo[] EventFields(Type ty)
+        {
+            FieldInfo[] r;
+            if (eventFields.TryGetValue(ty, out r)) return r;
+            List<FieldInfo> list = null;
+            foreach (var f in ty.GetFields(BindingFlags.Instance | BindingFlags.Public))
+            {
+                string fn = f.Name.ToLowerInvariant();
+                if (!(fn.Contains("event") && (fn.Contains("name") || fn == "audioevent" || fn == "soundevent")) && fn != "eventname") continue;
+                if (list == null) list = new List<FieldInfo>();
+                list.Add(f);
+            }
+            r = list == null ? noFields : list.ToArray();
+            eventFields[ty] = r;
+            return r;
+        }
+
+        // What the loaded state machines wait for and post only changes when areas stream in or out: the plain call scans
+        // once and then again after a streaming change; force (a Rescan button, a command, a catalog job) scans now.
         public static void Scan(bool force = false)
         {
-            if (!force && Time.realtimeSinceStartup < nextScan) return;
+            if (!force)
+            {
+                if (Time.realtimeSinceStartup < nextScan) return;
+                if (scanned && !Levels.Changed(ref scannedStream)) return;
+            }
             nextScan = Time.realtimeSinceStartup + 3f;
+            scanned = true;
+            scannedStream = Levels.StreamVersion;
             waits.Clear(); posts.Clear();
             try
             {
@@ -361,15 +481,13 @@ namespace InsideDev
                             {
                                 var tf = ty.GetField("time");
                                 var tv = tf != null ? tf.GetValue(a) as FsmFloat : null;
-                                waits.Add(new Wait { fsm = fsm, state = st.Name, cue = "music time " + (tv != null ? tv.Value.ToString("0.00") + "s" : "?"), finishEvent = Ev(a, "finishEvent") });
+                                waits.Add(new Wait { fsm = fsm, state = st.Name, cue = "music time " + (tv != null ? Fmt.F(tv.Value, "0.00") + "s" : "?"), finishEvent = Ev(a, "finishEvent") });
                             }
                             else
                             {
                                 // any action that names a Wwise event (PostEvent-style actions)
-                                foreach (var f in ty.GetFields(BindingFlags.Instance | BindingFlags.Public))
+                                foreach (var f in EventFields(ty))
                                 {
-                                    string fn = f.Name.ToLowerInvariant();
-                                    if (!(fn.Contains("event") && (fn.Contains("name") || fn == "audioevent" || fn == "soundevent")) && fn != "eventname") continue;
                                     string v = FieldStr(a, f);
                                     if (string.IsNullOrEmpty(v)) continue;
                                     AudioSpy.Learn(v);

@@ -20,6 +20,7 @@
 #include <stdio.h>
 
 void wt_log(const char *fmt, ...);   // version_proxy.c
+int wt_mod_file(const wchar_t *name, wchar_t *path, size_t cap);   // version_proxy.c: 1 when <mod folder>\name exists
 
 #define WT_EXPORT __declspec(dllexport)
 #define WT_VERSION 3
@@ -245,14 +246,17 @@ static void wt_init_table(void) {
 }
 
 // ---------------------------------------------------------------- module detection + resolution
-static char g_akPath[MAX_PATH];
+#define WT_WPATH 2048
+static char g_akPath[WT_WPATH * 3];   // UTF-8
 static uint32_t g_akSize, g_akStamp, g_akExports;
 static volatile LONG g_resolvedAll, g_resolvedHooked, g_enabled = 1;
 static FARPROC(WINAPI *o_monoGPA)(HMODULE, LPCSTR);
 
 static void detect(HMODULE m) {
     g_ak = m;
-    GetModuleFileNameA(m, g_akPath, MAX_PATH);
+    wchar_t wp[WT_WPATH];
+    DWORD wn = GetModuleFileNameW(m, wp, WT_WPATH);
+    if (wn == 0 || wn >= WT_WPATH || !WideCharToMultiByte(CP_UTF8, 0, wp, -1, g_akPath, sizeof g_akPath, NULL, NULL)) snprintf(g_akPath, sizeof g_akPath, "?");
     BYTE *b = (BYTE *)m;
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);
     g_akSize = nt->OptionalHeader.SizeOfImage;
@@ -268,9 +272,9 @@ static FARPROC WINAPI hk_monoGPA(HMODULE m, LPCSTR n) {
     if (!r || ((uintptr_t)n >> 16) == 0 || n[0] != 'C' || strncmp(n, "CSharp_", 7) != 0) return r;
     if (m != g_ak) {
         if (g_ak) return r;
-        char p[MAX_PATH]; GetModuleFileNameA(m, p, MAX_PATH);
-        size_t L = strlen(p);
-        if (L < 17 || _stricmp(p + L - 17, "AkSoundEngine.dll") != 0) return r;
+        wchar_t p[WT_WPATH];
+        DWORD L = GetModuleFileNameW(m, p, WT_WPATH);
+        if (L < 17 || L >= WT_WPATH || _wcsicmp(p + L - 17, L"AkSoundEngine.dll") != 0) return r;
         detect(m);
     }
     InterlockedIncrement(&g_resolvedAll);
@@ -291,10 +295,7 @@ int wt_patch_mono(HMODULE mono, int (*patch_iat)(HMODULE, const char *, const ch
     static int done;
     if (done || !mono) return 0;
     done = 1;
-    char flag[MAX_PATH]; GetModuleFileNameA(NULL, flag, MAX_PATH);
-    char *s = strrchr(flag, '\\'); if (s) *s = 0;
-    strcat(flag, "\\_mod\\wwise_off.flag");
-    if (GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES) { g_enabled = 0; wt_log("[WWISE] tracer disabled by wwise_off.flag"); }
+    if (wt_mod_file(L"wwise_off.flag", NULL, 0)) { g_enabled = 0; wt_log("[WWISE] tracer disabled by wwise_off.flag"); }
     int n = patch_iat(mono, "KERNEL32.dll", "GetProcAddress", (void *)hk_monoGPA, (void **)&o_monoGPA);
     if (!o_monoGPA) o_monoGPA = (void *)GetProcAddress;
     wt_log("[WWISE] tracer v%d: patched %d GetProcAddress import(s) in mono.dll; %d entry points watched%s",
@@ -334,24 +335,25 @@ WT_EXPORT int WT_Stats(int64_t *out, int n) {
     int64_t v[16] = { g_total, g_head, g_tail, g_dropped, g_resolvedAll, g_resolvedHooked, g_level,
                       (int64_t)(uintptr_t)g_ak, g_akSize, g_akStamp, g_akExports, g_render, g_cbItems, g_cbBad,
                       g_nhooks ? g_nhooks : WT_NHOOKS_GEN + 4, g_enabled };
+    if (!out) return 0;
     if (n > 16) n = 16;
     for (int i = 0; i < n; ++i) out[i] = v[i];
     return n;
 }
-WT_EXPORT int WT_ModulePath(char *buf, int len) { if (len <= 0) return 0; snprintf(buf, len, "%s", g_akPath); return (int)strlen(buf); }
+WT_EXPORT int WT_ModulePath(char *buf, int len) { if (!buf || len <= 0) return 0; snprintf(buf, len, "%s", g_akPath); buf[len - 1] = 0; return (int)strlen(buf); }
 
 // hook i: name into buf; info[0]=resolved, [1]=calls, [2]=original address, [3]=wrapper address
 WT_EXPORT int WT_HookInfo(int i, char *buf, int len, int64_t *info) {
     wt_init_table();
-    if (i < 0 || i >= g_nhooks) return 0;
-    snprintf(buf, len, "%s", g_hooks[i].name);
+    if (i < 0 || i >= g_nhooks || !buf || len <= 0 || !info) return 0;
+    snprintf(buf, len, "%s", g_hooks[i].name); buf[len - 1] = 0;
     info[0] = g_hooks[i].resolved; info[1] = g_hooks[i].calls;
     info[2] = (int64_t)(uintptr_t)*g_hooks[i].orig; info[3] = (int64_t)(uintptr_t)g_hooks[i].hook;
     return 1;
 }
 // exported name i of AkSoundEngine.dll with its address (for the API page)
 WT_EXPORT int WT_Export(int i, char *buf, int len, int64_t *addr) {
-    if (!g_ak) return 0;
+    if (!g_ak || !buf || len <= 0 || !addr) return 0;
     BYTE *b = (BYTE *)g_ak;
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);
     IMAGE_DATA_DIRECTORY ed = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
@@ -361,7 +363,7 @@ WT_EXPORT int WT_Export(int i, char *buf, int len, int64_t *addr) {
     DWORD *names = (DWORD *)(b + e->AddressOfNames);
     WORD *ords = (WORD *)(b + e->AddressOfNameOrdinals);
     DWORD *funcs = (DWORD *)(b + e->AddressOfFunctions);
-    snprintf(buf, len, "%s", (char *)(b + names[i]));
+    snprintf(buf, len, "%s", (char *)(b + names[i])); buf[len - 1] = 0;
     *addr = (int64_t)(uintptr_t)(b + funcs[ords[i]]);
     return 1;
 }
@@ -383,6 +385,7 @@ WT_EXPORT int WT_RuleAdd(int kind, uint32_t key, uint32_t val) {
 // out: enforce, rules, nuked, muted, replaced, forced
 WT_EXPORT int WT_RuleStats(int64_t *out, int n) {
     int64_t v[6] = { g_enforce, g_ruleCount, g_nNuked, g_nMuted, g_nReplaced, g_nForced };
+    if (!out) return 0;
     if (n > 6) n = 6;
     for (int i = 0; i < n; ++i) out[i] = v[i];
     return n;

@@ -18,6 +18,9 @@ namespace InsideDev
         public bool panel;
         bool hud = true;
         string hudKeys, hudKeysFor; int hudKeysFilter = -1;
+        // hotkeys.game=0: the keys that change the game itself (F7 god, F8 kill, [ ] \ time scale, middle-click teleport)
+        // work only while the editor panel is open; 1 (default) = always
+        bool hotkeysGame = true;
         static readonly string[] tabs = { "Spawn points", "Levels", "Triggers", "Hidden", "World state", "Audio", "Inspector", "Cheats", "Console", "Diagnostics", "Settings", "Objects", "Explorer", "Graph", "Events", "Sounds", "Audio Timeline", "Wwise API", "History", "Audio DB", "Logic", "Mods", "FSM Graph", "FSM Find" };
         static readonly string[] tabIds = { "spawns", "levels", "triggers", "hidden", "world", "audio", "inspector", "cheats", "console", "diag", "settings", "objects", "explorer", "graph", "events", "sounds", "atimeline", "wwiseapi", "history", "audiodb", "logic", "modified", "fsmgraph", "fsmfind" };
         public readonly Workspace workspace = new Workspace();
@@ -31,6 +34,10 @@ namespace InsideDev
         float nextBeat;
         readonly Action tShockwave, tAudioTimed, tAudioCatalog, tRenderScale, tEditorUI, tObjectDatabase, tSelection, tEventMonitor, tSoundLibrary, tChangeRecorder, tMods, tAudioTrace, tAudioDb, tAudioRules, tHiddenScan, tAudioRefScan, tCodeDeps, tLogic, tModifiedPanel, tReferenceIndex, tCustomSpawns, tGizmo, tWorldPick, tOverlay, tLevels, tLiveSavepoints, tDiscovery, tBridge, tExtensions, tAudioSpy, tHiddenScanTick, tSpawnCache;
         public float unityUpdateRT = -100f; public bool fallbackUpdLogged;
+        // frame of the last Unity-driven DevRoot.Update (Boot.Tick decides by it) and of the last Update that ran
+        public int unityUpdateFrame;
+        int updFrame = -1;
+        public bool UpdatedThisFrame { get { return updFrame == Time.frameCount; } }
         public static bool quietBackground;   // set by the replay record pass: background scanners (object database, reference index, audio refs, hidden scans, code deps, spawn cache) wait until it ends
         // Background scanners (object database, reference index, sound library, audio database and reference scan, hidden scans,
         // code deps, spawn cache, live savepoints, timed-audio and catalog scans) cost 30-170 ms of main thread each: they wait while
@@ -78,7 +85,15 @@ namespace InsideDev
             tDiscovery = Discovery.Update;
             tBridge = () => Remote.Update(this);
             tExtensions = () => { Extensions.LoadAll(this); Extensions.Tick(this); };
-            tAudioSpy = () => { if (AudioSpy.Instance == null || !(SoundEngine.GetImplementationDebug() is AudioSpy)) { if (Time.realtimeSinceStartup > nextAudioTry) { nextAudioTry = Time.realtimeSinceStartup + 2f; AudioSpy.Install(); } } };
+            // once a second: is the spy still the sound engine's implementation; an install that did not happen (engine not
+            // ready, or switched off with audio.spy=0) is tried again after 2 s
+            tAudioSpy = () =>
+            {
+                float now = Time.realtimeSinceStartup;
+                if (now < nextAudioTry) return;
+                nextAudioTry = now + 1f;
+                if (AudioSpy.Instance == null || !(SoundEngine.GetImplementationDebug() is AudioSpy)) { nextAudioTry = now + 2f; AudioSpy.Install(); }
+            };
             tHiddenScanTick = TickHidden;
             tSpawnCache = SpawnCache.Scan;
             ui = new UI(draw);
@@ -86,8 +101,11 @@ namespace InsideDev
             EditorState.Load();
             uiScale = EditorState.Get("ui.scale", 1f);
             hud = EditorState.Get("hud", true);
-            overlay.labelLevel = Mathf.Clamp(EditorState.Get("overlay.labels", 3), 0, 3); overlay.showLabels = overlay.labelLevel > 0;
-            overlay.scope = Mathf.Clamp(EditorState.Get("overlay.scope", 1), 0, 4);
+            overlay.LoadChoices();
+            hotkeysGame = EditorState.Get("hotkeys.game", true);
+            LoadConsoleHistory();
+            conRow = ConsoleRow;
+            DescribeKeys();
             hdAtlas = EditorState.Get("hidden.atlas", false);
             RenderDiag.board = EditorState.Get("diag.board", false);
             TransformGizmo.Load();
@@ -101,6 +119,43 @@ namespace InsideDev
             GlobalSearch.RegisterDefaults(this);
             RegisterCommands();
             try { Application.logMessageReceived += OnUnityLog; } catch (Exception e) { DevLog.Error("log hook", e); }
+            try { unityUpdateFrame = Time.frameCount; } catch { }
+            Doctor.Register(DoctorPart, DoctorRows);
+            RplXSetup.Register();
+            SceneRecorder.RegisterDoctor();
+        }
+
+        static void DescribeKeys()
+        {
+            EditorState.Describe("core", "ui.scale", "1", "editor UI scale (0.5 to 2; Settings tab)");
+            EditorState.Describe("core", "hud", "1", "HUD lines at the top of the picture (F5)");
+            EditorState.Describe("core", "hotkeys.game", "1", "1 = F7 god, F8 kill, [ ] \\ time scale and middle-click teleport always work; 0 = only while the editor panel is open");
+            EditorState.Describe("core", "console.history", "", "the last 50 console commands, oldest first, separated by | (a | inside a command is written %7C, a % is written %25)");
+            EditorState.Describe("core", "hidden.atlas", "0", "Hidden tab: list the switched-off objects of all levels from the atlas instead of the loaded scenes");
+            EditorState.Describe("core", "diag.board", "0", "diagnostics board drawn over the picture (F11)");
+            EditorState.Describe("core", "render.renderer", "gl", "editor renderer: gl (immediate) or mesh (batched)");
+            EditorState.Describe("core", "mode.author", "0", "Mod Author mode of the History panel");
+            EditorState.Describe("core", "inspector.mode", "0", "Inspector detail: 0 Normal, 1 Advanced, 2 Raw");
+            EditorState.Describe("core", "insp.fold.signals", "1", "Inspector: section Signal connections open");
+            EditorState.Describe("core", "insp.fold.connectors", "1", "Inspector: section SignalConnector wiring open");
+            Overlay.DescribeKeys();
+        }
+
+        // the sibling part "core" (bridge, audio, background) has its own check; a part name can be registered once
+        const string DoctorPart = "core.loop";
+        List<Doctor.Row> DoctorRows()
+        {
+            var rows = new List<Doctor.Row>();
+            rows.Add(DevLog.FileOpen ? new Doctor.Row(DoctorPart, "log file", Doctor.Ok, "_mod\\insidedev.log is being written")
+                                     : new Doctor.Row(DoctorPart, "log file", Doctor.Warn, "_mod\\insidedev.log could not be opened; messages stay in memory (console tab) only", "check that the game folder is writable and no other program holds the file"));
+            rows.Add(fallbackUpdLogged ? new Doctor.Row(DoctorPart, "update driver", Doctor.Warn, "Unity stopped calling the editor's Update at least once; the loader fallback (Savegame.Update) drove it")
+                                       : new Doctor.Row(DoctorPart, "update driver", Doctor.Ok, "Unity Update"));
+            rows.Add(new Doctor.Row(DoctorPart, "streaming scan", Doctor.Info, Levels.Status()));
+            var ov = Perf.Get("Overlay");
+            rows.Add(ov.disabled ? new Doctor.Row(DoctorPart, "world overlay", Doctor.Fail, "switched off by the fail-safe after repeated errors", "perf enable Overlay")
+                                 : new Doctor.Row(DoctorPart, "world overlay", Doctor.Info, "triggers " + overlay.TriggerModeLabel + ", labels " + Overlay.LabelLevels[overlay.labelLevel] + ", " + Fmt.I(overlay.entries.Count) + " colliders listed"));
+            rows.Add(new Doctor.Row(DoctorPart, "game hotkeys", Doctor.Info, hotkeysGame ? "always on (hotkeys.game=1)" : "only while the editor panel is open (hotkeys.game=0)"));
+            return rows;
         }
 
         void OnUnityLog(string msg, string stack, LogType type)
@@ -112,15 +167,20 @@ namespace InsideDev
         // ---------------------------------------------------------------- per-frame logic
         public void LateUpdate()
         {
-            Perf.Run("Shockwave", tShockwave);
+            if (Shockwave.noKill || Shockwave.Editing) Perf.Run("Shockwave", tShockwave);
             Perf.Run("AudioTimed", tAudioTimed);
             if (BackgroundOk) Perf.Run("AudioCatalog", tAudioCatalog);
             CameraControl.Apply();
             Perf.Run("RenderScale", tRenderScale);
         }
 
+        // Runs once per frame. Unity's DevRoot.Update and the loader fallback (Boot.Tick) can both arrive in one frame;
+        // the second call returns at once, so hotkeys and clicks are never handled twice.
         public void Update()
         {
+            int frame = Time.frameCount;
+            if (updFrame == frame) return;
+            updFrame = frame;
             try
             {
                 fpsAcc += Time.unscaledDeltaTime; fpsFrames++;
@@ -140,31 +200,44 @@ namespace InsideDev
                 if (EditorInput.ctrl && !InputCapture.keyboard && EditorInput.Key(KeyCode.Z)) DevLog.Write("[history] " + (EditorInput.shift ? ChangeRecorder.Redo() : ChangeRecorder.Undo()));
                 if (EditorInput.ctrl && !InputCapture.keyboard && EditorInput.Key(KeyCode.Y)) DevLog.Write("[history] " + ChangeRecorder.Redo());
                 if (EditorInput.Key(KeyCode.BackQuote)) { ShowTab(TabConsoleI); ui.focus = "con"; }
+                // keys that change the game itself; hotkeys.game=0 keeps them for the open editor only
+                bool gameKeys = hotkeysGame || panel;
                 if (!InputCapture.keyboard)
                 {
-                    if (EditorInput.Key(KeyCode.F2)) { overlay.CycleTriggers(); DevLog.Write("triggers: " + overlay.TriggerModeLabel); }
-                    if (EditorInput.Key(KeyCode.F3)) { overlay.showSolids = !overlay.showSolids; overlay.ForceRefresh(); }
-                    if (EditorInput.Key(KeyCode.F4) && (Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift))) { overlay.scope = (overlay.scope + 1) % 5; EditorState.Set("overlay.scope", overlay.scope); DevLog.Write("[overlay] scope " + Overlay.Scopes[overlay.scope]); }
-                    else if (EditorInput.Key(KeyCode.F4)) { overlay.labelLevel = (overlay.labelLevel + 1) % 4; overlay.showLabels = overlay.labelLevel > 0; EditorState.Set("overlay.labels", overlay.labelLevel); }
+                    if (EditorInput.Key(KeyCode.F2)) { overlay.CycleTriggers(); overlay.SaveChoices(); DevLog.Write("triggers: " + overlay.TriggerModeLabel); }
+                    if (EditorInput.Key(KeyCode.F3)) { overlay.showSolids = !overlay.showSolids; overlay.ForceRefresh(); overlay.SaveChoices(); }
+                    if (EditorInput.Key(KeyCode.F4) && (Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift))) { overlay.scope = (overlay.scope + 1) % 5; overlay.SaveChoices(); DevLog.Write("[overlay] scope " + Overlay.Scopes[overlay.scope]); }
+                    else if (EditorInput.Key(KeyCode.F4)) { overlay.SetLabelLevel((overlay.labelLevel + 1) % 4); overlay.SaveChoices(); }
                     if (EditorInput.Key(KeyCode.F5)) { hud = !hud; EditorState.Set("hud", hud); }
-                    if (EditorInput.Key(KeyCode.F6)) overlay.showSavepoints = !overlay.showSavepoints;
-                    if (EditorInput.Key(KeyCode.F7)) { G.God = !G.God; DevLog.Write("god " + (G.God ? "ON" : "OFF")); }
-                    if (EditorInput.Key(KeyCode.F8)) G.Kill();
+                    if (EditorInput.Key(KeyCode.F6)) { overlay.showSavepoints = !overlay.showSavepoints; overlay.SaveChoices(); }
+                    if (gameKeys && EditorInput.Key(KeyCode.F7)) { G.God = !G.God; DevLog.Write("god " + (G.God ? "ON" : "OFF")); }
+                    if (gameKeys && EditorInput.Key(KeyCode.F8)) G.Kill();
                     if (EditorInput.Key(KeyCode.F9)) { draw.flipY = !draw.flipY; DevLog.Write("flipY " + draw.flipY); }
-                    if (EditorInput.Key(KeyCode.F10)) { overlay.showHidden = !overlay.showHidden; if (overlay.showHidden) ScanHidden(); DevLog.Write("hidden markers " + overlay.showHidden); }
+                    if (EditorInput.Key(KeyCode.F10)) { SetHiddenMarkers(!overlay.showHidden); DevLog.Write("hidden markers " + overlay.showHidden); }
                     if (EditorInput.Key(KeyCode.F11)) { RenderDiag.board = !RenderDiag.board; EditorState.Set("diag.board", RenderDiag.board); }
-                    if (EditorInput.Key(KeyCode.LeftBracket)) G.TimeScale = Step(G.TimeScale, false);
-                    if (EditorInput.Key(KeyCode.RightBracket)) G.TimeScale = Step(G.TimeScale, true);
-                    if (EditorInput.Key(KeyCode.Backslash)) G.TimeScale = 1f;
+                    if (gameKeys)
+                    {
+                        if (EditorInput.Key(KeyCode.LeftBracket)) G.TimeScale = Step(G.TimeScale, false);
+                        if (EditorInput.Key(KeyCode.RightBracket)) G.TimeScale = Step(G.TimeScale, true);
+                        if (EditorInput.Key(KeyCode.Backslash)) G.TimeScale = 1f;
+                    }
                 }
                 ui.BeginFrame(uiScale);
                 if (panel)
                 {
+                    // the game's own cursor state is put back when the panel closes
+                    if (!cursorHeld) { cursorHeld = true; cursorWasVisible = Cursor.visible; cursorWasLock = Cursor.lockState; }
+                    Background.PanelOpen();
                     Cursor.visible = true;
                     Cursor.lockState = CursorLockMode.None;
                     Perf.Run("EditorUI", tEditorUI);
                     try { CommandPalette.Draw(ui); } catch (Exception e) { DevLog.Error("palette", e); ui.EndArea(); CommandPalette.open = false; }
                     try { ui.DrawTooltip(); } catch (Exception e) { DevLog.Error("tooltip", e); }
+                }
+                else if (cursorHeld)
+                {
+                    cursorHeld = false;
+                    try { Cursor.visible = cursorWasVisible; Cursor.lockState = cursorWasLock; } catch (Exception e) { DevLog.Error("cursor restore", e); }
                 }
                 InputCapture.Update(panel && ui.focus != null, CameraControl.free);
                 CameraControl.Update(ui.mouseOverUI);
@@ -192,19 +265,22 @@ namespace InsideDev
                 Perf.Run("CustomSpawns", tCustomSpawns);
                 Perf.Run("Gizmo", tGizmo);
                 Perf.Run("WorldPick", tWorldPick);
-                if (EditorInput.down[2] && !ui.mouseOverUI && !capLock) TeleportToMouse();
+                if (gameKeys && EditorInput.down[2] && !ui.mouseOverUI && !capLock) TeleportToMouse();
                 Perf.Run("Overlay", tOverlay);
                 Perf.Run("Levels", tLevels);
-                if (bg) Perf.Run("LiveSavepoints", tLiveSavepoints);
                 Perf.Run("Discovery", tDiscovery);
                 Perf.Run("Bridge", tBridge);
                 Perf.Run("Extensions", tExtensions);
                 Perf.Run("AudioSpy", tAudioSpy);
-                if (bg) Perf.Run("HiddenScan", tHiddenScanTick);
+                // hidden markers are the user's own switch (F10, overlay.hidden); with it off this costs nothing
+                if (overlay.showHidden) { if (bg) Perf.Run("HiddenMarkers", tHiddenScanTick); }
+                else if (hiddenIdx >= 0) hiddenIdx = -1;
                 if (bg) Perf.Run("SpawnCache", tSpawnCache);
             }
             catch (Exception e) { DevLog.Error("Update", e); }
         }
+
+        bool cursorHeld, cursorWasVisible; CursorLockMode cursorWasLock;
 
         static float Step(float v, bool up)
         {
@@ -230,9 +306,25 @@ namespace InsideDev
         // ---------------------------------------------------------------- world layer (built by RenderHost once per submitted frame)
         public bool Panel { get { return panel; } }
 
+        // One bad frame (an object destroyed between two checks) must not end the overlay for the session: it is switched
+        // off only after OverlayFailLimit failures in a row; the error is logged once a second at most.
+        const int OverlayFailLimit = 30;
+        int overlayFails; float overlayErrAt = -10f;
+
         void BuildWorld(Draw d)
         {
-            try { overlay.Emit(d); } catch (Exception e) { DevLog.Error("Overlay.Emit", e); overlay.showTriggers = overlay.showSolids = overlay.showSavepoints = false; }
+            try { overlay.Emit(d); overlayFails = 0; }
+            catch (Exception e)
+            {
+                overlayFails++;
+                if (Time.realtimeSinceStartup - overlayErrAt > 1f) { overlayErrAt = Time.realtimeSinceStartup; DevLog.Error("Overlay.Emit", e); }
+                if (overlayFails >= OverlayFailLimit)
+                {
+                    overlayFails = 0;
+                    overlay.showTriggers = overlay.showSolids = overlay.showSavepoints = overlay.showHidden = false;
+                    DevLog.Write("[overlay] switched off after " + OverlayFailLimit + " failed frames in a row (F2 / F3 / F6 / F10 switch it back on)");
+                }
+            }
             try { WorldPick.Emit(d); } catch (Exception e) { DevLog.Error("pick overlay", e); }
             try { SelectionOverlay.Emit(d); } catch (Exception e) { DevLog.Error("selection overlay", e); SelectionOverlay.enabled = false; }
             try { TransformGizmo.Emit(d); } catch (Exception e) { DevLog.Error("gizmo", e); TransformGizmo.SetGlobal(false); }
@@ -240,35 +332,77 @@ namespace InsideDev
             try { RenderDiag.DrawBoard(d, panel ? workspace.GameViewRect(uiScale) : new Rect(0, 0, Screen.width, Screen.height)); } catch (Exception e) { DevLog.Error("diag board", e); RenderDiag.board = false; }
         }
 
+        // HUD: three kept strings, drawn every frame. The values behind them are looked at 4 times a second and a string
+        // is built again only when one of its values changed, so a frame with the HUD on allocates nothing.
+        static readonly Color cHudLevel = new Color(0.6f, 1f, 0.7f, 1f), cHudKeys = new Color(0.75f, 0.8f, 0.9f, 1f), cHudBack = new Color(0, 0, 0, 0.45f);
+        string hudLine = "", hudLevel = "", hudChName = "no char";
+        float hudNext, hudTs = -1f;
+        int hudChId, hudSub = -2, hudSp = -2, hudTrig = -1, hudFps = -1, hudLvSub = -2, hudLvKey = -1;
+        bool hudDead, hudGod, hudKeysGame;
+        Vector3 hudPos;
+
         void DrawHud()
         {
+            float now = Time.realtimeSinceStartup;
+            if (now >= hudNext || hudKeys == null) { hudNext = now + 0.25f; RefreshHud(); }
+            draw.Fill(new Rect(0, 0, Screen.width, 54), cHudBack);
+            draw.ShadowText(10, 4, hudLine, Color.white, 13);
+            draw.ShadowText(10, 20, hudLevel, cHudLevel, 13);
+            draw.ShadowText(10, 36, hudKeys, cHudKeys, 12);
+        }
+
+        void RefreshHud()
+        {
             var ch = G.MainCharacter;
-            string pos = ch != null ? ch.pos3.ToString("F2") : "-";
+            bool has = (object)ch != null;
+            int chId = has ? ch.GetInstanceID() : 0;
+            bool dead = has && ch.isDead;
+            Vector3 pos = has ? ch.pos3 : Vector3.zero;
             int sub, sp;
-            string where = G.CurrentSavepoint(out sub, out sp) ? G.SubsceneLabel(sub) + " #" + sp : "-";
-            string s = string.Format("INSIDE Dev {8}  |  {0} {1}  |  pos {2}  |  sp {3}  |  ts {4:0.##}{5}  |  triggers {6}  |  {7:0} fps",
-                ch != null ? ch.name : "no char", ch != null && ch.isDead ? "(dead)" : "", pos, where, G.TimeScale, G.God ? "  |  GOD" : "",
-                overlay.visibleTriggers, fps, Boot.Version);
-            string lvl = "level: ?";
-            if (sub >= 0)
+            bool known = G.CurrentSavepoint(out sub, out sp);
+            float ts = G.TimeScale;
+            bool god = G.God;
+            int trig = overlay.visibleTriggers, fpsI = Mathf.RoundToInt(fps);
+            bool moved = Mathf.Abs(pos.x - hudPos.x) >= 0.005f || Mathf.Abs(pos.y - hudPos.y) >= 0.005f || Mathf.Abs(pos.z - hudPos.z) >= 0.005f;
+            if (hudLine.Length == 0 || chId != hudChId || dead != hudDead || moved || sub != hudSub || sp != hudSp || ts != hudTs || god != hudGod || trig != hudTrig || fpsI != hudFps)
             {
-                string subName = SafeSubName(sub);
-                var parts = Levels.ForSubscene(subName);
-                var gp = parts.Find(x => x.part.StartsWith("Game", StringComparison.OrdinalIgnoreCase)) ?? (parts.Count > 0 ? parts[0] : null);
-                lvl = "level: " + (gp != null ? gp.name + " = " + gp.File + " (scene " + gp.index + ", " + gp.area + ")" : subName + " (no build scene match)");
-                if (parts.Count > 1)
-                {
-                    var others = new List<string>();
-                    foreach (var p in parts) if (p != gp) others.Add(p.part + " " + p.File);
-                    lvl += "   +  " + string.Join(", ", others.ToArray());
-                }
+                if (chId != hudChId || hudLine.Length == 0) hudChName = has ? ch.name : "no char";
+                hudChId = chId; hudDead = dead; hudPos = pos; hudSub = sub; hudSp = sp; hudTs = ts; hudGod = god; hudTrig = trig; hudFps = fpsI;
+                hudLine = "INSIDE Dev " + Boot.Version + "  |  " + hudChName + " " + (dead ? "(dead)" : "") + "  |  pos " + (has ? Fmt.V3(pos, "F2") : "-") +
+                          "  |  sp " + (known ? G.SubsceneLabel(sub) + " #" + Fmt.I(sp) : "-") + "  |  ts " + Fmt.F(ts, "0.##") + (god ? "  |  GOD" : "") +
+                          "  |  triggers " + Fmt.I(trig) + "  |  " + Fmt.I(fpsI) + " fps";
             }
-            lvl += "   |   streaming: " + Levels.activeCount + " active / " + Levels.loadedCount + " loaded scenes";
-            draw.Fill(new Rect(0, 0, Screen.width, 54), new Color(0, 0, 0, 0.45f));
-            draw.ShadowText(10, 4, s, Color.white, 13);
-            draw.ShadowText(10, 20, lvl, new Color(0.6f, 1f, 0.7f, 1f), 13);
-            if (hudKeysFor != overlay.TriggerModeLabel || hudKeysFilter != WorldPick.filter) { hudKeysFor = overlay.TriggerModeLabel; hudKeysFilter = WorldPick.filter; hudKeys = "F1 panel  F2 triggers: " + hudKeysFor + "  F3 solids  F4 labels  P pick (Shift+P filter: " + WorldPick.Filters[WorldPick.filter] + ")  F6 savepoints  F7 god  F8 kill  F9 flip  F10 hidden  F11 diagnostics  Ins freecam  +/-/0 zoom  [ ] \\ time  MMB teleport  ` console"; }
-            draw.ShadowText(10, 36, hudKeys, new Color(0.75f, 0.8f, 0.9f, 1f), 12);
+            int lvKey = (Levels.activeCount * 1000 + Levels.loadedCount) * 1000 + Levels.scenes.Count;
+            if (hudLevel.Length == 0 || sub != hudLvSub || lvKey != hudLvKey)
+            {
+                hudLvSub = sub; hudLvKey = lvKey;
+                hudLevel = LevelLine(sub) + "   |   streaming: " + Fmt.I(Levels.activeCount) + " active / " + Fmt.I(Levels.loadedCount) + " loaded scenes";
+            }
+            bool gameKeys = hotkeysGame || panel;
+            if (hudKeys == null || hudKeysFor != overlay.TriggerModeLabel || hudKeysFilter != WorldPick.filter || hudKeysGame != gameKeys)
+            {
+                hudKeysFor = overlay.TriggerModeLabel; hudKeysFilter = WorldPick.filter; hudKeysGame = gameKeys;
+                hudKeys = "F1 panel  F2 triggers: " + hudKeysFor + "  F3 solids  F4 labels  P pick (Shift+P filter: " + WorldPick.Filters[WorldPick.filter] + ")  F6 savepoints" +
+                          (gameKeys ? "  F7 god  F8 kill" : "") + "  F9 flip  F10 hidden  F11 diagnostics  Ins freecam  +/-/0 zoom" + (gameKeys ? "  [ ] \\ time  MMB teleport" : "") + "  ` console";
+            }
+        }
+
+        static string LevelLine(int sub)
+        {
+            if (sub < 0) return "level: ?";
+            string subName = SafeSubName(sub);
+            var parts = Levels.ForSubscene(subName);
+            Levels.Scene gp = null;
+            foreach (var x in parts) if (x.part.StartsWith("Game", StringComparison.OrdinalIgnoreCase)) { gp = x; break; }
+            if (gp == null && parts.Count > 0) gp = parts[0];
+            string lvl = "level: " + (gp != null ? gp.name + " = " + gp.File + " (scene " + gp.index + ", " + gp.area + ")" : subName + " (no build scene match)");
+            if (parts.Count > 1)
+            {
+                var others = new List<string>();
+                foreach (var p in parts) if (p != gp) others.Add(p.part + " " + p.File);
+                lvl += "   +  " + string.Join(", ", others.ToArray());
+            }
+            return lvl;
         }
 
         // ---------------------------------------------------------------- spawn points
@@ -276,10 +410,20 @@ namespace InsideDev
         float nextSpScan; int spStream = -1;
         bool spOnlyLoaded;
 
+        // Live Savepoint objects of the loaded areas (FindObjectsOfType: up to 14 ms). Only the Spawn points tab and a
+        // teleport to a savepoint use them, so the list is refreshed while that tab is drawn (every 2 s or after a
+        // streaming change) and right before such a teleport. With the tab closed nothing runs.
         void RefreshLiveSavepoints()
         {
             if (Time.realtimeSinceStartup < nextSpScan && !Levels.Changed(ref spStream)) return;
-            nextSpScan = Time.realtimeSinceStartup + (panel ? 2f : 30f);
+            ScanLiveSavepoints();
+        }
+
+        float spScanAt = -1e9f; int spScanStream = -1;
+        void ScanLiveSavepoints()
+        {
+            nextSpScan = Time.realtimeSinceStartup + 2f;
+            spScanAt = Time.realtimeSinceStartup; spScanStream = Levels.StreamVersion;
             liveSp.Clear();
             try
             {
@@ -314,7 +458,11 @@ namespace InsideDev
         public void TeleportToSpawn(int s, int i)
         {
             Vector3 p;
-            bool areaLoaded = liveSp.ContainsKey(s * 1000 + i);
+            // the list sleeps with the Spawn points tab closed, and an entry of an area that was unloaded since the last
+            // scan holds a destroyed object: bring it up to date and count live objects only
+            if (Time.realtimeSinceStartup - spScanAt > 2f || spScanStream != Levels.StreamVersion) ScanLiveSavepoints();
+            Savepoint liveNow;
+            bool areaLoaded = liveSp.TryGetValue(s * 1000 + i, out liveNow) && liveNow != null;
             if (!areaLoaded)
             {
                 // teleporting into an unloaded area drops the character into the void: load it first
@@ -358,7 +506,7 @@ namespace InsideDev
                 }
                 else if (ui.Button("Rename", 60)) { csRenameIdx = i; csRename = e.name; ui.focus = "csren"; }
                 if (ui.Button("Delete", 56)) { CustomSpawns.Delete(i); ui.EndRow(); break; }
-                ui.Label(e.name + "   " + e.subscene.TrimStart('#') + " #" + e.savepoint + "   @" + e.pos.ToString("F1"), rsp ? UI.Accent : UI.Txt);
+                ui.Label(e.name + "   " + e.subscene.TrimStart('#') + " #" + e.savepoint + "   @" + Fmt.V3(e.pos, "F1"), rsp ? UI.Accent : UI.Txt);
                 ui.EndRow();
             }
             if (es.Count == 0) ui.Label("   none yet", UI.Dim);
@@ -371,6 +519,7 @@ namespace InsideDev
         void TabSpawns()
         {
             if (!G.SavepointsReady) { ui.Label("Savepoint manager not loaded yet — start or continue a game.", UI.Dim); return; }
+            if (BackgroundOk) Perf.RunNested("LiveSavepoints", tLiveSavepoints);
             CustomSpawnsUI();
             int curSub, curSp;
             G.CurrentSavepoint(out curSub, out curSp);
@@ -459,7 +608,7 @@ namespace InsideDev
                     ui.Space(22);
                     bool here = s == curSub && i == curSp;
                     string area = gameN >= 0 ? SafeAreaName(s, i) : SafeSubName(s) + " #" + i;
-                    ui.Label((here ? "> " : "  ") + "#" + i + "   " + area + "   " + type + (known ? "   @" + p.ToString("F1") : ""), here ? UI.Accent : (live ? UI.Txt : UI.Dim), ui.Width - 124);
+                    ui.Label((here ? "> " : "  ") + "#" + i + "   " + area + "   " + type + (known ? "   @" + Fmt.V3(p, "F1") : ""), here ? UI.Accent : (live ? UI.Txt : UI.Dim), ui.Width - 124);
                     if (ui.Button("Spawn", 60)) G.LoadSavepoint(s, i);
                     if (ui.Button("TP", 40)) TeleportToSpawn(s, i);
                     ui.EndRow();
@@ -469,8 +618,16 @@ namespace InsideDev
         }
 
         // ---------------------------------------------------------------- hidden objects
-        public class HiddenEntry { public GameObject go; public string kind; public string path; }
+        public class HiddenEntry
+        {
+            public GameObject go; public string kind; public string path;
+            // kept by the views so that they do not ask the engine or build text every frame: the overlay (position and
+            // "alive" read every few frames, marker label) and the Hidden tab (name, row text per shown distance)
+            public Vector3 pos; public bool alive; public int checkAt;
+            public string label, name, nameLower, rowText; public float rowDist = -1f;
+        }
         public readonly List<HiddenEntry> hidden = new List<HiddenEntry>();
+        int hiddenVersion;
         float nextHiddenScan;
         string hdFilter = "";
         bool hdOffObjects = true, hdNoRender = true, hdOffColliders = true;
@@ -480,10 +637,14 @@ namespace InsideDev
         // something, or every 30 s (5 s with the editor open); 3 ms per frame at most.
         readonly List<HiddenEntry> hiddenNext = new List<HiddenEntry>();
         int hiddenIdx = -1, hiddenPass = -1, hiddenHist = -1, hiddenStream = -1;
+        float nextHiddenDemand;
         void TickHidden()
         {
             if (!overlay.showHidden) { hiddenIdx = -1; return; }
-            if (Levels.Changed(ref hiddenStream)) ObjectDatabase.Demand(20f);   // get a fresh database pass after streaming
+            // the markers are built from the object database: ask for a fresh pass after streaming, and for a first pass
+            // when the markers were switched on before the database ever ran (overlay.hidden=1 at start)
+            if (Levels.Changed(ref hiddenStream)) { ObjectDatabase.DemandQuiet(20f); Background.Want(Background.Objects, 20f); }
+            else if (!ObjectDatabase.Ready && Time.realtimeSinceStartup > nextHiddenDemand) { nextHiddenDemand = Time.realtimeSinceStartup + 5f; WantObjects(10f); }
             if (hiddenIdx < 0)
             {
                 bool due = Time.realtimeSinceStartup > nextHiddenScan || ObjectDatabase.completedPasses != hiddenPass || ChangeRecorder.Version != hiddenHist;
@@ -501,8 +662,22 @@ namespace InsideDev
                 if ((hiddenIdx & 63) == 0 && System.Diagnostics.Stopwatch.GetTimestamp() - t0 > budget) return;
             }
             hidden.Clear(); hidden.AddRange(hiddenNext); hiddenNext.Clear();
-            overlay.hiddenEntries = hidden;
+            overlay.hiddenEntries = hidden; hiddenVersion++;
             hiddenIdx = -1;
+        }
+
+        static void WantObjects(float seconds)
+        {
+            ObjectDatabase.Demand(seconds);
+            Background.Want(Background.Objects, seconds);
+        }
+
+        // F10, the Hidden tab and the cheats: the choice is kept in editor.cfg (overlay.hidden)
+        void SetHiddenMarkers(bool on)
+        {
+            overlay.showHidden = on;
+            overlay.SaveChoices();
+            if (on) ScanHidden();
         }
 
         static void CheckHidden(Transform t, List<HiddenEntry> into)
@@ -556,7 +731,7 @@ namespace InsideDev
                 }
             }
             catch (Exception e) { DevLog.Error("ScanHidden", e); }
-            overlay.hiddenEntries = hidden;
+            overlay.hiddenEntries = hidden; hiddenVersion++;
         }
 
         // "All levels (atlas)": switched-off objects in every level file, from the level atlas
@@ -614,6 +789,7 @@ namespace InsideDev
 
         void TabHidden()
         {
+            Background.Want(Background.Hidden, 3f);
             Atlas.EnsureLoaded();
             if (Atlas.Present)
             {
@@ -629,7 +805,9 @@ namespace InsideDev
             ui.Label("Filter:", null, 44);
             ui.TextField("hdf", ref hdFilter, 200);
             bool m = ui.Toggle(overlay.showHidden, "markers in world [F10]");
-            if (m != overlay.showHidden) { overlay.showHidden = m; if (m) ScanHidden(); }
+            if (m != overlay.showHidden) SetHiddenMarkers(m);
+            bool pon = PassiveHidden.enabled;
+            if (ui.Toggle(pon, "passive scanner always on") != pon) PassiveHidden.enabled = !pon;
             ui.EndRow();
             ui.BeginRow();
             hdOffObjects = ui.Toggle(hdOffObjects, "objects switched off");
@@ -637,20 +815,32 @@ namespace InsideDev
             hdOffColliders = ui.Toggle(hdOffColliders, "disabled triggers/colliders");
             ui.EndRow();
             ui.Label("Only what is in the currently loaded scenes exists in memory - other areas' objects appear once they stream in.", UI.Dim);
-            var ch = G.MainCharacter;
-            Vector3 origin = ch != null ? ch.pos3 : Vector3.zero;
-            var list = new List<KeyValuePair<float, HiddenEntry>>();
-            string f = hdFilter.ToLowerInvariant();
-            foreach (var h in hidden)
+            // nearest-first list rebuilt 4x per second (or when the scan, the filter or a toggle changed), not every frame;
+            // the object names are read once per entry
+            int hdKeyNow = hiddenVersion * 8 + (hdOffObjects ? 1 : 0) + (hdNoRender ? 2 : 0) + (hdOffColliders ? 4 : 0);
+            if (Time.realtimeSinceStartup - hdAt > 0.25f || hdKeyNow != hdKey || hdFilter != hdFilterUsed)
             {
-                if (h.go == null) continue;
-                bool isOff = h.kind == "off", isRen = h.kind == "renderer off";
-                if ((isOff && !hdOffObjects) || (isRen && !hdNoRender) || (!isOff && !isRen && !hdOffColliders)) continue;
-                if (f.Length > 0 && !h.go.name.ToLowerInvariant().Contains(f)) continue;
-                list.Add(new KeyValuePair<float, HiddenEntry>((h.go.transform.position - origin).magnitude, h));
+                hdAt = Time.realtimeSinceStartup; hdKey = hdKeyNow; hdFilterUsed = hdFilter;
+                var ch = G.MainCharacter;
+                Vector3 origin = ch != null ? ch.pos3 : Vector3.zero;
+                hdList.Clear();
+                string f = hdFilter.ToLowerInvariant();
+                int changed = Changes.list.Count;
+                foreach (var h in hidden)
+                {
+                    if (h.go == null) continue;
+                    bool isOff = h.kind == "off", isRen = h.kind == "renderer off";
+                    if ((isOff && !hdOffObjects) || (isRen && !hdNoRender) || (!isOff && !isRen && !hdOffColliders)) continue;
+                    if (h.name == null) { h.name = h.go.name; h.nameLower = h.name.ToLowerInvariant(); }
+                    if (f.Length > 0 && !h.nameLower.Contains(f)) continue;
+                    if (changed > 0 && Changes.IsChanged(h.go)) continue;
+                    hdList.Add(new KeyValuePair<float, HiddenEntry>((h.go.transform.position - origin).magnitude, h));
+                }
+                hdList.Sort(byDistance);
+                hdHead = hdList.Count + " hidden item(s), nearest first" + (changed > 0 ? "   |   " + changed + " changed by you (purple, top)" : "");
             }
-            list.Sort((a, b) => a.Key.CompareTo(b.Key));
-            ui.Label(list.Count + " hidden item(s), nearest first" + (Changes.list.Count > 0 ? "   |   " + Changes.list.Count + " changed by you (purple, top)" : ""), UI.Dim);
+            var list = hdList;
+            ui.Label(hdHead, UI.Dim);
             if (Changes.list.Count > 0)
             {
                 ui.BeginRow();
@@ -673,7 +863,6 @@ namespace InsideDev
                 });
                 ui.Space(4);
             }
-            list.RemoveAll(kv => kv.Value.go == null || Changes.IsChanged(kv.Value.go));
             ui.VirtualList("hd", list.Count, UI.RowPitch, ui.Remaining, i =>
             {
                 var h = list[i].Value;
@@ -681,13 +870,19 @@ namespace InsideDev
                 if (g == null) return;
                 ui.BeginRow();
                 bool visibleNow = h.kind == "off" ? g.activeSelf : h.kind == "renderer off" ? AnyRenderer(g) : AnyCollider(g);
-                if (ui.Button(visibleNow ? "Hide" : "Show", 50)) SetShown(h, !visibleNow);
+                if (ui.Button(visibleNow ? "Hide" : "Show", 50)) { SetShown(h, !visibleNow); hdAt = -9f; }
                 if (ui.Button("Go", 30)) G.Teleport(g.transform.position);
-                if (ui.Item(list[i].Key.ToString("F1", CultureInfo.InvariantCulture) + "m   " + g.name + "   [" + h.kind + "]   " + Parent(g), visibleNow ? new Color(0.6f, 1f, 0.7f, 1f) : new Color(1f, 0.45f, 0.9f, 1f)))
+                float shownDist = Mathf.Round(list[i].Key * 10f);
+                if (h.rowText == null || h.rowDist != shownDist) { h.rowDist = shownDist; h.rowText = Fmt.F(list[i].Key, "F1") + "m   " + h.name + "   [" + h.kind + "]   " + Parent(g); }
+                if (ui.Item(h.rowText, visibleNow ? new Color(0.6f, 1f, 0.7f, 1f) : new Color(1f, 0.45f, 0.9f, 1f)))
                     SelectInInspector(g);
                 ui.EndRow();
             });
         }
+
+        readonly List<KeyValuePair<float, HiddenEntry>> hdList = new List<KeyValuePair<float, HiddenEntry>>();
+        static readonly Comparison<KeyValuePair<float, HiddenEntry>> byDistance = (a, b) => a.Key.CompareTo(b.Key);
+        float hdAt = -9f; int hdKey = -1; string hdFilterUsed, hdHead = "";
 
         static string Parent(GameObject g) { var p = g.transform.parent; return p == null ? "" : "in " + p.name; }
         static bool AnyRenderer(GameObject g) { foreach (var r in g.GetComponents<Renderer>()) if (r != null && r.enabled) return true; return false; }
@@ -705,13 +900,14 @@ namespace InsideDev
         // ---------------------------------------------------------------- world state (persistent flags)
         string wsFilter = "";
         readonly List<PersistentBool> pbools = new List<PersistentBool>();
-        float nextPbScan;
+        float nextPbScan; int pbStream = -1;
 
         void TabWorld()
         {
-            if (Time.realtimeSinceStartup > nextPbScan)
+            // the flag objects come and go with streaming: searched again then, and every 10 s as a safety net
+            if (Time.realtimeSinceStartup > nextPbScan || pbStream != Levels.StreamVersion)
             {
-                nextPbScan = Time.realtimeSinceStartup + 2f;
+                nextPbScan = Time.realtimeSinceStartup + 10f; pbStream = Levels.StreamVersion;
                 pbools.Clear();
                 foreach (var o in Resources.FindObjectsOfTypeAll(typeof(PersistentBool)))
                 {
@@ -739,7 +935,15 @@ namespace InsideDev
                 shown++;
                 ui.BeginRow();
                 bool v = ui.Toggle(pb.current, "", 22);
-                if (v != pb.current) { pb.current = v; DevLog.Write("persistent '" + name + "' = " + v); }
+                if (v != pb.current)
+                {
+                    // the flag is an auto-property: the history records its backing field, so undo, "Revert all my
+                    // changes" and "Record as mod" know the edit before the next savepoint writes it into the savegame
+                    try { ChangeRecorder.Before(ChangeRecorder.Prop.Make(pb.gameObject, pb, ChangeRecorder.PropKind.Field, "<current>k__BackingField"), "world", "persistent '" + name + "'"); }
+                    catch (Exception e) { DevLog.Error("persistent flag history", e); }
+                    pb.current = v;
+                    DevLog.Write("persistent '" + name + "' = " + v);
+                }
                 if (ui.Item(name + "   (" + pb.gameObject.name + (pb.gameObject.activeInHierarchy ? "" : ", hidden") + ")", pb.current ? new Color(0.6f, 1f, 0.7f, 1f) : UI.Txt))
                 { inspector.Select(pb.gameObject); ShowTab(TabInspectorI); }
                 ui.EndRow();
@@ -899,10 +1103,11 @@ namespace InsideDev
             {
                 var sc = Levels.scenes[i];
                 string st = Levels.StateOf(sc);
-                if (lvOnlyLoaded && (st == "" || st == "unloaded")) continue;
+                // the row of scene i is lvRows[i]: it is created before any filter skips the scene
                 LvRow row;
                 if (i >= lvRows.Count) { int sub; row = new LvRow { key = (sc.path + " " + sc.File).ToLowerInvariant(), sub = subIndex.TryGetValue(sc.baseName.ToLowerInvariant(), out sub) ? sub : -1 }; lvRows.Add(row); }
                 else row = lvRows[i];
+                if (lvOnlyLoaded && (st == "" || st == "unloaded")) continue;
                 if (f.Length > 0 && !row.key.Contains(f)) continue;
                 if (row.state != st || row.text == null) { row.state = st; row.text = sc.index.ToString("D3") + "  " + sc.File.PadRight(9) + "  " + sc.name + "   " + sc.area + (st.Length > 0 ? "   [" + st + "]" : ""); }
                 lvVisible.Add(i);
@@ -983,6 +1188,9 @@ namespace InsideDev
         readonly List<KeyValuePair<float, ColliderEntry>> trList = new List<KeyValuePair<float, ColliderEntry>>();
         readonly List<string> trText = new List<string>();
 
+        static readonly float[] tsSteps = { 0f, 0.1f, 0.25f, 0.5f, 1f, 2f, 4f };
+        static readonly string[] tsStepNames = { "0", "0.1", "0.25", "0.5", "1", "2", "4" };
+
         void TabCheats()
         {
             ui.BeginRow();
@@ -991,12 +1199,12 @@ namespace InsideDev
             if (ui.Button("Kill [F8]")) G.Kill();
             ui.EndRow();
 
-            ui.Label("Time scale: " + G.TimeScale.ToString("0.00") + "     [ / ] step,  \\ reset");
+            ui.Label("Time scale: " + Fmt.F(G.TimeScale, "0.00") + "     [ / ] step,  \\ reset");
             float ts = ui.Slider("ts", G.TimeScale, 0f, 4f);
             if (Mathf.Abs(ts - G.TimeScale) > 0.001f) G.TimeScale = ts;
             ui.BeginRow();
-            foreach (var v in new[] { 0f, 0.1f, 0.25f, 0.5f, 1f, 2f, 4f })
-                if (ui.Button(v.ToString("0.##"), 50)) G.TimeScale = v;
+            for (int i = 0; i < tsSteps.Length; i++)
+                if (ui.Button(tsStepNames[i], 50)) G.TimeScale = tsSteps[i];
             ui.EndRow();
 
             ui.Space();
@@ -1018,26 +1226,35 @@ namespace InsideDev
             ui.Space();
             ui.Label("Overlay", UI.Dim);
             ui.BeginRow();
+            // every choice made here is kept in editor.cfg (overlay.*)
+            bool choice = false;
             bool a = ui.Toggle(overlay.showTriggers, "triggers [F2]");
             bool b = ui.Toggle(overlay.showSolids, "solid colliders [F3]");
-            if (a != overlay.showTriggers || b != overlay.showSolids) { overlay.showTriggers = a; overlay.showSolids = b; overlay.ForceRefresh(); }
-            if (ui.Button("show: " + overlay.TriggerModeLabel + " [F2]")) overlay.CycleTriggers();
-            if (ui.Button("labels: " + Overlay.LabelLevels[overlay.labelLevel] + " [F4]")) { overlay.labelLevel = (overlay.labelLevel + 1) % 4; overlay.showLabels = overlay.labelLevel > 0; EditorState.Set("overlay.labels", overlay.labelLevel); }
-            if (ui.Button("scope: " + Overlay.Scopes[overlay.scope] + " [Shift+F4]")) { overlay.scope = (overlay.scope + 1) % 5; EditorState.Set("overlay.scope", overlay.scope); }
-            overlay.showLinks = ui.Toggle(overlay.showLinks, "relation lines");
-            overlay.showSavepoints = ui.Toggle(overlay.showSavepoints, "savepoints [F6]");
+            if (a != overlay.showTriggers || b != overlay.showSolids) { overlay.showTriggers = a; overlay.showSolids = b; overlay.ForceRefresh(); choice = true; }
+            if (ui.Button("show: " + overlay.TriggerModeLabel + " [F2]")) { overlay.CycleTriggers(); choice = true; }
+            if (ui.Button("labels: " + Overlay.LabelLevels[overlay.labelLevel] + " [F4]")) { overlay.SetLabelLevel((overlay.labelLevel + 1) % 4); choice = true; }
+            if (ui.Button("scope: " + Overlay.Scopes[overlay.scope] + " [Shift+F4]")) { overlay.scope = (overlay.scope + 1) % 5; choice = true; }
+            bool links = ui.Toggle(overlay.showLinks, "relation lines");
+            if (links != overlay.showLinks) { overlay.showLinks = links; choice = true; }
+            bool saves = ui.Toggle(overlay.showSavepoints, "savepoints [F6]");
+            if (saves != overlay.showSavepoints) { overlay.showSavepoints = saves; choice = true; }
             ui.EndRow();
             ui.BeginRow();
-            hud = ui.Toggle(hud, "HUD [F5]");
+            bool hudNow = ui.Toggle(hud, "HUD [F5]");
+            if (hudNow != hud) { hud = hudNow; EditorState.Set("hud", hud); }
             draw.flipY = ui.Toggle(draw.flipY, "flip Y [F9] (if everything is upside down)");
             captureGameLog = ui.Toggle(captureGameLog, "mirror game log to console");
             ui.EndRow();
             ui.BeginRow();
-            ui.Label("Draw distance " + overlay.maxDistance.ToString("0") + "m", null, 150);
-            overlay.maxDistance = ui.Slider("dist", overlay.maxDistance, 5f, 300f);
+            ui.Label("Draw distance " + Fmt.F(overlay.maxDistance, "0") + "m", null, 150);
+            float dist = ui.Slider("dist", overlay.maxDistance, 5f, 300f);
+            if (dist != overlay.maxDistance) { overlay.maxDistance = dist; choice = true; }
             ui.EndRow();
+            if (choice) overlay.SaveChoices();
             ui.Label("green = savepoint   red = kill/death   cyan = camera   purple = audio   orange = logic   deep blue = water   teal = fx   white = streaming   yellow = other trigger   grey = solid", UI.Dim);
             ui.Label("Middle-click in the world teleports the boy/huddle to the cursor (on its current depth plane).", UI.Dim);
+            bool gk = ui.Toggle(hotkeysGame, "game hotkeys also while the editor is closed: F7 god, F8 kill, [ ] \\ time scale, middle-click teleport");
+            if (gk != hotkeysGame) { hotkeysGame = gk; EditorState.Set("hotkeys.game", gk); }
 
             ui.Space();
             ui.Label("Picking and moving", UI.Dim);
@@ -1066,20 +1283,96 @@ namespace InsideDev
             }
         }
 
-        int lastLogCount;
+        // ---------------------------------------------------------------- console
+        // The log view is rebuilt when a message arrived (DevLog.Total; the kept list stops growing at DevLog.MaxLines, so
+        // its Count says nothing), when "clear" ran, or when the filter changed. Up / Down recall the last
+        // ConsoleHistoryMax commands; they are kept in editor.cfg (console.history).
+        const int ConsoleHistoryMax = 50;
+        readonly List<string> conHistory = new List<string>();
+        int conHistoryAt = -1;      // -1 = a new line is being typed, otherwise the index of the recalled command
+        string conDraft = "";       // the line that was being typed when Up was pressed first
+        string conFilter = "", conFilterUsed, conHead = "";
+        int lastLogTotal = -1, lastLogClears = -1;
+        float conCopiedAt = -10f;
         List<string> conLines;
+        Action<int> conRow;
+
+        void LoadConsoleHistory()
+        {
+            conHistory.Clear();
+            string s = EditorState.Get("console.history", "");
+            if (s.Length == 0) return;
+            foreach (var part in s.Split('|'))
+            {
+                string cmd = part.Replace("%7C", "|").Replace("%25", "%").Trim();
+                if (cmd.Length > 0) conHistory.Add(cmd);
+            }
+            if (conHistory.Count > ConsoleHistoryMax) conHistory.RemoveRange(0, conHistory.Count - ConsoleHistoryMax);
+        }
+
+        void RememberCommand(string cmd)
+        {
+            conHistoryAt = -1; conDraft = "";
+            conHistory.Remove(cmd);     // a repeated command moves to the end instead of filling the list
+            conHistory.Add(cmd);
+            if (conHistory.Count > ConsoleHistoryMax) conHistory.RemoveRange(0, conHistory.Count - ConsoleHistoryMax);
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < conHistory.Count; i++)
+            {
+                if (i > 0) sb.Append('|');
+                sb.Append(conHistory[i].Replace("%", "%25").Replace("|", "%7C"));
+            }
+            EditorState.Set("console.history", sb.ToString());
+        }
+
+        void ConsoleRow(int i)
+        {
+            ui.Label(conLines[i]);
+            if (ui.click && ui.LastHoverVisible) { Clipboard.Set(conLines[i]); conCopiedAt = Time.realtimeSinceStartup; }
+        }
+
         void TabConsole()
         {
+            ui.BeginRow();
+            ui.Label("Filter:", null, 44);
+            ui.TextField("conf", ref conFilter, 220);
+            if (conFilter.Length > 0 && ui.Button("x", 24)) conFilter = "";
+            ui.Label(Time.realtimeSinceStartup - conCopiedAt < 1.5f ? "line copied to the clipboard" : conHead, UI.Dim);
+            ui.EndRow();
             float h = ui.Remaining - UI.LineH - 6;
-            if (DevLog.Lines.Count != lastLogCount || conLines == null)
+            int total = DevLog.Total, clears = DevLog.Clears;
+            if (total != lastLogTotal || clears != lastLogClears || conFilter != conFilterUsed || conLines == null)
             {
-                lastLogCount = DevLog.Lines.Count;
-                conLines = new List<string>();
-                lock (DevLog.Lines) foreach (var l in DevLog.Lines) conLines.AddRange(l.Split('\n'));
+                lastLogTotal = total; lastLogClears = clears; conFilterUsed = conFilter;
+                if (conLines == null) conLines = new List<string>(); else conLines.Clear();
+                string f = conFilter.Trim();
+                int all = 0;
+                foreach (var msg in DevLog.Tail(DevLog.MaxLines))
+                    foreach (var raw in msg.Split('\n'))
+                    {
+                        string l = raw.TrimEnd('\r');
+                        all++;
+                        if (f.Length == 0 || l.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0) conLines.Add(l);
+                    }
+                conHead = (f.Length > 0 ? conLines.Count + " of " + all + " lines" : all + " lines") + "     Up / Down: earlier commands     click a line: copy it     every bridge command works here";
                 ui.ScrollToEnd("con");
             }
-            var cl = conLines;
-            ui.VirtualList("con", cl.Count, UI.ItemPitch, h, i => ui.Label(cl[i]));
+            ui.VirtualList("con", conLines.Count, UI.ItemPitch, h, conRow);
+            if (ui.FocusIs("con") && conHistory.Count > 0)
+            {
+                if (Input.GetKeyDown(KeyCode.UpArrow))
+                {
+                    if (conHistoryAt < 0) { conDraft = conInput; conHistoryAt = conHistory.Count; }
+                    if (conHistoryAt > 0) conHistoryAt--;
+                    conInput = conHistory[conHistoryAt];
+                }
+                else if (Input.GetKeyDown(KeyCode.DownArrow) && conHistoryAt >= 0)
+                {
+                    conHistoryAt++;
+                    if (conHistoryAt >= conHistory.Count) { conHistoryAt = -1; conInput = conDraft; }
+                    else conInput = conHistory[conHistoryAt];
+                }
+            }
             ui.BeginRow();
             bool enter = ui.TextField("con", ref conInput, ui.Width - 60);
             bool run = ui.Button("Run", 50);
@@ -1088,6 +1381,8 @@ namespace InsideDev
             {
                 string cmd = conInput.Trim();
                 conInput = "";
+                RememberCommand(cmd);
+                Background.Touch();
                 DevLog.Write("> " + cmd);
                 try { Commands.Run(cmd, this); } catch (Exception e) { DevLog.Write("error: " + e.Message); }
             }
@@ -1114,9 +1409,9 @@ namespace InsideDev
             EditorCommands.Register("sel-boy", "Teleport the boy to the selected object", "selection", () => { G.Teleport(Selection.Current.transform.position); return "teleported"; }, null, () => Selection.Current != null);
             EditorCommands.Register("sel-clear", "Clear selection", "selection", () => { Selection.Clear("command"); return ""; }, null, () => Selection.Current != null);
             EditorCommands.Register("pick", "Toggle world pick mode", "world", () => { WorldPick.mode = !WorldPick.mode; return "pick mode " + (WorldPick.mode ? "on" : "off"); }, "P");
-            EditorCommands.Register("scope", "Cycle overlay scope (selected / 1 hop / 2 hops / nearby / all)", "world", () => { overlay.scope = (overlay.scope + 1) % 5; EditorState.Set("overlay.scope", overlay.scope); return "scope " + Overlay.Scopes[overlay.scope]; }, "Shift+F4");
-            EditorCommands.Register("labels", "Cycle overlay labels", "world", () => { overlay.labelLevel = (overlay.labelLevel + 1) % 4; overlay.showLabels = overlay.labelLevel > 0; EditorState.Set("overlay.labels", overlay.labelLevel); return "labels " + Overlay.LabelLevels[overlay.labelLevel]; }, "F4");
-            EditorCommands.Register("triggers", "Cycle trigger overlay: all / general / savepoints / cameras / kill / audio / logic / water / fx / streaming / off", "world", () => { overlay.CycleTriggers(); return "triggers: " + overlay.TriggerModeLabel; }, "F2");
+            EditorCommands.Register("scope", "Cycle overlay scope (selected / 1 hop / 2 hops / nearby / all)", "world", () => { overlay.scope = (overlay.scope + 1) % 5; overlay.SaveChoices(); return "scope " + Overlay.Scopes[overlay.scope]; }, "Shift+F4");
+            EditorCommands.Register("labels", "Cycle overlay labels", "world", () => { overlay.SetLabelLevel((overlay.labelLevel + 1) % 4); overlay.SaveChoices(); return "labels " + Overlay.LabelLevels[overlay.labelLevel]; }, "F4");
+            EditorCommands.Register("triggers", "Cycle trigger overlay: all / general / savepoints / cameras / kill / audio / logic / water / fx / streaming / off", "world", () => { overlay.CycleTriggers(); overlay.SaveChoices(); return "triggers: " + overlay.TriggerModeLabel; }, "F2");
             EditorCommands.Register("god", "Toggle god mode", "cheats", () => { G.God = !G.God; return "god " + G.God; }, "F7");
             EditorCommands.Register("kill", "Kill the boy", "cheats", () => { G.Kill(); return "killed"; }, "F8");
             for (int i = 0; i < tabIds.Length; i++) { string id = tabIds[i]; EditorCommands.Register("open-" + id, "Open panel: " + tabs[i], "panels", () => { ShowPanel(id); return ""; }); }
@@ -1176,7 +1471,7 @@ namespace InsideDev
             ui.Label("UI scale", UI.Dim);
             ui.BeginRow();
             foreach (var sc in new[] { 0.75f, 1f, 1.25f, 1.5f })
-                if (ui.Button((sc * 100).ToString("0") + "%", 60, Mathf.Approximately(uiScale, sc) ? UI.TabSel : (Color?)null)) { uiScale = sc; EditorState.Set("ui.scale", sc); }
+                if (ui.Button(Fmt.F(sc * 100, "0") + "%", 60, Mathf.Approximately(uiScale, sc) ? UI.TabSel : (Color?)null)) { uiScale = sc; EditorState.Set("ui.scale", sc); }
             ui.EndRow();
             ui.Space();
             ui.Label("Layout", UI.Dim);
@@ -1220,30 +1515,44 @@ namespace InsideDev
 
     public static class Commands
     {
-        static readonly CultureInfo IC = CultureInfo.InvariantCulture;
+        static int bridging;
 
         public static void Run(string line, DevCore root) { Run(line, root, true); }
 
         // extensions: a word the console does not know goes to the loaded extensions' Command handlers (the way the
-        // bridge asks them), tokenised like the bridge (Words = Remote.Split: quotes group words); the bridge passes
-        // false because it asked them already
+        // bridge asks them), tokenised like the bridge (Words = Remote.Split: quotes group words), and after them to the
+        // bridge's own command set, so every bridge command can be typed in the console; the bridge passes false because
+        // it asked both already
         public static void Run(string line, DevCore root, bool extensions)
         {
             var a = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            if (a.Length == 0) return;
             string c = a[0].ToLowerInvariant();
             switch (c)
             {
                 case "help":
-                    DevLog.Write("tp <x> <y> [z] | spawn|load <sub> <sp> | tpsp <sub> <sp> | discover all|<sub> | post <event> | cue <name> | shockwave nokill|fire | catalog | subs [filter] | levels [filter] | where | kill | god [on|off] | ts <scale>\n" +
-                                 "find <name> | sel <name> | respawn | reload | triggers|solids|labels|savepoints [on|off]\n" +
+                    DevLog.Write("tp <x> <y> [z] | spawn|load <sub> <sp> | tpsp <sub> <sp> | discover all|<sub> | post <event> | cue <name> | shockwave nokill|fire | catalog | subs [filter] | levels [filter] | where [json] | kill | god [on|off] | ts <scale>\n" +
+                                 "find <name> | sel <name> | respawn | reload | triggers|solids|savepoints [on|off] | labels [on|off|OFF|SELECTED|NEARBY|ALL]\n" +
                                  "flag <name> [on|off] | flags | clear | atlas [find <text> | level <n> | check]");
+                    if (extensions && bridging == 0)
+                    {
+                        DevLog.Write("the console also runs every bridge command; the bridge's own list:");
+                        Bridge("help", root);
+                    }
                     break;
                 case "tp":
                     {
-                        var ch = G.MainCharacter;
-                        if (a.Length < 3) { DevLog.Write("usage: tp <x> <y> [z]"); break; }
-                        float z = a.Length > 3 ? float.Parse(a[3], IC) : (ch != null ? ch.pos3.z : 0f);
-                        G.Teleport(new Vector3(float.Parse(a[1], IC), float.Parse(a[2], IC), z));
+                        float x = 0f, y = 0f, z = 0f;
+                        bool numbers = (a.Length == 3 || a.Length == 4) && Fmt.TryF(a[1], out x) && Fmt.TryF(a[2], out y) && (a.Length == 3 || Fmt.TryF(a[3], out z));
+                        if (!numbers)
+                        {
+                            // "tp <object>" is the bridge's form of the command
+                            if (a.Length == 2 && extensions && Bridge(line, root)) break;
+                            DevLog.Write("usage: tp <x> <y> [z]   (decimal point: tp 12.5 3)   |   tp <object>");
+                            break;
+                        }
+                        if (a.Length == 3) { var ch = G.MainCharacter; z = ch != null ? ch.pos3.z : 0f; }
+                        G.Teleport(new Vector3(x, y, z));
                         break;
                     }
                 case "levels":
@@ -1262,7 +1571,17 @@ namespace InsideDev
                     }
                 case "discover":
                     if (a.Length > 1 && a[1] == "all") Discovery.DiscoverAll();
-                    else if (a.Length > 1) Discovery.Enqueue(int.Parse(a[1]), 0, Discovery.Action.Discover);
+                    else if (a.Length > 1)
+                    {
+                        if (!G.SavepointsReady) { DevLog.Write("refused: savepoints not ready (start or continue a game first)"); break; }
+                        int sub;
+                        if (!Fmt.TryI(a[1], out sub) || sub < 0 || sub >= SavepointManager.SubsceneCount) { DevLog.Write("usage: discover all | discover <subsceneIndex>   (0.." + Fmt.I(SavepointManager.SubsceneCount - 1) + ", see subs)"); break; }
+                        // an area the game already knows needs no discovery, and a discovery job unloads its area when it
+                        // is done: never start one for an area that may be the one the boy stands in
+                        int known = SavepointManager.GetSubsceneSavepointCount(sub);
+                        if (known >= 0) { DevLog.Write("refused: " + G.SubsceneLabel(sub) + " is already known (" + Fmt.I(known) + " savepoints)"); break; }
+                        Discovery.Enqueue(sub, 0, Discovery.Action.Discover);
+                    }
                     else DevLog.Write("usage: discover all | discover <subsceneIndex>");
                     break;
                 case "post":
@@ -1279,14 +1598,20 @@ namespace InsideDev
                     else DevLog.Write("usage: shockwave nokill | shockwave fire");
                     break;
                 case "tpsp":
-                    if (a.Length < 3) { DevLog.Write("usage: tpsp <subsceneIndex> <savepointIndex>"); break; }
-                    root.TeleportToSpawn(int.Parse(a[1]), int.Parse(a[2]));
-                    break;
+                    {
+                        int sub, sp;
+                        if (a.Length < 3 || !Fmt.TryI(a[1], out sub) || !Fmt.TryI(a[2], out sp)) { DevLog.Write("usage: tpsp <subsceneIndex> <savepointIndex>"); break; }
+                        root.TeleportToSpawn(sub, sp);
+                        break;
+                    }
                 case "spawn":
                 case "load":
-                    if (a.Length < 3) { DevLog.Write("usage: load <subsceneIndex> <savepointIndex>"); break; }
-                    G.LoadSavepoint(int.Parse(a[1]), int.Parse(a[2]));
-                    break;
+                    {
+                        int sub, sp;
+                        if (a.Length < 3 || !Fmt.TryI(a[1], out sub) || !Fmt.TryI(a[2], out sp)) { DevLog.Write("usage: load <subsceneIndex> <savepointIndex>"); break; }
+                        G.LoadSavepoint(sub, sp);
+                        break;
+                    }
                 case "subs":
                     {
                         if (!G.SavepointsReady) { DevLog.Write("savepoints not ready"); break; }
@@ -1304,7 +1629,33 @@ namespace InsideDev
                         var ch = G.MainCharacter;
                         int sub, sp;
                         G.CurrentSavepoint(out sub, out sp);
-                        DevLog.Write((ch != null ? ch.name + " at " + ch.pos3.ToString("F3") : "no character") + "   savepoint " + (sub >= 0 ? G.SubsceneLabel(sub) + " #" + sp + " (load " + sub + " " + sp + ")" : "?"));
+                        if (a.Length > 1 && string.Equals(a[a.Length - 1], "json", StringComparison.OrdinalIgnoreCase))
+                        {
+                            // one JSON line; the bridge answers it when it has the command, so both give the same object
+                            if (extensions && Bridge(line, root)) break;
+                            var o = new Json.Obj();
+                            o["ok"] = true;
+                            if (ch != null)
+                            {
+                                Vector3 p = ch.pos3;
+                                var boy = new Json.Obj();
+                                boy["name"] = ch.name;
+                                boy["pos"] = new List<object> { Math.Round((double)p.x, 3), Math.Round((double)p.y, 3), Math.Round((double)p.z, 3) };
+                                boy["dead"] = ch.isDead;
+                                o["boy"] = boy;
+                            }
+                            else o["boy"] = null;
+                            if (sub >= 0)
+                            {
+                                var save = new Json.Obj();
+                                save["sub"] = sub; save["sp"] = sp; save["label"] = G.SubsceneLabel(sub);
+                                o["savepoint"] = save;
+                            }
+                            else o["savepoint"] = null;
+                            DevLog.Write(JsonLine.Write(o));
+                            break;
+                        }
+                        DevLog.Write((ch != null ? ch.name + " at " + Fmt.V3(ch.pos3, "F3") : "no character") + "   savepoint " + (sub >= 0 ? G.SubsceneLabel(sub) + " #" + sp + " (load " + sub + " " + sp + ")" : "?"));
                         break;
                     }
                 case "atlas": DevLog.Write(Atlas.Command(a)); break;
@@ -1314,13 +1665,20 @@ namespace InsideDev
                     DevLog.Write("god " + (G.God ? "ON" : "OFF"));
                     break;
                 case "ts":
-                    if (a.Length > 1) G.TimeScale = float.Parse(a[1], IC);
-                    DevLog.Write("timescale " + G.TimeScale);
+                    if (a.Length > 1)
+                    {
+                        float v;
+                        if (!Fmt.TryF(a[1], out v)) { DevLog.Write("usage: ts <scale>   (0 to 10, decimal point: ts 0.5)"); break; }
+                        G.TimeScale = v;
+                    }
+                    DevLog.Write("timescale " + Fmt.F(G.TimeScale));
                     break;
                 case "find":
                 case "sel":
                     {
                         if (a.Length < 2) { DevLog.Write("usage: " + c + " <name>"); break; }
+                        // "sel back|fwd|clear" is the bridge's selection history
+                        if (c == "sel" && a.Length == 2 && extensions && (a[1] == "back" || a[1] == "fwd" || a[1] == "clear") && Bridge(line, root)) break;
                         string q = line.Substring(line.IndexOf(' ') + 1).Trim();
                         root.Inspector.Search(q);
                         ObjectDatabase.EnsureFresh(3f);
@@ -1337,16 +1695,51 @@ namespace InsideDev
                         {
                             DevLog.Write(res.Count + " match(es)");
                             for (int i = 0; i < Math.Min(40, res.Count); i++)
-                                DevLog.Write("  " + Inspector.PathOf(res[i]) + "  @" + res[i].position.ToString("F2"));
+                                DevLog.Write("  " + Inspector.PathOf(res[i]) + "  @" + Fmt.V3(res[i].position, "F2"));
                         }
                         break;
                     }
                 case "respawn": GameManager.Respawn(); break;
                 case "reload": GameManager.ReloadScene(); break;
-                case "triggers": root.Overlay.showTriggers = a.Length > 1 ? On(a[1]) : !root.Overlay.showTriggers; root.Overlay.ForceRefresh(); break;
-                case "solids": root.Overlay.showSolids = a.Length > 1 ? On(a[1]) : !root.Overlay.showSolids; root.Overlay.ForceRefresh(); break;
-                case "labels": root.Overlay.showLabels = a.Length > 1 ? On(a[1]) : !root.Overlay.showLabels; break;
-                case "savepoints": root.Overlay.showSavepoints = a.Length > 1 ? On(a[1]) : !root.Overlay.showSavepoints; break;
+                case "triggers":
+                    {
+                        // "triggers <radius>" (the list of nearby triggers) is the bridge's form of the command
+                        if (a.Length > 1 && !IsOnOff(a[1]) && extensions && Bridge(line, root)) break;
+                        var ov = root.Overlay;
+                        ov.showTriggers = a.Length > 1 ? On(a[1]) : !ov.showTriggers; ov.ForceRefresh(); ov.SaveChoices();
+                        DevLog.Write("triggers: " + ov.TriggerModeLabel);
+                        break;
+                    }
+                case "solids":
+                    {
+                        var ov = root.Overlay;
+                        ov.showSolids = a.Length > 1 ? On(a[1]) : !ov.showSolids; ov.ForceRefresh(); ov.SaveChoices();
+                        DevLog.Write("solids " + (ov.showSolids ? "on" : "off"));
+                        break;
+                    }
+                case "labels":
+                    {
+                        // on = the level used last (ALL at first), off = OFF, or a level by name
+                        var ov = root.Overlay;
+                        if (a.Length > 1)
+                        {
+                            int lv = Array.IndexOf(Overlay.LabelLevels, a[1].ToUpperInvariant());
+                            if (lv >= 0) ov.SetLabelLevel(lv);
+                            else if (IsOnOff(a[1])) ov.SetLabels(On(a[1]));
+                            else { DevLog.Write("usage: labels [on|off|OFF|SELECTED|NEARBY|ALL]"); break; }
+                        }
+                        else ov.SetLabels(ov.labelLevel == 0);
+                        ov.SaveChoices();
+                        DevLog.Write("labels " + Overlay.LabelLevels[ov.labelLevel]);
+                        break;
+                    }
+                case "savepoints":
+                    {
+                        var ov = root.Overlay;
+                        ov.showSavepoints = a.Length > 1 ? On(a[1]) : !ov.showSavepoints; ov.SaveChoices();
+                        DevLog.Write("savepoints " + (ov.showSavepoints ? "on" : "off"));
+                        break;
+                    }
                 case "flags":
                     foreach (EditorMode.EDebugFlags fl in Enum.GetValues(typeof(EditorMode.EDebugFlags)))
                         if (fl != EditorMode.EDebugFlags.None) DevLog.Write("  " + fl + " = " + G.GetFlag(fl));
@@ -1354,26 +1747,50 @@ namespace InsideDev
                 case "flag":
                     {
                         if (a.Length < 2) { DevLog.Write("usage: flag <name> [on|off]"); break; }
-                        var fl = (EditorMode.EDebugFlags)Enum.Parse(typeof(EditorMode.EDebugFlags), a[1], true);
+                        EditorMode.EDebugFlags fl;
+                        try { fl = (EditorMode.EDebugFlags)Enum.Parse(typeof(EditorMode.EDebugFlags), a[1], true); }
+                        catch (ArgumentException) { DevLog.Write("unknown flag '" + a[1] + "' (flags lists them)"); break; }
                         G.SetFlag(fl, a.Length > 2 ? On(a[2]) : !G.GetFlag(fl));
                         DevLog.Write("flag " + fl + " = " + G.GetFlag(fl));
                         break;
                     }
-                case "clear": lock (DevLog.Lines) DevLog.Lines.Clear(); break;
+                case "clear": DevLog.Clear(); break;
                 default:
                     {
                         string reply = extensions ? Extensions.Command(Words(line), root) : null;
                         if (reply != null) DevLog.Write(reply);
-                        else DevLog.Write("unknown command '" + c + "' — try help");
+                        else if (!extensions || !Bridge(line, root)) DevLog.Write("unknown command '" + c + "' — try help");
                         break;
                     }
             }
+        }
+
+        // Hands a line to the bridge's command set and prints the reply in the console. False when the line already
+        // came from there. A word the bridge does not know either comes back through Run(line, root, false), which prints
+        // "unknown command".
+        static bool Bridge(string line, DevCore root)
+        {
+            if (bridging > 0) return false;
+            bridging++;
+            try
+            {
+                string reply = Remote.RunLocal(line, root);
+                if (reply != null) DevLog.Write(reply);
+            }
+            finally { bridging--; }
+            return true;
         }
 
         static bool On(string s)
         {
             s = s.ToLowerInvariant();
             return s == "on" || s == "1" || s == "true" || s == "yes";
+        }
+
+        static bool IsOnOff(string s)
+        {
+            s = s.ToLowerInvariant();
+            return s == "on" || s == "off" || s == "1" || s == "0" || s == "true" || s == "false" || s == "yes" || s == "no";
         }
 
         static List<string> Words(string line)
@@ -1401,10 +1818,13 @@ namespace InsideDev
         void LateUpdate() { if (core != null) core.LateUpdate(); }
         void Update()
         {
-            try { RenderHost.OnUpdate(); } catch (Exception e) { DevLog.Error("RenderHost.OnUpdate", e); }
+            // when the loader fallback (Boot.Tick) already drove this frame, RenderHost and the core are not run again
+            bool driven = core != null && core.UpdatedThisFrame;
+            if (!driven) { try { RenderHost.OnUpdate(); } catch (Exception e) { DevLog.Error("RenderHost.OnUpdate", e); } }
             if (RenderHost.wantEofRestart) { RenderHost.wantEofRestart = false; StartEof("watchdog"); }
             if (core == null) return;
             core.unityUpdateRT = Time.realtimeSinceStartup;
+            core.unityUpdateFrame = Time.frameCount;
             core.Update();
         }
 
@@ -1438,6 +1858,7 @@ namespace InsideDev
         void OnApplicationQuit()
         {
             try { PassiveHidden.SaveIfDirty(); } catch (Exception e) { DevLog.Error("OnApplicationQuit", e); }
+            try { EditorState.Flush(); ModifiedPanel.Flush(); } catch (Exception e) { DevLog.Error("OnApplicationQuit editor state", e); }
             try { Extensions.Quit(); } catch (Exception e) { DevLog.Error("OnApplicationQuit extensions", e); }
         }
 

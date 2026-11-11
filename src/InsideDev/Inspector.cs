@@ -406,7 +406,7 @@ namespace InsideDev
             {
                 bool tr = ui.Toggle(col.isTrigger, "isTrigger");
                 if (tr != col.isTrigger) col.isTrigger = tr;
-                ui.Label("      bounds " + col.bounds.center.ToString("F2") + "  size " + col.bounds.size.ToString("F2"), UI.Dim);
+                ui.Label("      bounds " + Fmt.V3(col.bounds.center, "F2") + "  size " + Fmt.V3(col.bounds.size, "F2"), UI.Dim);
             }
             fieldRoot = comp;
             int count = DrawObjectFields(ui, comp, "c" + comp.GetInstanceID(), 0);
@@ -433,7 +433,7 @@ namespace InsideDev
                 ui.Space(24);
                 if (ui.Button("Play", 44)) { an.Stop(); an.Play(st.name); DevLog.Write("[anim] " + an.name + " play " + st.name); }
                 if (ui.Button("Stop", 44)) an.Stop(st.name);
-                ui.Label(st.name + "   " + st.length.ToString("0.00", IC) + " s   " + st.wrapMode + (an.IsPlaying(st.name) ? "   PLAYING " + (st.normalizedTime * 100f).ToString("0") + "%" : ""), an.IsPlaying(st.name) ? UI.Accent : UI.Txt);
+                ui.Label(st.name + "   " + st.length.ToString("0.00", IC) + " s   " + st.wrapMode + (an.IsPlaying(st.name) ? "   PLAYING " + (st.normalizedTime * 100f).ToString("0", IC) + "%" : ""), an.IsPlaying(st.name) ? UI.Accent : UI.Txt);
                 ui.EndRow();
             }
         }
@@ -513,7 +513,7 @@ namespace InsideDev
                         try
                         {
                             var r = mi.Invoke(comp, null);
-                            DevLog.Write("[call] " + t.Name + "." + mi.Name + "()" + (mi.ReturnType != typeof(void) ? " -> " + r : "") + " on " + comp.name);
+                            DevLog.Write("[call] " + t.Name + "." + mi.Name + "()" + (mi.ReturnType != typeof(void) ? " -> " + Fmt.Any(r) : "") + " on " + comp.name);
                         }
                         catch (Exception e) { DevLog.Write("[call] " + mi.Name + " failed: " + (e.InnerException ?? e).Message); }
                     }
@@ -588,12 +588,18 @@ namespace InsideDev
                 {
                     try
                     {
-                        object parsed = ft == typeof(string) ? (object)nv : Convert.ChangeType(nv, ft, IC);
+                        // numbers are read strictly (decimal point, no group separators): "0,25" is an error, not 25
+                        object parsed;
+                        if (ft == typeof(string)) parsed = nv;
+                        else if (ft == typeof(float)) parsed = float.Parse(nv.Trim(), NumberStyles.Float, IC);
+                        else if (ft == typeof(double)) parsed = double.Parse(nv.Trim(), NumberStyles.Float, IC);
+                        else parsed = int.Parse(nv.Trim(), NumberStyles.Integer, IC);
                         RecordField(key);
                         f.SetValue(owner, parsed);
                         edits.Remove(key);
                         DevLog.Write("set " + f.DeclaringType.Name + "." + f.Name + " = " + nv);
                     }
+                    catch (FormatException) { DevLog.Write("set " + f.Name + " failed: '" + nv + "' is not a number (use a decimal point, e.g. 0.25)"); }
                     catch (Exception e) { DevLog.Write("set " + f.Name + " failed: " + e.Message); }
                 }
             }
@@ -628,10 +634,12 @@ namespace InsideDev
             else if (v is UObj)
             {
                 var uo = (UObj)v;
+                // a field that still points at a destroyed object (usual after its area unloaded)
+                if (uo == null) { ui.Label("null (destroyed)", UI.Dim); ui.EndRow(); return; }
                 GameObject target = null;
                 if (uo is GameObject) target = (GameObject)uo;
                 else if (uo is Component) target = ((Component)uo).gameObject;
-                string txt = uo == null ? "null" : uo.name + " (" + uo.GetType().Name + ")";
+                string txt = uo.name + " (" + uo.GetType().Name + ")";
                 if (target != null) { if (ui.Item(txt, UI.Accent)) { ui.EndRow(); Select(target); return; } }
                 else ui.Label(txt);
             }
@@ -646,17 +654,6 @@ namespace InsideDev
                 object x; try { x = f.GetValue(v); } catch { continue; }
                 ui.Label(Indent(level) + f.Name + " = " + (ValueDump.IsNested(x) ? ValueDump.Compact(x, 2) : ValueDump.Short(x)), UI.Dim);
             }
-        }
-
-        static string Describe(object v)
-        {
-            if (v == null) return "null";
-            var col = v as ICollection;
-            if (col != null) return v.GetType().Name + " [" + col.Count + "]";
-            string s;
-            try { s = v.ToString(); } catch { s = "?"; }
-            if (s.Length > 80) s = s.Substring(0, 80) + "...";
-            return s;
         }
     }
 }
