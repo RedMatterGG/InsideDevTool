@@ -28,15 +28,29 @@ namespace InsideDev
         public bool Has(string key) { return given.Contains(key); }
     }
 
+    // One line of a SpecReport with its parts apart: severity "error" | "warning" | "note", the spec key it is about
+    // ("" = the spec as a whole) and the message.
+    public struct SpecIssue
+    {
+        public string severity, where, message;
+    }
+
     public sealed class SpecReport
     {
         public readonly List<string> errors = new List<string>();
         public readonly List<string> warnings = new List<string>();
         public readonly List<string> notes = new List<string>();
+        // the same lines as errors / warnings / notes, in the order they were reported
+        public readonly List<SpecIssue> issues = new List<SpecIssue>();
         public bool ok { get { return errors.Count == 0; } }
-        public void Error(string where, string message) { errors.Add(Line(where, message)); }
-        public void Warn(string where, string message) { warnings.Add(Line(where, message)); }
-        public void Note(string where, string message) { notes.Add(Line(where, message)); }
+        public void Error(string where, string message) { errors.Add(Line(where, message)); Issue("error", where, message); }
+        public void Warn(string where, string message) { warnings.Add(Line(where, message)); Issue("warning", where, message); }
+        public void Note(string where, string message) { notes.Add(Line(where, message)); Issue("note", where, message); }
+
+        void Issue(string severity, string where, string message)
+        {
+            issues.Add(new SpecIssue { severity = severity, where = where ?? "", message = message ?? "" });
+        }
 
         public string Summary(int max)
         {
@@ -416,6 +430,7 @@ namespace InsideDev
         public string pipeCodec = "hevc_nvenc";
         public int pipeQp = 14;
         public string readback = "auto";
+        public float stallSeconds = 30f;
     }
 
     public sealed class SessionSpec : SpecNode
@@ -431,6 +446,7 @@ namespace InsideDev
         public bool holdWhileLoading = true;
         public bool quietLog = true;
         public int gcSteps = 0;
+        public int stopAfterErrors = 300;
     }
 
     public sealed class PostSpec : SpecNode
@@ -456,6 +472,7 @@ namespace InsideDev
         public float timeout = 20f;
         public bool freeze = false;
         public bool addDuringTake = true;
+        public string rescan = "auto";
     }
 
     // ------------------------------------------------------------------ spec: cameras
@@ -1148,13 +1165,17 @@ namespace InsideDev
     {
         public const string BackfaceMark = "backfaces: ";
 
-        public static int At(CamSpec dir, double t, Func<TimeRef, double> timeOf, out int prev)
+        public static int At(CamSpec dir, double t, Func<TimeRef, double> timeOf, out int prev) { return At(dir, t, timeOf, null, out prev); }
+
+        // scratch: an array of at least dir.shots.Count numbers to work in, so a caller that asks every step makes no garbage
+        // (null or too short: a new one).
+        public static int At(CamSpec dir, double t, Func<TimeRef, double> timeOf, double[] scratch, out int prev)
         {
             prev = -1;
             int cur = -1;
             if (dir == null || timeOf == null) return -1;
             int n = dir.shots.Count;
-            var tf = new double[n];
+            var tf = scratch != null && scratch.Length >= n ? scratch : new double[n];
             double best = double.NegativeInfinity;
             for (int i = 0; i < n; i++)
             {

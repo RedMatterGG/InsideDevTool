@@ -20,7 +20,7 @@ namespace InsideDev
     public static class MultiCamRig
     {
         static readonly CultureInfo IC = CultureInfo.InvariantCulture;
-        static readonly string[] Common = { "name", "mode", "label", "enabled", "fov", "near", "focus", "roll", "playerSide", "zMax", "render", "post", "shake", "hide", "clamp", "view", "motion" };
+        static readonly string[] Common = { "name", "mode", "label", "enabled", "fov", "near", "focus", "roll", "playerSide", "zMax", "render", "post", "shake", "hide", "backfaces", "feedForward", "clamp", "view", "motion" };
         static readonly Dictionary<string, string[]> ModeKeys = new Dictionary<string, string[]>
         {
             { "game", new[] { "offset", "fovScale", "clean" } },
@@ -225,6 +225,52 @@ namespace InsideDev
                 catch (Exception e) { report.Error(Where(c), "validation failed: " + e.GetType().Name + ": " + e.Message); }
             }
             Cycles(spec, report);
+            try { SpeedUps(spec, report); }
+            catch (Exception e) { report.Warn("timing.segments", "speed-up check failed: " + e.GetType().Name + ": " + e.Message); }
+        }
+
+        // Replay specs: a speed-up between two segments where the sub-frame exposure of the faster one is longer than the
+        // step of the frame before it. The replay timeline shortens the exposure of the first frames there (record time
+        // never runs backwards); the note names the play.ramp that keeps the full exposure.
+        static void SpeedUps(MultiCamSpec spec, SpecReport report)
+        {
+            if (spec.replay == null || spec.timing == null) return;
+            var segs = spec.timing.segments;
+            float fps = spec.timing.fps > 0f ? spec.timing.fps : 30f;
+            float ramp = spec.replay.play != null ? spec.replay.play.ramp : 0f;
+            for (int i = 1; i < segs.Count; i++)
+            {
+                var a = segs[i - 1]; var b = segs[i];
+                if (a == null || b == null) continue;
+                double sa = SegSpeed(a, fps), sb = SegSpeed(b, fps);
+                double need = MultiCamReplayMath.OverlapRamp(sa, sb, Math.Max(1, b.samples), b.shutter, fps);
+                if (need == 0 || (need > 0 && ramp >= need - 1e-6)) continue;
+                report.Note("timing.segments[" + i.ToString(IC) + "]", "speed " + sa.ToString("0.####", IC) + " -> " + sb.ToString("0.####", IC) + " with " + b.samples.ToString(IC) + " samples and shutter " + F(b.shutter) +
+                            ": the first frame(s) after the speed-up get a shorter exposure" + (need > 0 ? "; replay.play.ramp >= " + need.ToString("0.###", IC) + " s keeps the full exposure" : " (no ramp avoids it with shutter 360)"));
+            }
+        }
+
+        static double SegSpeed(SegmentSpec s, float fps)
+        {
+            return s.rate > 0 ? Math.Max(1, s.samples) * fps / s.rate : s.speed;
+        }
+
+        // A beat's own point joins the beat's target here, when the plan is prepared: the target check and the run then
+        // resolve and report the very reference the rig samples, and a misspelt point is an error of mcam check instead of
+        // one log line in the middle of the take.
+        static void BeatPoints(CamSpec c, string w, SpecReport report)
+        {
+            for (int i = 0; i < c.beats.Count; i++)
+            {
+                var b = c.beats[i];
+                if (b == null || string.IsNullOrEmpty(b.point)) continue;
+                string bw = w + ".beats[" + i.ToString(IC) + "].point";
+                if (b.target == null) { report.Warn(bw, "ignored: a beat's point belongs to the beat's own target (the camera's target takes the camera's point)"); continue; }
+                string bad = MultiCamTargets.PointError(b.target, b.point);
+                if (bad != null) { report.Error(bw, bad); continue; }
+                if (b.point == "pivot" || b.target.fixedPoint || b.target.isGroup || !string.IsNullOrEmpty(b.target.point)) continue;
+                b.target = WithPoint(b.target, b.point);
+            }
         }
 
         static string Where(CamSpec c) { return !string.IsNullOrEmpty(c.where) ? c.where : "cameras." + c.name; }
@@ -247,7 +293,8 @@ namespace InsideDev
                 if (spec.defaults != null && spec.defaults.Has(k)) continue;
                 report.Warn(w + "." + k, "ignored by mode '" + c.mode + "'");
             }
-            if (c.fov > 60f) report.Warn(w + ".fov", "fov " + F(c.fov) + " > 60 (the game uses 50.99)");
+            if (c.fov >= 170f) report.Error(w + ".fov", "fov " + F(c.fov) + " must be below 170");
+            else if (c.fov > 60f) report.Warn(w + ".fov", "fov " + F(c.fov) + " > 60 (the game uses 50.99)");
             else if (c.fov > 51.5f) report.Note(w + ".fov", "fov " + F(c.fov) + " is wider than the game's 50.99");
             if (c.near < 0f) report.Error(w + ".near", "near must be >= 0");
             if (c.playerSide && c.zMax > 0f) report.Warn(w + ".zMax", "zMax " + F(c.zMax) + " > 0 lets the camera behind the set front");
@@ -311,6 +358,11 @@ namespace InsideDev
                 case "frame":
                     if (c.target == null) report.Error(w + ".target", "frame needs a target");
                     if (c.crop != null && (c.crop.Length != 4 || c.crop[2] <= 0f || c.crop[3] <= 0f)) report.Error(w + ".crop", "crop must be [x, y, w, h] with w, h > 0");
+                    else if (c.crop != null)
+                    {
+                        float fw = spec.session.res.x > 0f ? spec.session.res.x : Screen.width, fh = spec.session.res.y > 0f ? spec.session.res.y : Screen.height;
+                        if (c.crop[0] < 0f || c.crop[1] < 0f || c.crop[0] + c.crop[2] > fw || c.crop[1] + c.crop[3] > fh) report.Warn(w + ".crop", "crop leaves the " + F(fw) + "x" + F(fh) + " frame");
+                    }
                     if (c.size <= 0f) report.Error(w + ".size", "size must be > 0");
                     else if (c.size > 1f) report.Warn(w + ".size", "size > 1: the subject is taller than the frame");
                     if (c.screen.x < 0f || c.screen.x > 1f || c.screen.y < 0f || c.screen.y > 1f) report.Warn(w + ".screen", "screen point outside [0, 1]");
@@ -337,6 +389,7 @@ namespace InsideDev
                     if (c.hold < 0f || c.move < 0f || c.late < 0f) report.Error(w, "hold, move and late must be >= 0");
                     if (c.smooth < 0f) report.Error(w + ".smooth", "smooth must be >= 0");
                     OneOf(w, "ease", c.ease, BeatEases, report);
+                    BeatPoints(c, w, report);
                     for (int i = 0; i < c.beats.Count; i++)
                     {
                         var b = c.beats[i];
@@ -344,6 +397,7 @@ namespace InsideDev
                         string bw = w + ".beats[" + i.ToString(IC) + "]";
                         if (b.target == null && c.target == null) report.Error(bw + ".target", "beat needs a target");
                         if (b.hold < 0f || b.move < 0f) report.Error(bw, "hold and move must be >= 0");
+                        if (b.fov >= 170f) report.Error(bw + ".fov", "fov " + F(b.fov) + " must be below 170");
                         var offs = b.offsets.Count > 0 ? b.offsets : b.Has("offset") ? new List<Vector3> { b.offset } : c.offsets.Count > 0 ? c.offsets : new List<Vector3> { c.offset };
                         bool front = false;
                         foreach (var o in offs) if (o.z < -1f) front = true;
@@ -426,7 +480,8 @@ namespace InsideDev
                 if (c.playerSide && k.pos.z > c.zMax) report.Warn(kw + ".pos", "key z " + F(k.pos.z) + " is behind the player-side line (clamped unless overhead)");
                 bool keyLook = k.look != null ? !k.look.isNone : camLook;
                 if (!keyLook) Euler(kw, k.yaw, k.pitch, c.playerSide, report);
-                if (k.fov > 60f) report.Warn(kw + ".fov", "fov " + F(k.fov) + " > 60");
+                if (k.fov >= 170f) report.Error(kw + ".fov", "fov " + F(k.fov) + " must be below 170");
+                else if (k.fov > 60f) report.Warn(kw + ".fov", "fov " + F(k.fov) + " > 60");
             }
         }
 
@@ -1201,6 +1256,7 @@ namespace InsideDev
                 lookNone = s.look != null && s.look.isNone;
                 look = new LookTrack(this, LookRef(s, target, v1, true), s.lookOffset, Vector3.zero, s.lookSmooth, s.lead);
                 init = false;
+                ffInit = false; ffV = Vector3.zero;
                 GameCurves(out cx, out cy, out cz);
             }
 
@@ -1280,6 +1336,7 @@ namespace InsideDev
                 ease = v1 && !s.Has("ease") ? "each" : s.ease;
                 path = new Path(kp, linearInterp);
                 aimInit = false;
+                ffInit = false; ffV = Vector3.zero;
             }
 
             Vector3 KeyAim(MultiCamContext ctx, int j, out bool ok, out bool fresh)

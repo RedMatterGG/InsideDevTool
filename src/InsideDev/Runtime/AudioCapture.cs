@@ -41,9 +41,9 @@ namespace InsideDev
     //   (marker,label,sample,game_time,real_time,lag; real_time = realtimeSinceStartupDbl - clockBase). Only in the Update
     //   phase: a marker posted after this frame's RuntimeCallbacks.lateUpdate (SceneHooks.lateFrame == frameCount) is past
     //   RenderAudio, so its row gets lag + 1. Window markers `wopen`/`wclose` have sample -1 and lag -1.
-    // - ForceLevel(level) applies AudioRules.Change (changesPerForce times, 2 until the single-Change fix is verified by
+    // - ForceLevel(level) writes the rule (changesPerForce times, 2 until the single-write fix is verified by
     //   `acap rtpctest`) and reads GetRTPCValue. Wwise applies queued RTPC sets at the next RenderAudio, so the readback that
-    //   decides is taken by Tick from the second frame on (0.5 s limit, one repeat of the Change): a mismatch at level > 0
+    //   decides is taken by Tick from the second frame on (0.5 s limit, one repeat of the write): a mismatch at level > 0
     //   closes the window and stops the capture (capturing turns false, lastError set); at level 0 it is logged as an error and
     //   the watchdog keeps forcing. ForceLevel returns false when the rule or GetRTPCValue call fails, or for level > 0 outside
     //   a capture window (refused). ForceLevel(0) during a window closes it.
@@ -59,10 +59,24 @@ namespace InsideDev
     // - Stop(why) is idempotent (stop, abort, runner destruction, quit): ForceLevel(0) first, then StopOutputCapture;
     //   capturing is false on return, `finalizing` until the file is moved. Suspend is never woken automatically (G6: only
     //   `acap suspend off`, rtpc 0 verified and 100 ms later); keepSuspended false is reported, not acted on.
+    // Sound is only touched when asked: `acap status`, `help`, `output` without a value, `result`, `guard` without a value
+    // and `changes` start no guard and write no rule. The guard starts with preflight, start, rtpctest, `suspend on`,
+    // `output <value>` and `guard on` (and the callers above); with the audible output it unsubscribes again once nothing
+    // is captured, verified or suspended and no rule of acap is left; with the muted output it stays until `acap guard off`
+    // (rule released, no re-forcing until the guard is asked for again) or `acap output audible`.
+    // acap's own rule on the master volume is a raw AudioRules.Set: it makes no History entry, cannot be undone from the
+    // editor and never lands in a recorded mod. A rule on that RTPC that somebody else set is remembered (audible: at
+    // window open; muted: when the guard first overrides it) and put back when acap lets go. A release that leaves no
+    // rule is never repeated by the readback check, so nothing pins the volume afterwards.
+    // The capture file is moved to the take folder by a rename; to another volume it is copied on a worker thread
+    // (the main thread only polls). While the window is open the file must keep growing: a stand-still of 3 s is noted in
+    // status and audio_capture.json (stalls, maxNoGrowthS). A window at level 0 (game volume 0 or audio.level 0) is
+    // reported as a warning: the WAV will be silent. `acap result [json]` returns the last audio_capture.json.
     public static class AudioCapture
     {
         public static bool capturing;
         public static double clockBase;                                 // set by CORE to RecordHeader.t0Real before the first Marker; audio_sync.csv real_time = Time.realtimeSinceStartupDbl - clockBase
+        public static double gameBase;                                  // absolute Time.timeDbl of audio_sync.csv game_time 0 (srec header t0, or the manual start); lines grec video up with the audio
 
         public const string RtpcName = "rtpc_master_volume";
         public const string RtpcKey = "rtpc:" + RtpcName;
@@ -80,8 +94,12 @@ namespace InsideDev
 
         static readonly CultureInfo IC = CultureInfo.InvariantCulture;
         static readonly string DefaultHeartbeat = new AudioCapSpec().heartbeat;
-        static bool subscribed, opening, inEmergency;
-        static int tickFrame, ownPid = -2;
+        const double StallSeconds = 3.0;
+        const int IdleTicks = 120;
+        static bool subscribed, opening, inEmergency, guardOff, guardLogged;
+        static int tickFrame, ownPid = -2, idleTicks;
+        static Json.Obj lastInfo;
+        static string lastInfoFile = "";
         static double suspendedAt = -1, zeroVerifiedAt = -1;
         static Cap cur;
         static Verify verify;
@@ -102,11 +120,13 @@ namespace InsideDev
         {
             public AudioCapSpec spec;
             public string name = "", dir, abs = "", rel = "", bank = "", dest = "", sync = "", info = "", final = "";
-            public bool manual, muted, useSuspend, timer, moved, needsFix;
+            public bool manual, muted, useSuspend, timer, moved, needsFix, stallNoted;
             public float level, gameLevel = float.NaN;
             public string gameLevelSource = "";
-            public double t0, tAppear = -1, tOpen = -1, tClose = -1, tStop = -1, tFinal = -1, nextMove, quietWaitS = -1;
-            public int markers, markerFails, late, hbReads, hbBad, everActive;
+            public double t0, tAppear = -1, tOpen = -1, tClose = -1, tStop = -1, tFinal = -1, nextMove, quietWaitS = -1, nextGrow, lastGrow = -1, maxNoGrowth;
+            public int markers, markerFails, late, hbReads, hbBad, everActive, stalls;
+            public long lastLen = -1;
+            public Mover mover;
             public long seenStart = -1, seenEnd = -1;
             public double maxAge, maxPeak;
             public StreamWriter rows;
@@ -114,6 +134,9 @@ namespace InsideDev
             public AudioWavCheck wav;
             public readonly List<string> readbacks = new List<string>(), notes = new List<string>();
         }
+
+        // The copy of a capture file to a take folder on another volume: plain file IO on its own thread.
+        sealed class Mover { public System.Threading.Thread thread; public volatile bool done; public string error; }
 
         sealed class Verify { public float target; public double t0; public int frame; public bool retried; public string purpose = ""; public float first = float.NaN; }
         sealed class Wake { public double t0; }
@@ -131,23 +154,52 @@ namespace InsideDev
         static bool CloseMuted { get { return cur != null ? cur.muted : MutedOutput; } }
         static string PathName(Cap c) { return c.useSuspend ? "Suspend" : c.muted ? "muter-only" : "audible"; }
 
+        // A capture is running whose window level is 0: the WAV holds silence.
+        public static bool SilentNow { get { return cur != null && capturing && cur.level <= 0f; } }
+
         // ------------------------------------------------------------------ guard subscription
 
         public static void Ensure()
         {
+            guardOff = false;
+            idleTicks = 0;
             if (!subscribed)
             {
                 RuntimeCallbacks.update += Tick;
                 RuntimeCallbacks.applicationQuit += OnQuit;
                 subscribed = true;
-                DevLog.Write("[acap] guard on, output " + Output + ": " + (MutedOutput ? "rtpc " + RtpcName + " forced 0 outside capture windows, GetRTPCValue every 10th frame, heartbeat watchdog in windows" : "game sound audible, acap's own rtpc " + RtpcName + " rule removed outside captures, no heartbeat, no Suspend"));
+                if (!guardLogged || MutedOutput) DevLog.Write("[acap] guard on, output " + Output + ": " + (MutedOutput ? "rtpc " + RtpcName + " forced 0 outside capture windows, GetRTPCValue every 10th frame, heartbeat watchdog in windows" : "game sound audible, acap's own rtpc " + RtpcName + " rule removed outside captures, no heartbeat, no Suspend; the guard ends itself when idle"));
+                guardLogged = true;
             }
             if (windowOpen) return;
             if (MutedOutput) { if (!IsZero(AudioRules.Get(RtpcKey))) ZeroRule("ensure"); }
             else if (cur == null && test == null && wake == null && OwnRuleActive()) Release("ensure: audible output");
         }
 
+        static void Unsubscribe()
+        {
+            if (!subscribed) return;
+            RuntimeCallbacks.update -= Tick;
+            RuntimeCallbacks.applicationQuit -= OnQuit;
+            subscribed = false;
+            idleTicks = 0;
+        }
+
+        // Nothing left for the per-frame guard: no capture, test, wake or readback, Wwise not suspended, no rule of acap,
+        // and either the audible output or a muted guard the user switched off.
+        static bool GuardIdle()
+        {
+            return cur == null && test == null && wake == null && verify == null && !windowOpen && !suspended && !OwnRuleActive() && (guardOff || !MutedOutput);
+        }
+
         static bool OwnRuleActive() { return ownRule != null && AudioRules.Get(RtpcKey) == ownRule; }
+
+        // The rule on `key` is acap's own right now (a capture window level or the muted guard's 0), not a setting of the
+        // user: History, undo and mod recording have no business with it.
+        public static bool OwnsRule(string key) { return key == RtpcKey && OwnRuleActive(); }
+
+        // acap's own rule on the master volume, written raw: no History entry, no undo step, nothing a recorded mod picks up.
+        static void WriteRule(string value) { AudioRules.Set(RtpcKey, value); }
 
         static string ForeignRule()
         {
@@ -174,6 +226,12 @@ namespace InsideDev
             try
             {
                 Stop("game quit");
+                for (int i = 0; i < 20 && cur != null && state == "finalizing" && cur.final.Length == 0; i++)
+                {
+                    Finalize(cur, false);
+                    if (cur == null || state != "finalizing") break;
+                    System.Threading.Thread.Sleep(50);
+                }
                 if (cur != null && state == "finalizing") Finalize(cur, true);
             }
             catch (Exception e) { DevLog.Error("acap quit", e); }
@@ -269,10 +327,24 @@ namespace InsideDev
             bool ok = StartCapture(spec, outDir, null, out err);
             if (!ok && report != null) report.Error("audio", err);
             if (ok && report != null) report.Note("audio", "capture started (output " + (cur.muted ? OutputMuted : OutputAudible) + ", " + PathName(cur) + "): " + cur.abs + " -> " + cur.dest + "; " + (cur.muted ? "the window opens at level " + cur.level.ToString("0.###", IC) + " " + (cur.useSuspend ? "after 1 s of a quiet heartbeat" : "once the file appeared") : "the window opened at once at level " + cur.level.ToString("0.###", IC) + " (game volume " + cur.gameLevel.ToString("0.###", IC) + ", audio.level " + cur.spec.level.ToString("0.###", IC) + ")"));
+            if (ok && report != null && cur.level <= 0f) report.Warn("audio", SilentText(cur));
             return ok;
         }
 
+        static string SilentText(Cap c)
+        {
+            return "the capture level is 0 (" + (c.muted ? "audio.level 0" : "game volume " + c.gameLevel.ToString("0.###", IC) + ", audio.level " + c.spec.level.ToString("0.###", IC)) + "): " +
+                   Path.GetFileName(c.dest) + " will be silent; " + (c.muted ? "set audio.level above 0" : "raise the game volume (and audio.level), or use the muted output for a capture with silent speakers");
+        }
+
         static bool StartCapture(AudioCapSpec spec, string outDir, string manualName, out string err)
+        {
+            bool ok = StartCaptureCore(spec, outDir, manualName, out err);
+            if (!ok && suspended && err != null && err.IndexOf("suspended", StringComparison.OrdinalIgnoreCase) < 0) err += "; Wwise is still suspended by acap ('acap suspend off' wakes it)";
+            return ok;
+        }
+
+        static bool StartCaptureCore(AudioCapSpec spec, string outDir, string manualName, out string err)
         {
             err = Preflight(spec);
             if (err != null) { err = "audio capture refused: " + err; DevLog.Write("[acap] " + err); return false; }
@@ -342,23 +414,32 @@ namespace InsideDev
                 try { c.flagStage = AudioCaptureLogic.FlagStage(File.ReadAllText(MuterFlag)); } catch { }
             }
             if (!spec.keepSuspended && c.useSuspend) c.notes.Add("keepSuspended false is not acted on: WakeupFromSuspend only through 'acap suspend off' (G6)");
+            var aside = new List<KeyValuePair<string, string>>();
             try
             {
-                SetAside(c.dest, stamp);
-                SetAside(c.sync, stamp);
-                SetAside(c.info, stamp);
+                SetAside(c.dest, stamp, aside);
+                SetAside(c.sync, stamp, aside);
+                SetAside(c.info, stamp, aside);
                 c.rows = new StreamWriter(c.sync, false, new UTF8Encoding(false));
                 c.rows.WriteLine("marker,label,sample,game_time,real_time,lag");
                 c.rows.Flush();
             }
-            catch (Exception e) { EndTimer(c); err = "audio capture refused: " + c.sync + ": " + e.Message; return false; }
+            catch (Exception e)
+            {
+                EndTimer(c);
+                DropRows(c);
+                PutBack(aside);
+                err = "audio capture refused: " + c.sync + ": " + e.Message;
+                return false;
+            }
             bool started;
             try { started = SoundEngine.StartOutputCapture(c.rel); }
             catch (Exception e) { started = false; c.notes.Add("StartOutputCapture: " + e.GetType().Name + ": " + e.Message); }
             if (!started)
             {
                 EndTimer(c);
-                try { c.rows.Close(); File.Delete(c.sync); } catch { }
+                DropRows(c);
+                PutBack(aside);
                 err = "audio capture refused: StartOutputCapture(" + c.rel + ") returned false" + (c.notes.Count > 0 ? " (" + c.notes[c.notes.Count - 1] + ")" : "");
                 DevLog.Write("[acap] " + err);
                 return false;
@@ -377,12 +458,35 @@ namespace InsideDev
             return false;
         }
 
-        static void SetAside(string path, string stamp)
+        static void SetAside(string path, string stamp, List<KeyValuePair<string, string>> done)
         {
             if (!File.Exists(path)) return;
             string to = path + ".old_" + stamp;
             File.Move(path, to);
+            done.Add(new KeyValuePair<string, string>(path, to));
             DevLog.Write("[acap] kept the previous " + Path.GetFileName(path) + " as " + Path.GetFileName(to));
+        }
+
+        // A start that was refused after the previous files were set aside gives them their names back.
+        static void PutBack(List<KeyValuePair<string, string>> aside)
+        {
+            foreach (var kv in aside)
+            {
+                try
+                {
+                    if (File.Exists(kv.Key) || !File.Exists(kv.Value)) continue;
+                    File.Move(kv.Value, kv.Key);
+                    DevLog.Write("[acap] start refused: " + Path.GetFileName(kv.Key) + " put back");
+                }
+                catch (Exception e) { DevLog.Error("acap put back " + kv.Key, e); }
+            }
+        }
+
+        static void DropRows(Cap c)
+        {
+            try { if (c.rows != null) c.rows.Close(); } catch { }
+            c.rows = null;
+            try { if (File.Exists(c.sync)) File.Delete(c.sync); } catch { }
         }
 
         static void MarkSuspended(string by)
@@ -459,17 +563,17 @@ namespace InsideDev
             int n = Math.Max(1, changesPerForce);
             try
             {
-                if (back != null)
+                if (back != null && AudioRules.Check(RtpcKey, back) == null)
                 {
                     if (!float.TryParse(back, NumberStyles.Float, IC, out target)) target = float.NaN;
-                    for (int i = 0; i < n; i++) AudioRules.Change(RtpcKey, back, Source);
+                    for (int i = 0; i < n; i++) WriteRule(back);
                 }
                 else
                 {
                     string gs;
                     target = GameLevel(out gs);
-                    if (!float.IsNaN(target)) for (int i = 0; i < n; i++) AudioRules.Change(RtpcKey, target.ToString("0.###", IC), Source);
-                    AudioRules.Change(RtpcKey, null, Source);
+                    if (!float.IsNaN(target)) for (int i = 0; i < n; i++) WriteRule(target.ToString("0.###", IC));
+                    WriteRule(null);
                     src = "rule removed, game volume " + (float.IsNaN(target) ? "unknown (" + gs + ")" : target.ToString("0.###", IC) + " from " + gs);
                 }
             }
@@ -486,7 +590,7 @@ namespace InsideDev
             if (AudioRules.Check(RtpcKey, v) != null) return false;
             if (level <= 0f && windowOpen) CloseWindowState(purpose);
             int n = Math.Max(1, changesPerForce);
-            try { for (int i = 0; i < n; i++) AudioRules.Change(RtpcKey, v, Source); }
+            try { for (int i = 0; i < n; i++) WriteRule(v); }
             catch (Exception e) { DevLog.Error("acap rtpc " + v, e); return false; }
             ownRule = v;
             if (!SoundEngineInner.Ready) { Rate("not ready", "[acap] rtpc rule " + v + " set; the sound engine wrapper is not installed, Wwise gets it at the game's next set"); return false; }
@@ -497,8 +601,15 @@ namespace InsideDev
             return true;
         }
 
+        // The muted guard overrides whatever rule is on the master volume. A rule that is not acap's own (the user's, a
+        // mod's) is remembered, so Release puts it back when the guard lets go; a removed one is forgotten.
         static void ZeroRule(string why)
         {
+            if (!OwnRuleActive())
+            {
+                string foreign = AudioRules.Get(RtpcKey);
+                priorRule = foreign != null && !IsZero(foreign) ? foreign : null;
+            }
             reforces++;
             Rate("zero rule", "[acap] rtpc " + RtpcName + " forced 0 (" + why + ")");
             ForceInternal(0f, "watchdog");
@@ -556,6 +667,8 @@ namespace InsideDev
                 }
                 if (windowOpen && test == null && (c == null || state != "window")) { DevLog.Write("[acap] window without an owner: closed"); Close("orphan window"); windowOpen = false; }
                 if (!windowOpen) Outside(f);
+                if (!GuardIdle()) idleTicks = 0;
+                else if (++idleTicks > IdleTicks) Unsubscribe();
             }
             catch (Exception e)
             {
@@ -571,6 +684,7 @@ namespace InsideDev
                 if (cur == null && test == null && wake == null && verify == null && OwnRuleActive()) Release("audible output: acap rule outside a capture");
                 return;
             }
+            if (guardOff) return;
             if (!IsZero(AudioRules.Get(RtpcKey))) { ZeroRule("watchdog: rule was " + (AudioRules.Get(RtpcKey) ?? "removed")); return; }
             if (verify != null || test != null || f % 10 != 0 || !SoundEngineInner.Ready) return;
             float v; string err;
@@ -600,14 +714,22 @@ namespace InsideDev
                 return;
             }
             if (Now - q.t0 < 0.5) return;
+            if (q.purpose == "release" && AudioRules.Get(RtpcKey) == null)
+            {
+                verify = null;
+                string note = "release " + q.target.ToString("0.###", IC) + ": Wwise reads " + (ok ? v.ToString("0.###", IC) : err) + " with no rule left (the game's own last value); not repeated, the game volume is the game's again";
+                if (cur != null) cur.readbacks.Add(note);
+                DevLog.Write("[acap] " + note);
+                return;
+            }
             if (!q.retried)
             {
                 q.retried = true;
                 q.t0 = Now;
                 q.frame = Time.frameCount;
                 string tv = q.target.ToString("0.###", IC);
-                DevLog.Write("[acap] readback " + (ok ? v.ToString("0.###", IC) : err) + " != " + tv + " after 0.5 s (" + q.purpose + "): Change repeated");
-                try { for (int i = 0; i < Math.Max(1, changesPerForce); i++) AudioRules.Change(RtpcKey, tv, Source); } catch (Exception e) { DevLog.Error("acap rtpc repeat", e); }
+                DevLog.Write("[acap] readback " + (ok ? v.ToString("0.###", IC) : err) + " != " + tv + " after 0.5 s (" + q.purpose + "): rule write repeated");
+                try { for (int i = 0; i < Math.Max(1, changesPerForce); i++) WriteRule(tv); } catch (Exception e) { DevLog.Error("acap rtpc repeat", e); }
                 return;
             }
             verify = null;
@@ -681,6 +803,7 @@ namespace InsideDev
                 if (File.Exists(c.abs)) { c.tAppear = Now; DevLog.Write("[acap] capture file appeared after " + (c.tAppear - c.t0).ToString("0.000", IC) + " s"); }
                 else if (Now - c.t0 > 2.0) { Emergency("capture file did not appear at " + c.abs + " within 2 s"); return; }
             }
+            if (c.tAppear >= 0 && Now >= c.nextGrow) WatchGrowth(c);
             if (!windowOpen) return;
             string rule = AudioRules.Get(RtpcKey);
             float rv;
@@ -696,6 +819,32 @@ namespace InsideDev
             float v; string err;
             if (!ReadRtpc(out v, out err)) { Emergency("GetRTPCValue failed inside the window: " + err); return; }
             if (Math.Abs(v - windowLevel) > 0.01f) Emergency("Wwise reads " + RtpcName + " " + v.ToString("0.###", IC) + " inside the window (level " + windowLevel.ToString("0.###", IC) + ")");
+        }
+
+        // Once a second: the capture file must keep growing while Wwise renders into it. A stand-still (output device
+        // removed, sink stalled) is counted and noted once per episode; the capture goes on.
+        static void WatchGrowth(Cap c)
+        {
+            c.nextGrow = Now + 1.0;
+            long len = -1;
+            try { using (var fs = new FileStream(c.abs, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) len = fs.Length; }
+            catch (Exception) { return; }
+            if (c.lastGrow < 0 || len > c.lastLen)
+            {
+                if (c.stallNoted) DevLog.Write("[acap] capture file grows again after " + (Now - c.lastGrow).ToString("0.0", IC) + " s");
+                c.lastLen = len;
+                c.lastGrow = Now;
+                c.stallNoted = false;
+                return;
+            }
+            double still = Now - c.lastGrow;
+            if (still > c.maxNoGrowth) c.maxNoGrowth = still;
+            if (still < StallSeconds || c.stallNoted) return;
+            c.stallNoted = true;
+            c.stalls++;
+            string note = "capture file did not grow for " + still.ToString("0.0", IC) + " s at " + (Now - c.t0).ToString("0.0", IC) + " s (" + (len / 1024.0).ToString("0", IC) + " kB): output device removed or the sound engine stalled?";
+            c.notes.Add(note);
+            DevLog.Write("[acap] warning: " + note);
         }
 
         static void Observe(Cap c, AudioHeartbeat h)
@@ -781,14 +930,8 @@ namespace InsideDev
         {
             if (c.final.Length == 0)
             {
-                string fail = null;
-                try
-                {
-                    if (!File.Exists(c.abs)) fail = "capture file missing: " + c.abs;
-                    else if (c.dest != c.abs) { File.Move(c.abs, c.dest); c.moved = true; c.final = c.dest; }
-                    else { using (new FileStream(c.abs, FileMode.Open, FileAccess.Read, FileShare.None)) { } c.final = c.abs; }
-                }
-                catch (Exception e) { c.moveError = e.GetType().Name + ": " + e.Message; }
+                string fail;
+                if (!Place(c, last, out fail)) return;
                 if (fail != null) { c.final = c.abs; if (c.error == null) c.error = fail; }
                 else if (c.final.Length == 0)
                 {
@@ -809,12 +952,79 @@ namespace InsideDev
             c.needsFix = c.wav == null || !c.wav.ok;
             WriteInfo(c);
             double wall = c.tAppear >= 0 ? c.tStop - c.tAppear : c.tStop - c.t0;
-            string sum = c.name + " -> " + c.final + ": " + (c.wav != null ? c.wav.Text() : "no RIFF check") + ", wall " + wall.ToString("0.000", IC) + " s" +
+            string sum = c.name + " -> " + c.final + ": " + (c.level <= 0f ? "SILENT (level 0), " : "") + (c.stalls > 0 ? "file stood still " + c.stalls + "x (longest " + c.maxNoGrowth.ToString("0.0", IC) + " s), " : "") +
+                         (c.wav != null ? c.wav.Text() : "no RIFF check") + ", wall " + wall.ToString("0.000", IC) + " s" +
                          (c.wav != null && c.wav.seconds > 0 && wall > 0 ? " (WAV/wall " + (c.wav.seconds / wall).ToString("0.0000", IC) + ")" : "") + (c.needsFix ? "; header needs mcam_audio.py fix" : "") + (c.error != null ? "; error: " + c.error : "");
             lastCapture = sum;
             DevLog.Write("[acap] finalized " + sum);
             cur = null;
             state = "idle";
+        }
+
+        // Puts the capture file into its folder: a rename on the same volume, a copy on a worker thread to another one.
+        // False while that copy is still running (the caller comes back); fail = the file is gone.
+        static bool Place(Cap c, bool last, out string fail)
+        {
+            fail = null;
+            try
+            {
+                var mv = c.mover;
+                if (mv == null)
+                {
+                    if (!File.Exists(c.abs)) { fail = "capture file missing: " + c.abs; return true; }
+                    if (c.dest == c.abs)
+                    {
+                        using (new FileStream(c.abs, FileMode.Open, FileAccess.Read, FileShare.None)) { }
+                        c.final = c.abs;
+                        return true;
+                    }
+                    if (!AudioCaptureLogic.OtherVolume(c.abs, c.dest))
+                    {
+                        File.Move(c.abs, c.dest);
+                        c.moved = true;
+                        c.final = c.dest;
+                        return true;
+                    }
+                    mv = c.mover = StartMover(c.abs, c.dest);
+                }
+                if (!mv.done && last) mv.thread.Join(60000);
+                if (!mv.done)
+                {
+                    if (!last) return false;
+                    c.moveError = "the copy to " + c.dest + " did not finish before the game quit";
+                    return true;
+                }
+                c.mover = null;
+                if (mv.error == null) { c.moved = true; c.final = c.dest; }
+                else c.moveError = mv.error;
+            }
+            catch (Exception e) { c.moveError = e.GetType().Name + ": " + e.Message; }
+            return true;
+        }
+
+        static Mover StartMover(string from, string to)
+        {
+            var m = new Mover();
+            m.thread = new System.Threading.Thread(() =>
+            {
+                string part = to + ".part";
+                try
+                {
+                    File.Copy(from, part, true);
+                    File.Move(part, to);
+                    try { File.Delete(from); } catch (Exception) { }
+                }
+                catch (Exception e)
+                {
+                    m.error = e.GetType().Name + ": " + e.Message;
+                    try { if (File.Exists(part)) File.Delete(part); } catch (Exception) { }
+                }
+                m.done = true;
+            });
+            m.thread.IsBackground = true;
+            m.thread.Name = "acap move";
+            m.thread.Start();
+            return m;
         }
 
         static void WriteInfo(Cap c)
@@ -840,6 +1050,7 @@ namespace InsideDev
                 o["timerPeriod1"] = c.useSuspend && FlagTimer();
                 o["level"] = (double)c.level;
                 o["clockBase"] = clockBase;
+                o["gameBase"] = gameBase;
                 o["startReal"] = Round(c.t0 - clockBase);
                 o["appearedAfterS"] = c.tAppear >= 0 ? Round(c.tAppear - c.t0) : -1.0;
                 o["quietWaitS"] = Round(c.quietWaitS);
@@ -850,6 +1061,9 @@ namespace InsideDev
                 o["markers"] = (double)c.markers;
                 o["markerFailures"] = (double)c.markerFails;
                 o["lateMarkers"] = (double)c.late;
+                o["silent"] = c.level <= 0f;
+                o["stalls"] = (double)c.stalls;
+                o["maxNoGrowthS"] = Round(c.maxNoGrowth);
                 var hb = new Json.Obj();
                 hb["start"] = c.hbStart; hb["end"] = c.hbEnd; hb["reads"] = (double)c.hbReads; hb["badReads"] = (double)c.hbBad;
                 hb["maxAgeS"] = Round(c.maxAge); hb["maxSessionPeak"] = c.maxPeak; hb["activeReads"] = (double)c.everActive;
@@ -862,7 +1076,9 @@ namespace InsideDev
                 o["stopReason"] = c.why;
                 o["error"] = c.error;
                 o["notes"] = new List<object>(c.notes.ToArray());
-                File.WriteAllText(c.info, Json.Write(o) + "\n");
+                lastInfo = o;
+                lastInfoFile = c.info;
+                SafeFile.WriteAllText(c.info, Json.Write(o) + "\n");
             }
             catch (Exception e) { DevLog.Error("acap " + CaptureInfoFile, e); }
         }
@@ -948,8 +1164,8 @@ namespace InsideDev
             if (!MutedOutput) return "refused: output is audible (no Suspend); 'acap output muted' first";
             Ensure();
             AKRESULT r;
-            try { r = AkSoundEngine.Suspend(true); } catch (Exception e) { return "Suspend(true) failed: " + e.GetType().Name + ": " + e.Message; }
-            if (r != AKRESULT.AK_Success) return "Suspend(true) returned " + r;
+            try { r = AkSoundEngine.Suspend(true); } catch (Exception e) { return "failed: Suspend(true): " + e.GetType().Name + ": " + e.Message; }
+            if (r != AKRESULT.AK_Success) return "failed: Suspend(true) returned " + r;
             MarkSuspended("acap suspend on");
             return "AkSoundEngine.Suspend(true): " + r + " (render anyway; stays until game exit or 'acap suspend off')";
         }
@@ -996,19 +1212,19 @@ namespace InsideDev
             if (!underSuspend && !File.Exists(MuterFlag)) return "refused: run 'acap suspend on' first and wait for a quiet heartbeat (" + (suspended ? "suspended, not quiet for 1 s yet" : "not suspended") + "), or pass L5 S2 (user consent first)";
             test = new RtpcTest { level = level, values = new[] { 0f, level, 0f }, t0 = Now, native = AudioRules.nativeEnforce, underSuspend = underSuspend };
             NextTestStep();
-            return "rtpctest started: " + RtpcName + " 0 -> " + level.ToString("0.###", IC) + " -> 0, one AudioRules.Change each, GetRTPCValue after each (native enforcement " + (test.native ? "on" : "off") + ", " + (underSuspend ? "suspended" : "muter-only") + "); result in acap status";
+            return "rtpctest started: " + RtpcName + " 0 -> " + level.ToString("0.###", IC) + " -> 0, one rule write each, GetRTPCValue after each (native enforcement " + (test.native ? "on" : "off") + ", " + (underSuspend ? "suspended" : "muter-only") + "); result in acap status";
         }
 
         static void NextTestStep()
         {
             var t = test;
             t.index++;
-            if (t.index >= t.values.Length) { FinishTest(true, "one Change per value reached Wwise"); return; }
+            if (t.index >= t.values.Length) { FinishTest(true, "one rule write per value reached Wwise"); return; }
             float v = t.values[t.index];
             if (v > 0f) { windowLevel = v; windowOpen = true; }
             else windowOpen = false;
-            try { AudioRules.Change(RtpcKey, v.ToString("0.###", IC), Source + " rtpctest"); }
-            catch (Exception e) { AbortTest("Change: " + e.Message); return; }
+            try { WriteRule(v.ToString("0.###", IC)); }
+            catch (Exception e) { AbortTest("rule write: " + e.Message); return; }
             ownRule = v.ToString("0.###", IC);
             t.stepT0 = Now;
             t.stepFrame = Time.frameCount;
@@ -1073,20 +1289,25 @@ namespace InsideDev
         // ------------------------------------------------------------------ commands
 
         const string Usage =
-            "acap status | preflight [suspend=auto|on|off] [muteronly=on] [hb=<heartbeat.json>] [hbage=2]\n" +
+            "acap status [json] | preflight [suspend=auto|on|off] [muteronly=on] [hb=<heartbeat.json>] [hbage=2]\n" +
             "acap start <name> [suspend=auto|on|off] [muteronly=on] [level=100] [hb=<heartbeat.json>] [hbage=2]   (to <game>/_mod/audio/<name>.wav)\n" +
-            "acap mark <ascii> | acap stop | acap suspend on|off | acap rtpctest [level=100] | acap changes 1|2\n" +
-            "acap output [audible|muted]   (" + OutputKey + " in editor.cfg, default audible; suspend, muteronly, hb, hbage, rtpctest and 'suspend on' are muted-only)";
+            "acap mark <ascii> | acap stop | acap result [json] | acap suspend on|off | acap rtpctest [level=100] | acap changes 1|2\n" +
+            "acap output [audible|muted]   (" + OutputKey + " in editor.cfg, default audible; suspend, muteronly, hb, hbage, rtpctest and 'suspend on' are muted-only)\n" +
+            "acap guard [on|off]   (off: acap's rule on the master volume is released and not forced again until the next preflight, start or guard on)";
 
+        const string StartUsage = "usage: acap start <name> [suspend=auto|on|off] [muteronly=on] [level=100] [hb=<heartbeat.json>] [hbage=2]";
+
+        // status, help, result, output and guard without a value, and changes read or set acap's own fields only: they
+        // start no guard and write no rule.
         public static string Command(List<string> a, DevCore core)
         {
             string sub = a.Count > 1 ? a[1].ToLowerInvariant() : "status";
             try
             {
-                Ensure();
+                RplXSetup.Register();
                 switch (sub)
                 {
-                    case "status": return Status();
+                    case "status": return a.Count > 2 && a[a.Count - 1].ToLowerInvariant() == "json" ? JsonLine.Write(StatusJson()) : Status();
                     case "help": return Usage;
                     case "preflight": return PreflightText(a);
                     case "start": return ManualStart(a);
@@ -1095,24 +1316,58 @@ namespace InsideDev
                         if (cur == null) return "no capture running" + (lastCapture.Length > 0 ? "; last: " + lastCapture : "");
                         if (state == "finalizing") return "finalizing " + cur.name;
                         Stop("acap stop");
-                        return "capture stopped (" + (cur.muted ? "rtpc forced 0 first" : "rtpc released to the game volume first") + "); finalizing " + cur.name + " -> " + cur.dest;
+                        return "capture stopped (" + (cur.muted ? "rtpc forced 0 first" : "rtpc released to the game volume first") + "); finalizing " + cur.name + " -> " + cur.dest + " (acap result shows the WAV check)";
+                    case "result": return ResultCommand(a);
                     case "output": return OutputCommand(a);
+                    case "guard": return GuardCommand(a);
                     case "suspend":
-                        if (a.Count < 3) return "usage: acap suspend on|off";
-                        if (a[2] == "on") return SuspendOn();
-                        if (a[2] == "off") return SuspendOff();
+                        string onOff = a.Count > 2 ? a[2].ToLowerInvariant() : "";
+                        if (a.Count == 3 && onOff == "on") return SuspendOn();
+                        if (a.Count == 3 && onOff == "off") return SuspendOff();
                         return "usage: acap suspend on|off";
-                    case "rtpctest": return StartTest(Arg(a, "level", 100f));
+                    case "rtpctest":
+                        string bad = AudioCaptureLogic.ArgError(a, 2, AudioCaptureLogic.TestKeys);
+                        if (bad != null) return "usage: acap rtpctest [level=100]: " + bad;
+                        return StartTest(Arg(a, "level", 100f));
                     case "changes":
                         int n;
-                        if (a.Count < 3 || !int.TryParse(a[2], out n) || n < 1 || n > 2) return "usage: acap changes 1|2 (now " + changesPerForce + ")";
+                        if (a.Count != 3 || !int.TryParse(a[2], NumberStyles.Integer, IC, out n) || n < 1 || n > 2) return "usage: acap changes 1|2 (now " + changesPerForce + ")";
                         changesPerForce = n;
-                        DevLog.Write("[acap] AudioRules.Change calls per ForceLevel: " + n);
-                        return "ForceLevel uses " + n + " Change call(s) per level (readback still decides)";
+                        DevLog.Write("[acap] rule writes per ForceLevel: " + n);
+                        return "ForceLevel uses " + n + " rule write(s) per level (readback still decides)";
                 }
             }
-            catch (Exception e) { DevLog.Error("acap " + sub, e); return "acap " + sub + " failed: " + e.GetType().Name + ": " + e.Message; }
+            catch (Exception e) { DevLog.Error("acap " + sub, e); return "failed: acap " + sub + ": " + e.GetType().Name + ": " + e.Message; }
             return "usage:\n" + Usage;
+        }
+
+        static string GuardCommand(List<string> a)
+        {
+            string v = a.Count > 2 ? a[2].ToLowerInvariant() : "";
+            if (a.Count < 3) return "acap guard " + (subscribed ? (guardOff ? "ending (rule released)" : "on") : "off") + ", output " + Output + (MutedOutput && !subscribed ? " (the muted guard starts with preflight, start or acap guard on)" : "");
+            if (a.Count > 3 || (v != "on" && v != "off")) return "usage: acap guard [on|off]";
+            if (v == "on")
+            {
+                Ensure();
+                return "guard on, output " + Output + ": " + (MutedOutput ? "rtpc " + RtpcName + " forced 0 outside capture windows" : "nothing is forced with the audible output; the guard ends itself when idle");
+            }
+            if (cur != null || windowOpen || test != null || wake != null) return "refused: a capture, window, rtpctest or wake is active (acap stop first)";
+            string was = AudioRules.Get(RtpcKey);
+            bool own = OwnRuleActive();
+            Release("acap guard off");
+            guardOff = true;
+            return "guard off: " + (own ? "acap's rule " + was + " on " + RtpcName + " released (" + (AudioRules.Get(RtpcKey) != null ? "rule " + AudioRules.Get(RtpcKey) + " from before put back" : "the game volume is the game's again") + ")" : "no rule of acap was active") +
+                   "; nothing is forced until the next preflight, start, rtpctest, suspend on or acap guard on" + (suspended ? "; Wwise is still suspended by acap ('acap suspend off')" : "");
+        }
+
+        // The audio_capture.json of the last capture this session finished (the WAV check, WAV / wall-clock ratio, stalls).
+        static string ResultCommand(List<string> a)
+        {
+            bool json = a.Count > 2 && a[a.Count - 1].ToLowerInvariant() == "json";
+            if (cur != null) return "busy: " + (state == "finalizing" ? "finalizing " : "capturing ") + cur.name + " (acap result again when it is done)";
+            if (lastInfo == null) return "not found: no capture finished in this session";
+            if (json) return JsonLine.Write(lastInfo);
+            return "acap result: " + lastCapture + "\n  " + lastInfoFile;
         }
 
         static string OutputCommand(List<string> a)
@@ -1135,8 +1390,9 @@ namespace InsideDev
         {
             var s = new AudioCapSpec();
             s.capture = "record";
-            s.suspend = ArgS(a, "suspend", s.suspend);
-            s.allowMuterOnly = ArgS(a, "muteronly", "off") == "on";
+            bool on;
+            s.suspend = ArgS(a, "suspend", s.suspend).ToLowerInvariant();
+            s.allowMuterOnly = AudioCaptureLogic.OnOff(ArgS(a, "muteronly", "off"), out on) && on;
             s.level = Arg(a, "level", s.level);
             s.heartbeat = ArgS(a, "hb", s.heartbeat);
             s.maxHeartbeatAge = Arg(a, "hbage", s.maxHeartbeatAge);
@@ -1145,6 +1401,8 @@ namespace InsideDev
 
         static string PreflightText(List<string> a)
         {
+            string bad = AudioCaptureLogic.ArgError(a, 2, AudioCaptureLogic.CaptureKeys);
+            if (bad != null) return "usage: acap preflight [suspend=auto|on|off] [muteronly=on] [hb=<heartbeat.json>] [hbage=2]: " + bad;
             var sb = new StringBuilder();
             string why = Check(ManualSpec(a), sb);
             return (why == null ? "ok" : "refused: " + why) + "\n" + sb.ToString().TrimEnd('\n');
@@ -1155,10 +1413,12 @@ namespace InsideDev
 
         static string ManualStart(List<string> a)
         {
-            if (a.Count < 3 || a[2].IndexOf('=') >= 0) return "usage: acap start <name> [suspend=auto|on|off] [muteronly=on] [level=100]";
+            if (a.Count < 3 || a[2].IndexOf('=') >= 0) return StartUsage;
             string name = a[2];
-            foreach (char ch in name) if (!(char.IsLetterOrDigit(ch) && ch < 128) && ch != '_' && ch != '-') return "name: ASCII letters, digits, '_' and '-' only";
-            if (name.Length > 64) return "name: 64 characters at most";
+            foreach (char ch in name) if (!(char.IsLetterOrDigit(ch) && ch < 128) && ch != '_' && ch != '-') return StartUsage + ": name: ASCII letters, digits, '_' and '-' only";
+            if (name.Length > 64) return StartUsage + ": name: 64 characters at most";
+            string bad = AudioCaptureLogic.ArgError(a, 3, AudioCaptureLogic.CaptureKeys);
+            if (bad != null) return StartUsage + ": " + bad;
             if (MultiCam.runner != null) return "busy: an mcam run owns the capture";
             if (SceneRecorder.active != null) return "busy: a recording is active (its capture goes through srec record ... audio=on)";
             var spec = ManualSpec(a);
@@ -1166,17 +1426,25 @@ namespace InsideDev
             double was = clockBase;
             clockBase = base0;
             string err;
-            if (!StartCapture(spec, null, name, out err)) { clockBase = was; return err; }
+            if (!StartCapture(spec, null, name, out err))
+            {
+                clockBase = was;
+                err = err ?? "no reason given";
+                const string refused = "audio capture refused: ";
+                return err.StartsWith(refused, StringComparison.Ordinal) ? "refused: " + err.Substring(refused.Length) : "failed: " + err;
+            }
             manualGame0 = Time.timeDbl;
+            gameBase = manualGame0;
             manualMarks = 0;
             Post(cur, "s0", 0, 0.0, 0);
             manualMarks = 1;
-            return "capture " + name + " started -> " + cur.abs + " (output " + (cur.muted ? OutputMuted : OutputAudible) + ", " + PathName(cur) + ", window at " + cur.level.ToString("0.###", IC) + (cur.muted ? "" : ", open, game volume " + cur.gameLevel.ToString("0.###", IC)) + "); acap mark <ascii>, acap stop";
+            return "capture " + name + " started -> " + cur.abs + " (output " + (cur.muted ? OutputMuted : OutputAudible) + ", " + PathName(cur) + ", window at " + cur.level.ToString("0.###", IC) + (cur.muted ? "" : ", open, game volume " + cur.gameLevel.ToString("0.###", IC)) + "); acap mark <ascii>, acap stop" +
+                   (cur.level <= 0f ? "\nwarning: " + SilentText(cur) : "");
         }
 
         static string ManualMark(List<string> a)
         {
-            if (cur == null || !capturing) return "no capture running";
+            if (cur == null || !capturing) return "refused: no capture running";
             if (a.Count < 3) return "usage: acap mark <ascii>";
             string label = AudioCaptureLogic.SafeLabel(a[2]);
             Marker(label, manualMarks, Time.timeDbl - manualGame0, 0);
@@ -1212,7 +1480,8 @@ namespace InsideDev
                 sb.Append("  ").Append(c.name).Append(" (").Append(c.muted ? OutputMuted : OutputAudible).Append(", ").Append(PathName(c)).Append(c.muted ? "" : ", game volume " + c.gameLevel.ToString("0.###", IC)).Append("): ").Append(c.abs).Append(" -> ").Append(c.dest)
                   .Append(", ").Append((Now - c.t0).ToString("0.0", IC)).Append(" s, file ").Append(size >= 0 ? (size / 1024.0).ToString("0", IC) + " kB" : "not yet")
                   .Append(", markers ").Append(c.markers).Append(c.markerFails > 0 ? " (" + c.markerFails + " failed)" : "").Append(c.late > 0 ? ", late " + c.late : "")
-                  .Append(c.error != null ? ", error: " + c.error : "").Append('\n');
+                  .Append(c.level <= 0f ? ", SILENT (level 0)" : "").Append(c.stalls > 0 ? ", file stood still " + c.stalls + "x (longest " + c.maxNoGrowth.ToString("0.0", IC) + " s)" : "")
+                  .Append(c.mover != null ? ", copying to the take folder" : "").Append(c.error != null ? ", error: " + c.error : "").Append('\n');
             }
             var h = lastRead ?? lastHb;
             if (muted) sb.Append("  heartbeat: ").Append(h != null ? h.Text() : "not read yet").Append('\n');
@@ -1230,12 +1499,90 @@ namespace InsideDev
             sb.Append(", native enforcement ").Append(AudioRules.nativeEnforce ? "on" : "off").Append(", changes per force ").Append(changesPerForce).Append('\n');
             sb.Append("  ").Append(muted ? "flags: suspend " + (File.Exists(SuspendFlag) ? "present" : "absent") + ", muter-only " + (File.Exists(MuterFlag) ? "present" : "absent") : "flags: not used (audible)")
               .Append("; re-forces ").Append(reforces).Append(", non-zero readbacks ").Append(nonZeroReadbacks).Append(", readback errors ").Append(readbackErrors)
-              .Append(", emergencies ").Append(emergencies).Append(", late markers ").Append(lateMarkers).Append(subscribed ? "" : ", guard NOT subscribed").Append('\n');
+              .Append(", emergencies ").Append(emergencies).Append(", late markers ").Append(lateMarkers)
+              .Append(subscribed ? (guardOff ? ", guard ending (acap guard off)" : ", guard on") : muted ? ", guard off (starts with preflight, start or acap guard on)" : ", guard off (idle)").Append('\n');
             if (lastError != null) sb.Append("  last error: ").Append(lastError).Append('\n');
             if (lastCapture.Length > 0) sb.Append("  last capture: ").Append(lastCapture).Append('\n');
             if (test != null) sb.Append("  rtpctest running: ").Append(string.Join("; ", test.lines.ToArray())).Append('\n');
             if (lastTest.Length > 0) sb.Append("  last rtpctest: ").Append(lastTest).Append('\n');
             return sb.ToString().TrimEnd('\n');
+        }
+
+        // `acap status json`: the same facts as Status, numbers as numbers; reads only.
+        public static Json.Obj StatusJson()
+        {
+            var o = new Json.Obj();
+            var c = cur;
+            o["state"] = state;
+            o["output"] = Output;
+            o["guard"] = subscribed ? (guardOff ? "ending" : "on") : "off";
+            o["capturing"] = capturing;
+            o["windowOpen"] = windowOpen;
+            o["level"] = windowOpen ? (object)(double)windowLevel : null;
+            o["suspended"] = suspended;
+            string src;
+            float g = GameLevel(out src);
+            o["gameVolume"] = float.IsNaN(g) ? null : (object)(double)g;
+            o["gameVolumeSource"] = src;
+            o["rule"] = AudioRules.Get(RtpcKey);
+            o["ruleIsAcaps"] = OwnRuleActive();
+            o["ruleBefore"] = priorRule;
+            float v; string err;
+            bool read = ReadRtpc(out v, out err);
+            o["wwiseReadback"] = read && !float.IsNaN(v) ? (object)(double)v : null;
+            if (!read) o["wwiseReadbackError"] = err;
+            o["readbackPending"] = verify != null;
+            o["nativeEnforce"] = AudioRules.nativeEnforce;
+            o["changesPerForce"] = changesPerForce;
+            if (c != null)
+            {
+                var j = new Json.Obj();
+                long size = -1;
+                try { var fi = new FileInfo(c.final.Length > 0 ? c.final : c.abs); if (fi.Exists) size = fi.Length; } catch { }
+                j["name"] = c.name;
+                j["output"] = c.muted ? OutputMuted : OutputAudible;
+                j["path"] = PathName(c);
+                j["file"] = c.abs;
+                j["dest"] = c.dest;
+                j["seconds"] = Math.Round(Now - c.t0, 2);
+                j["bytes"] = size;
+                j["level"] = (double)c.level;
+                j["silent"] = c.level <= 0f;
+                j["markers"] = c.markers;
+                j["markerFailures"] = c.markerFails;
+                j["lateMarkers"] = c.late;
+                j["stalls"] = c.stalls;
+                j["maxNoGrowthS"] = Math.Round(c.maxNoGrowth, 2);
+                j["copying"] = c.mover != null;
+                j["error"] = c.error;
+                o["capture"] = j;
+            }
+            var n = new Json.Obj();
+            n["reforces"] = reforces; n["nonZeroReadbacks"] = nonZeroReadbacks; n["readbackErrors"] = readbackErrors; n["emergencies"] = emergencies; n["lateMarkers"] = lateMarkers;
+            o["counters"] = n;
+            o["lastError"] = lastError;
+            o["lastCapture"] = lastCapture;
+            o["lastCaptureInfo"] = lastInfoFile;
+            o["lastTest"] = lastTest;
+            return o;
+        }
+
+        // Quick, read-only rows for the doctor command.
+        internal static List<Doctor.Row> DoctorRows()
+        {
+            var rows = new List<Doctor.Row>();
+            bool muted = MutedOutput;
+            rows.Add(new Doctor.Row("acap", "output", muted ? Doctor.Warn : Doctor.Ok,
+                muted ? "muted (" + OutputKey + " in editor.cfg): the guard forces the master volume to 0 from the first preflight / start on" : "audible: the game sound is not touched outside a capture window",
+                muted ? "acap output audible, or acap guard off after a capture" : null));
+            rows.Add(new Doctor.Row("acap", "sound engine wrapper", SoundEngineInner.Ready ? Doctor.Ok : Doctor.Info, SoundEngineInner.Ready ? "installed" : "not installed yet: captures are refused until the game has started its sound engine"));
+            string rule = AudioRules.Get(RtpcKey);
+            bool idle = cur == null && test == null && wake == null && !windowOpen;
+            if (rule != null && idle && !(muted && subscribed && !guardOff))
+                rows.Add(new Doctor.Row("acap", "master volume rule", Doctor.Warn, "audio rule " + RtpcKey + " = " + rule + " is set while no capture runs: the game's volume slider has no effect", "audio clear " + RtpcKey));
+            else rows.Add(new Doctor.Row("acap", "master volume rule", Doctor.Ok, rule == null ? "none" : rule + (idle ? " (muted guard)" : " (capture)")));
+            if (suspended) rows.Add(new Doctor.Row("acap", "Wwise", Doctor.Warn, "suspended by acap: the game is silent", "acap suspend off"));
+            return rows;
         }
 
         static void Rate(string key, string msg)
@@ -1404,6 +1751,46 @@ namespace InsideDev
         {
             float f;
             return v != null && float.TryParse(v, NumberStyles.Float, IC, out f) && Math.Abs(f) < 1e-6f;
+        }
+
+        public static readonly string[] CaptureKeys = { "suspend", "muteronly", "level", "hb", "hbage" };
+        public static readonly string[] TestKeys = { "level" };
+
+        public static bool OnOff(string v, out bool on)
+        {
+            string s = (v ?? "").ToLowerInvariant();
+            on = s == "on" || s == "true" || s == "1" || s == "yes";
+            return on || s == "off" || s == "false" || s == "0" || s == "no";
+        }
+
+        // The key=value words of an acap command from index `from`: null when every key is one of `valid` and every value
+        // has the right shape, else what is wrong (with the valid keys). A typo must not run a capture with a default.
+        public static string ArgError(List<string> a, int from, string[] valid)
+        {
+            string keys = string.Join(", ", valid);
+            for (int i = from; i < a.Count; i++)
+            {
+                string s = a[i] ?? "";
+                int eq = s.IndexOf('=');
+                if (eq <= 0) return "key=value expected, got '" + s + "' (valid: " + keys + ")";
+                string k = s.Substring(0, eq).ToLowerInvariant(), v = s.Substring(eq + 1);
+                if (Array.IndexOf(valid, k) < 0) return "unknown argument '" + s.Substring(0, eq) + "' (valid: " + keys + ")";
+                float f;
+                bool b;
+                if (k == "level" && (!float.TryParse(v, NumberStyles.Float, IC, out f) || float.IsNaN(f) || f < 0f || f > 100f)) return "level needs a number 0..100, got '" + v + "'";
+                if (k == "hbage" && (!float.TryParse(v, NumberStyles.Float, IC, out f) || !(f > 0f) || float.IsInfinity(f))) return "hbage needs seconds above 0, got '" + v + "'";
+                if (k == "muteronly" && !OnOff(v, out b)) return "muteronly needs on or off, got '" + v + "'";
+                if (k == "suspend" && v.ToLowerInvariant() != "auto" && v.ToLowerInvariant() != "on" && v.ToLowerInvariant() != "off") return "suspend needs auto, on or off, got '" + v + "'";
+                if (k == "hb" && v.Length == 0) return "hb needs a file";
+            }
+            return null;
+        }
+
+        // The two files are on different volumes (a move between them is a copy).
+        public static bool OtherVolume(string a, string b)
+        {
+            try { return !string.Equals(Path.GetPathRoot(Path.GetFullPath(a)), Path.GetPathRoot(Path.GetFullPath(b)), StringComparison.OrdinalIgnoreCase); }
+            catch (Exception) { return false; }
         }
 
         public static bool FlagRequiresTimer(string json)

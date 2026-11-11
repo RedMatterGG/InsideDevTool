@@ -94,6 +94,29 @@ namespace InsideDev
         public bool hasRange;                                        // range=t0:t1 given
         public double rangeFrom, rangeTo;                            // record seconds
         public int every;                                            // golden: grab every n-th sample (0 = record.captureEvery)
+        public bool resume;                                          // replay: keep the camera passes the run in <out> has finished, film the rest
+        public bool overwrite;                                       // overwrite=on: the run may replace the one <out> already holds
+
+        // The argument words of this file, for the command parser: null = not one of them, "" = taken, else the error text.
+        public static string Extra(string verb, string word, ReplayArgs args)
+        {
+            string s = (word ?? "").Trim(), low = s.ToLowerInvariant();
+            if (low == "resume")
+            {
+                if (verb != ReplayModes.Replay) return "resume: only for mcam replay (the camera passes of a take are continued with 'mcam replay <spec> <out> resume')";
+                args.resume = true;
+                return "";
+            }
+            if (low == "overwrite" || low.StartsWith("overwrite=", StringComparison.Ordinal))
+            {
+                string v = low.Length > 10 ? low.Substring(10) : "on";
+                if (v == "on" || v == "1" || v == "true" || v == "yes") args.overwrite = true;
+                else if (v == "off" || v == "0" || v == "false" || v == "no") args.overwrite = false;
+                else return "overwrite: on or off expected (got '" + s.Substring(10) + "')";
+                return "";
+            }
+            return null;
+        }
     }
 
     internal sealed class ReplayProgress
@@ -115,6 +138,7 @@ namespace InsideDev
     {
         internal ReplayArgs replayArgs;                              // set by CORE_B between AddComponent and Init
         internal readonly ReplayProgress replay = new ReplayProgress();
+        internal MultiCamContext RunContext { get { return ctx; } } // the one context of this run: MultiCamTargets tells the owner's calls by it
 
         struct ReplayMarkerJob { public string label; public int sample, frame; public double time; }
 
@@ -200,6 +224,23 @@ namespace InsideDev
         int[] passOf = new int[0];
         Json.Obj rplanJson, goldenJson;
 
+        const string OverwriteKey = "mcam.overwrite", PlanMaxKey = "mcam.planMaxMB";
+        const int PlanMaxDefault = 512;
+        McbXFileWorker rpFiles;                                      // holds and folder clean-up of the camera passes
+        McbXLatestFile rpProgressFile;                               // progress.json, written off the game thread
+        string rpHolds = "link", rpPriorText;
+        float rpPlanChunk = 0.05f, recFlushAt;
+        Json.Obj rpPrior;                                            // resume: run.json of the run that is continued
+        bool[] rpSkip = new bool[0], rpFilmed = new bool[0], rpAnyHide = new bool[0];
+        bool rpPlanAll = true;
+        int[] rpHideKey = new int[0], rpHideId = new int[0];
+        Func<TimeRef, double> rpTimeOf;
+        readonly List<object> rpPriorPasses = new List<object>();
+        readonly List<string> rpKept = new List<string>();
+        readonly List<ReplayPipeStart> rpLate = new List<ReplayPipeStart>();
+        readonly List<float> recStepMs = new List<float>(4096);
+        static bool replayKeysDescribed;
+
         // ---------------------------------------------------------------- entry
 
         IEnumerator ReplayMain()
@@ -214,7 +255,17 @@ namespace InsideDev
             else if (mode == ReplayModes.Passes) outDir = Path.Combine(takeDir, ReplayPassesFolder);
             replay.phase = "setup";
             state = "setup";
+            string refused = ReplayRefuse(mode, spec, takeDir, replayArgs);
+            if (refused == null && replayArgs.resume) refused = ReplayResumeRead(spec, outDir, replayArgs, out rpPrior, out rpPriorText);
+            if (refused != null) { rpPrior = null; rpPriorText = null; ReplayRefused(refused); }
+            if (rpPrior != null)
+            {
+                // the finished passes of the earlier run stay listed in every run.json this run writes
+                foreach (var st in rpPrior.Arr("pass_stats")) if (ReplayPassDone(st as Json.Obj, -1)) passStats.Add(st);
+                foreach (var p in rpPrior.Arr("passes")) if (p is Json.Obj) rpPriorPasses.Add(p);
+            }
             ReplayOpenRun();
+            ReplayKeys();
             MultiCamSession.Push(spec, core);
             WriteRun(false);
             Log(mode + " '" + spec.name + "' from " + plan.path + " -> " + takeDir + (outDir != takeDir ? " (run files in " + outDir + ")" : ""));
@@ -228,12 +279,204 @@ namespace InsideDev
         void ReplayOpenRun()
         {
             Directory.CreateDirectory(outDir);
-            if (File.Exists(Path.Combine(outDir, "run.json"))) DevLog.Write("[mcam] note: " + outDir + " already holds a run; files are overwritten");
+            bool resume = rpPrior != null;
+            if (!resume && File.Exists(Path.Combine(outDir, "run.json"))) DevLog.Write("[mcam] note: " + outDir + " already holds a run; files are overwritten");
             File.WriteAllText(Path.Combine(outDir, "spec.json"), spec.text);
-            logW = new StreamWriter(Path.Combine(outDir, "log.txt"), false, new UTF8Encoding(false));
+            logW = new StreamWriter(Path.Combine(outDir, "log.txt"), resume, new UTF8Encoding(false));
             logW.AutoFlush = true;
             camDirs = new string[spec.cameras.Count];
             for (int i = 0; i < spec.cameras.Count; i++) camDirs[i] = Path.Combine(takeDir, spec.cameras[i].name);
+            rpSkip = new bool[spec.cameras.Count];
+        }
+
+        // The keys this file reads besides the typed spec: editor.cfg mcam.overwrite and mcam.planMaxMB, and from the spec
+        // text replay.play.holds and replay.play.planChunkMs.
+        void ReplayKeys()
+        {
+            ReplayDescribeKeys();
+            var keys = new McbXSpecKeys(spec);
+            rpHolds = keys.Str("link", "replay", "play", "holds");
+            if (rpHolds != "link" && rpHolds != "copy") { Warn("replay.play.holds '" + rpHolds + "': link or copy expected, link is used"); rpHolds = "link"; }
+            rpPlanChunk = Mathf.Clamp((float)keys.Num(50.0, "replay", "play", "planChunkMs"), 5f, 1000f) / 1000f;
+            rpTimeOf = ReplayTimeOf;
+        }
+
+        internal static void ReplayDescribeKeys()
+        {
+            if (replayKeysDescribed) return;
+            replayKeysDescribed = true;
+            EditorState.Describe("mcam", OverwriteKey, "off", "on: mcam record / take / replay may write into a folder that already holds a run without overwrite=on (as before 0.11.0)");
+            EditorState.Describe("mcam", PlanMaxKey, Fmt.I(PlanMaxDefault), "largest replay plan in MB of memory (steps x cameras) that mcam replay / take / passes builds; a longer timeline is refused");
+        }
+
+        // Why a replay-mode run must not start into outDir, or null: it would replace the recording or the run that is
+        // already there. overwrite=on, resume, or editor.cfg mcam.overwrite on allow it; passes and golden are repeatable and
+        // never refused. With resume the answer is why that run cannot be continued. Called by the command before the runner
+        // exists and again when the run starts.
+        internal static string ReplayRefuse(string verb, MultiCamSpec spec, string outDir, ReplayArgs args)
+        {
+            ReplayDescribeKeys();
+            if (args != null && args.resume && args.overwrite) return "refused: resume and overwrite=on exclude each other";
+            if (args != null && args.resume)
+            {
+                Json.Obj prior;
+                string text;
+                return ReplayResumeRead(spec, outDir, args, out prior, out text);
+            }
+            if (args != null && args.overwrite) return null;
+            if (verb == ReplayModes.Passes || verb == ReplayModes.Golden) return null;
+            string k = EditorState.Get(OverwriteKey, "off");
+            if (k == "on" || k == "1" || k == "true") return null;
+            string held = null, what = "run", runMode;
+            try
+            {
+                string rec = Path.Combine(outDir, ReplayConst.RecordFolder);
+                if (verb == ReplayModes.Record || verb == ReplayModes.Take)
+                {
+                    if (File.Exists(Path.Combine(rec, ReplayConst.RecordFile))) { held = Path.Combine(rec, ReplayConst.RecordFile); what = "recording"; }
+                    else if (McaXTake.HoldsTake(rec, out runMode)) held = Path.Combine(rec, "run.json");
+                }
+                if (held == null && verb != ReplayModes.Record && McaXTake.HoldsTake(outDir, out runMode)) held = Path.Combine(outDir, "run.json");
+            }
+            catch { return null; }
+            if (held == null) return null;
+            return "refused: " + outDir + " already holds a " + what + " (" + held + "): add overwrite=on to replace it" +
+                   (verb == ReplayModes.Replay ? ", add resume to film only the camera passes that are not finished" : "") + ", or give another folder";
+        }
+
+        // A refused start must not touch the run that is already in the folder: the run files of this start (run.json,
+        // progress.json) go to a scratch folder instead, and the run ends with the reason as its failure.
+        void ReplayRefused(string why)
+        {
+            if (rpPriorText != null) { try { File.WriteAllText(Path.Combine(outDir, "run.json"), rpPriorText); } catch (Exception e) { DevLog.Error("mcam resume: run.json not put back", e); } }
+            string scratch = Path.Combine(Path.GetTempPath(), "InsideDev_refused_run");
+            try { Directory.CreateDirectory(scratch); } catch { }
+            try { if (logW != null) { Log(why); logW.Close(); } } catch { }
+            logW = null;
+            outDir = scratch;
+            throw new Exception(why);
+        }
+
+        static string ReplayTextKey(string s) { return (s ?? "").Replace("\r\n", "\n").Trim(); }
+
+        // resume: reads the run.json of the run in <out> and checks what can be checked before anything is written (same
+        // spec text, same range, same frame size). Returns why the run cannot be continued, or null with the run.json.
+        static string ReplayResumeRead(MultiCamSpec spec, string outDir, ReplayArgs replayArgs, out Json.Obj prior, out string text)
+        {
+            prior = null; text = null;
+            var rplay = (spec.replay ?? new ReplaySpec()).play ?? new PlaySpec();
+            string file = Path.Combine(outDir, "run.json");
+            if (!File.Exists(file)) return "refused: resume: " + file + " does not exist (nothing to continue; start without resume)";
+            try { text = File.ReadAllText(file); prior = Json.Parse(text) as Json.Obj; }
+            catch (Exception e) { prior = null; return "refused: resume: " + file + " cannot be read (" + e.Message + ")"; }
+            if (prior == null) return "refused: resume: " + file + " is not a run.json";
+            string pm = prior.Str("mode", "");
+            if (pm != ReplayModes.Replay && pm != ReplayModes.Take) return "refused: resume: " + file + " belongs to a '" + pm + "' run, not to a replay";
+            string old = null;
+            try { old = File.ReadAllText(Path.Combine(outDir, "spec.json")); } catch { }
+            if (old == null || ReplayTextKey(old) != ReplayTextKey(spec.text))
+                return "refused: resume: the spec differs from " + Path.Combine(outDir, "spec.json") + " (the finished passes were filmed with that one; overwrite=on films everything again)";
+            var tj = prior["timeline"] as Json.Obj;
+            if (tj != null)
+            {
+                double dur = tj.Num("duration", double.NaN), from = 0, to = dur;
+                if (replayArgs.hasRange) { from = replayArgs.rangeFrom; to = replayArgs.rangeTo; }
+                else if (rplay.Has("range")) { from = rplay.range.x; to = rplay.range.y; }
+                if (!double.IsNaN(dur))
+                {
+                    from = Math.Max(0, Math.Min(from, dur));
+                    to = Math.Max(from, Math.Min(to, dur));
+                    if (Math.Abs(from - tj.Num("from")) > 1e-6 || Math.Abs(to - tj.Num("to")) > 1e-6)
+                        return "refused: resume: the earlier run covers record " + Fmt.F(tj.Num("from")) + ".." + Fmt.F(tj.Num("to")) + " s, this one would cover " + Fmt.F(from) + ".." + Fmt.F(to) +
+                               " s: give range=" + Fmt.F(tj.Num("from")) + ":" + Fmt.F(tj.Num("to")) + ", or overwrite=on";
+                }
+            }
+            var sc = prior.Arr("screen");
+            if (sc.Count == 2 && sc[0] is double && sc[1] is double)
+            {
+                int w = Screen.width, h = Screen.height;
+                if (spec.session.res.x > 0 && spec.session.res.y > 0) { w = (int)spec.session.res.x; h = (int)spec.session.res.y; }
+                if (w != (int)(double)sc[0] || h != (int)(double)sc[1])
+                    return "refused: resume: the earlier passes are " + Fmt.I((int)(double)sc[0]) + "x" + Fmt.I((int)(double)sc[1]) + ", this run would render " + Fmt.I(w) + "x" + Fmt.I(h) + " (set session.res or the window to that size, or overwrite=on)";
+            }
+            return null;
+        }
+
+        // A pass_stats entry of a finished pass: not stopped and every step written or held (steps < 0: any step count).
+        static bool ReplayPassDone(Json.Obj st, int steps)
+        {
+            if (st == null || st.Bool("stopped", true) || string.IsNullOrEmpty(st.Str("camera", ""))) return false;
+            double n = st.Num("steps", -1);
+            if (n <= 0 || (steps >= 0 && (int)n != steps)) return false;
+            return (int)(st.Num("frames_written", -1) + st.Num("copied", 0)) == (int)n && st.Num("hold_failed", 0) == 0;
+        }
+
+        // resume, once the timeline of this run is known: which passes of the earlier run stay. A pass stays when its
+        // pass_stats entry says finished for the same number of steps and its frames are on disk. Throws (after putting the
+        // earlier run.json back) when that run was planned from another recording or timeline.
+        void ReplayResumePlan()
+        {
+            if (rpPrior == null) return;
+            var tj = rpPrior["timeline"] as Json.Obj;
+            if (tj != null && ((int)tj.Num("steps", -1) != nSteps || (int)tj.Num("frames", -1) != nFrames))
+                ReplayRefused("refused: resume: the earlier run has " + Fmt.I((int)tj.Num("steps", -1)) + " step(s) in " + Fmt.I((int)tj.Num("frames", -1)) + " frame(s), this one " + Fmt.I(nSteps) + " in " + Fmt.I(nFrames) +
+                              " (another recording, range or timing): overwrite=on films everything again");
+            var rj = rpPrior["recording"] as Json.Obj;
+            if (rj != null && recInfo != null && ((int)rj.Num("samples", -1) != recInfo.samples || Math.Abs(rj.Num("duration", -1) - recInfo.duration) > 1e-6))
+                ReplayRefused("refused: resume: the recording changed since the earlier run (" + Fmt.I((int)rj.Num("samples", -1)) + " sample(s) then, " + Fmt.I(recInfo.samples) + " now): overwrite=on films everything again");
+            var last = new Dictionary<string, Json.Obj>();
+            foreach (var x in rpPrior.Arr("pass_stats")) { var st = x as Json.Obj; if (st != null) last[st.Str("camera", "")] = st; }
+            rpKept.Clear();
+            foreach (int i in passCams)
+            {
+                Json.Obj st;
+                string name = spec.cameras[i].name;
+                if (!last.TryGetValue(name, out st) || !ReplayPassDone(st, nSteps)) continue;
+                bool onDisk;
+                try
+                {
+                    if (spec.output.format == "pipe") { var fi = new FileInfo(Path.Combine(outDir, name + ".mkv")); onDisk = fi.Exists && fi.Length > 4096; }
+                    else onDisk = File.Exists(ReplayFramePath(i, 0)) && File.Exists(ReplayFramePath(i, nSteps - 1));
+                }
+                catch { onDisk = false; }
+                if (!onDisk) { Log("resume: pass " + name + " is listed as finished but its frames are not on disk: filmed again"); continue; }
+                rpSkip[i] = true;
+                rpKept.Add(name);
+            }
+            var again = new HashSet<string>();
+            foreach (int i in passCams) if (!rpSkip[i]) again.Add(spec.cameras[i].name);
+            passStats.Clear();
+            foreach (var x in rpPrior.Arr("pass_stats")) { var st = x as Json.Obj; if (st != null && !again.Contains(st.Str("camera", ""))) passStats.Add(st); }
+            rpPriorPasses.Clear();
+            foreach (var x in rpPrior.Arr("passes")) { var p = x as Json.Obj; if (p != null && !again.Contains(p.Str("camera", ""))) rpPriorPasses.Add(p); }
+            Log("resume: " + rpKept.Count + " finished pass(es) kept (" + (rpKept.Count > 0 ? string.Join(", ", rpKept.ToArray()) : "none") + "), " + again.Count + " to film (" + string.Join(", ", new List<string>(again).ToArray()) + ")");
+            rpPriorText = null;
+        }
+
+        // progress.json and the status text of a replay-mode run. The file is written by a background thread, so a slow disk
+        // or a virus scanner never stalls a recorded or rendered frame.
+        void RunProgress(bool force)
+        {
+            float now = Time.realtimeSinceStartup;
+            if (!force && now < nextProgress) return;
+            nextProgress = now + 0.5f;
+            MultiCam.status = StatusLine();
+            string text;
+            try { text = ProgressJson(); }
+            catch (Exception e) { RateError("progress", e); return; }
+            if (targetsBegun && text.IndexOf("\"targets\"", StringComparison.Ordinal) < 0)
+            {
+                int close = text.LastIndexOf('}');
+                if (close > 0) text = text.Substring(0, close).TrimEnd() + ",\n  \"targets\": " + JsonLine.Write(MultiCamTargets.StatusJson()) + "\n}";
+            }
+            if (rpProgressFile == null) rpProgressFile = new McbXLatestFile();
+            rpProgressFile.Post(Path.Combine(outDir, "progress.json"), text);
+        }
+
+        McbXFileWorker ReplayFiles()
+        {
+            if (rpFiles == null) rpFiles = new McbXFileWorker(rpHolds == "link");
+            return rpFiles;
         }
 
         IEnumerator ReplayResolution(int w, int h)
@@ -417,6 +660,7 @@ namespace InsideDev
             recLastReal = recHeader.t0Real;
             recFpsT0 = recHeader.t0Real;
             AudioCapture.clockBase = recHeader.t0Real;
+            AudioCapture.gameBase = recHeader.t0;
             if (sound)
             {
                 var rep6 = new SpecReport();
@@ -428,6 +672,8 @@ namespace InsideDev
             state = "recording"; replay.phase = "record";
             Log("record start: t0 " + recHeader.t0.ToString("0.###", IC) + ", clock " + rec.clock + ", res " + Screen.width + "x" + Screen.height + ", " + recorder.objects + " object(s), " + recKeptNames.Count + " kept culler(s)" + (sound ? ", audio capture on" : ""));
             WriteRun(false);
+            MultiCamTargets.Lean(true);
+            recFlushAt = Time.realtimeSinceStartup;
             yield return RecordLoop(rec, au);
             RecordFinishPass(take);
             if (recGamePipe != null)
@@ -449,6 +695,11 @@ namespace InsideDev
                 yield return replayEof;
                 if (shot) RecordGameFrame();
                 recPrevShot = shot;
+                if (recorder.Stopped)
+                {
+                    if (recorder.Failed || recorder.StopKind == "disk") throw new Exception("recorder stopped: " + recorder.StopReason + ": take aborted");
+                    endReason = "recorder " + recorder.StopKind + ": " + recorder.StopReason; break;
+                }
                 if (stopRequested) { endReason = "stop"; break; }
                 if (ctx.t >= spec.seconds - 1e-6) { endReason = "seconds"; break; }
                 if (spec.until != null && events.ReachedFired(spec.until, ctx.t)) { endReason = "until " + spec.until; break; }
@@ -465,6 +716,7 @@ namespace InsideDev
 
         void RecordStep(AudioCapSpec au, bool first)
         {
+            long step0 = System.Diagnostics.Stopwatch.GetTimestamp();
             double now = Time.realtimeSinceStartupDbl;
             curSample = recorder.samples;
             step = curSample;
@@ -511,8 +763,10 @@ namespace InsideDev
             replay.audio = AudioCapture.capturing ? "capturing" : recAudioStarted ? "stopped" : "";
             replay.eta = Math.Max(0, spec.seconds - t);
             TickFree();
-            if ((curSample + 1) % Math.Max(1, spec.output.flushEvery) == 0) FlushCsv();
-            Progress(false);
+            // inside recorded frames the CSVs are flushed at most every two seconds, progress.json is written off this thread
+            if ((curSample + 1) % Math.Max(1, spec.output.flushEvery) == 0 && Time.realtimeSinceStartup - recFlushAt >= 2f) { FlushCsv(); recFlushAt = Time.realtimeSinceStartup; }
+            RunProgress(false);
+            recStepMs.Add((float)((System.Diagnostics.Stopwatch.GetTimestamp() - step0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency));
         }
 
         void RecordGameFrame()
@@ -549,7 +803,7 @@ namespace InsideDev
                 if (g.ready)
                 {
                     var jp = MultiCamReplayJpegPipe.Open("game", dir, g.w, g.h, g.pixFmt, o, out why);
-                    if (jp != null) { agrab = g; recGamePipe = jp; recGameWriter = jp.writer; recGameEncoder = jp.encoder; Log("game frames: " + jp.encoder + ": " + o.ffmpeg + " " + jp.args); yield break; }
+                    if (jp != null) { agrab = g; recGamePipe = jp; recGameWriter = jp.writer; recGameEncoder = jp.encoder; Log("game frames: " + jp.encoder + ": " + MultiCamFrameWriter.ResolveExe(o.ffmpeg) + " " + jp.args); yield break; }
                     g.Close();
                 }
                 if (o.readback == "native") throw new Exception("record.captureGame with output.readback native: " + why);
@@ -1095,7 +1349,9 @@ namespace InsideDev
             var gd = MultiCamReplayMath.FrameStats(recDtMsNoGrab, 15.0, 18.5);
             p["nograb_frames"] = g[0]; p["nograb_ms_mean"] = MultiCamPlan.Num(g[1]); p["nograb_within_15_18_5"] = MultiCamPlan.Num(g[4]);
             p["nograb_dt_ms_mean"] = MultiCamPlan.Num(gd[1]); p["nograb_dt_within_15_18_5"] = MultiCamPlan.Num(gd[4]);
-            p["note"] = "frame_ms: record step to record step (phase 9); dt_ms: Time.unscaledDeltaTime, the engine frame interval game logic sees; nograb_*: without the frames after a captureGame grab";
+            var sm = MultiCamReplayMath.FrameStats(recStepMs, 0.0, 1.0);
+            p["step_ms_mean"] = MultiCamPlan.Num(sm[1]); p["step_ms_p99"] = MultiCamPlan.Num(sm[2]); p["step_ms_max"] = MultiCamPlan.Num(sm[3]); p["step_within_1ms"] = MultiCamPlan.Num(sm[4]);
+            p["note"] = "frame_ms: record step to record step (phase 9); dt_ms: Time.unscaledDeltaTime, the engine frame interval game logic sees; nograb_*: without the frames after a captureGame grab; step_ms: time the tool's own record step took inside the frame";
             var lim = new Json.Obj();
             lim["period_ms"] = recLimitPeriod * 1000.0; lim["waits"] = (double)recLimitWaits; lim["late"] = (double)recLimitLate; lim["reanchors"] = (double)recLimitReanchors;
             lim["slack_ms"] = LimiterSlack * 1000.0; lim["timeBeginPeriod1"] = recTimerUsed;
@@ -1220,6 +1476,7 @@ namespace InsideDev
             ReplayHideBegin();
             ReplayTimeline();
             if (nSteps == 0) throw new Exception("empty replay timeline (range " + tlFrom.ToString("0.###", IC) + ".." + tlTo.ToString("0.###", IC) + " s)");
+            ReplayResumePlan();
             ReplayEventsCsv();
             WriteRun(false);
             state = "plan"; replay.phase = "plan";
@@ -1236,11 +1493,11 @@ namespace InsideDev
                 ReplayEndReplayer();
                 yield break;
             }
-            if (grab != null) { try { grab.Dispose(); } catch { } }
-            grab = new MultiCamGrab(Screen.width, Screen.height, spec.output.format == "jpg", Mathf.Clamp(spec.output.jpeg, 1, 100));
+            if (grab != null) { try { grab.Dispose(); } catch { } grab = null; }
             yield return ReplayReadback();
+            if (agrab == null) grab = new MultiCamGrab(Screen.width, Screen.height, spec.output.format == "jpg", Mathf.Clamp(spec.output.jpeg, 1, 100));
             writers = new MultiCamFrameWriter[spec.cameras.Count];
-            ReplayPrestart(0);
+            ReplayPrestartFrom(0);
             outW = Screen.width; outH = Screen.height;
             rpEtaStart = Time.realtimeSinceStartup;
             rpEtaRenders0 = renders;
@@ -1248,6 +1505,7 @@ namespace InsideDev
             for (int k = 0; k < passCams.Count; k++)
             {
                 if (stopRequested) break;
+                if (rpSkip[passCams[k]]) { Log("pass " + (k + 1) + "/" + passCams.Count + " " + spec.cameras[passCams[k]].name + ": finished in the earlier run, kept (resume)"); continue; }
                 yield return CameraPass(k, passCams[k]);
             }
             endReason = stopRequested ? "stop" : "done";
@@ -1582,6 +1840,23 @@ namespace InsideDev
                 shutter[i] = g.spec.shutter;
             }
             float fps = spec.timing.fps > 0 ? spec.timing.fps : 30f;
+            long wantSteps;
+            int wantFrames;
+            bool cutShort;
+            MultiCamReplayMath.TimelineSize(from, to, fps, Math.Max(0.0, rplay.ramp), segFrom, speed, samples, shutter, out wantSteps, out wantFrames, out cutShort);
+            if (cutShort) throw new Exception("the timeline has more than " + MultiCamReplayMath.MaxFrames + " output frames over record " + from.ToString("0.###", IC) + ".." + to.ToString("0.###", IC) + " s: film it in parts (range=t0:t1)");
+            int maxMb = Math.Max(16, EditorState.Get(PlanMaxKey, PlanMaxDefault));
+            double planMb = (wantSteps + Math.Max(0, rplay.warmup) + MultiCamReplayMath.JitterCycle) * (96.0 + spec.cameras.Count * 120.0) / 1048576.0;
+            if (planMb > maxMb)
+                throw new Exception("the replay plan would need about " + planMb.ToString("0", IC) + " MB (" + wantSteps + " steps x " + spec.cameras.Count + " cameras), more than " + maxMb + " MB: film it in parts (range=t0:t1), use fewer sub-frame samples, or raise editor.cfg " + PlanMaxKey);
+            for (int i = 1; i < ns; i++)
+            {
+                if (double.IsNaN(segFrom[i]) || segFrom[i] <= from || segFrom[i] >= to) continue;
+                double need = MultiCamReplayMath.OverlapRamp(speed[i - 1], speed[i], samples[i], shutter[i], fps);
+                if (need == 0 || (need > 0 && rplay.ramp >= need - 1e-6)) continue;
+                Log("note: timing.segments[" + i + "]: speed " + speed[i - 1].ToString("0.####", IC) + " -> " + speed[i].ToString("0.####", IC) + " with " + samples[i] + " samples and shutter " + shutter[i].ToString("0.#", IC) +
+                    ": the first frame(s) after the speed-up get a shorter exposure so that record time never runs backwards" + (need > 0 ? "; play.ramp >= " + need.ToString("0.###", IC) + " s avoids it" : " (no ramp avoids it with shutter 360)"));
+            }
             tl = MultiCamReplayMath.Timeline(from, to, fps, Math.Max(0.0, rplay.ramp), segFrom, speed, samples, shutter, Math.Max(0, rplay.warmup), out nWarm, out nSteps, out nFrames);
             long prevLogic = 0;
             for (int idx = 0; idx < tl.Count; idx++)
@@ -1604,7 +1879,14 @@ namespace InsideDev
             {
                 if (ev == null) continue;
                 int s = -1, f = -1;
-                for (int idx = nWarm; idx < tl.Count; idx++) if (tl[idx].T >= ev.time - 1e-9) { s = tl[idx].step; f = tl[idx].frame; break; }
+                // first step at or after the event: the steps are in record-time order
+                int lo = nWarm, hi = tl.Count;
+                while (lo < hi)
+                {
+                    int mid = (lo + hi) >> 1;
+                    if (tl[mid].T < ev.time - 1e-9) lo = mid + 1; else hi = mid;
+                }
+                if (lo < tl.Count) { s = tl[lo].step; f = tl[lo].frame; }
                 eventsCsv.I(s).D(ev.time, "0.######").I(f).S(ev.kind).S(ev.name).S("record").S(ev.detail).End();
             }
         }
@@ -1622,6 +1904,7 @@ namespace InsideDev
         {
             nCams = spec.cameras.Count;
             tlPoses = new CamPose[tl.Count * nCams];
+            ReplayPlanScope();
             float chunk = Time.realtimeSinceStartup;
             int lastSeg = -1;
             double prevT = tl.Count > 0 ? tl[0].T : 0, prevO = tl.Count > 0 ? tl[0].o : 0;
@@ -1659,11 +1942,12 @@ namespace InsideDev
                 prevT = e.T; prevO = e.o;
                 replay.t = e.T;
                 replay.stepIndex = Math.Max(0, e.step + 1);
-                if (Time.realtimeSinceStartup - chunk > 0.05f)
+                if (Time.realtimeSinceStartup - chunk > rpPlanChunk)
                 {
-                    Progress(false);
+                    RunProgress(false);
                     yield return null;
                     TickFrozen();
+                    ReplayAlive();
                     chunk = Time.realtimeSinceStartup;
                 }
             }
@@ -1710,7 +1994,7 @@ namespace InsideDev
             for (int i = 0; i < n; i++)
             {
                 var cs = spec.cameras[i];
-                if (!cs.enabled) continue;
+                if (!rpFilmed[i]) continue;
                 var v = MultiCamView.Spec(cs);
                 if (v.every <= 0f || e.T < viewNext[i] - 1e-9) continue;
                 viewNext[i] = e.T + v.every;
@@ -1759,29 +2043,65 @@ namespace InsideDev
 
         double ReplayTimeOf(TimeRef r) { return ctx.TimeOf(r, 0.0); }
 
+        // The plan checks views and camera paths and resolves hide sets for the cameras this run films: every enabled
+        // camera, or only the ones a cams filter left.
+        void ReplayPlanScope()
+        {
+            int n = spec.cameras.Count, enabled = 0;
+            bool all = passCams.Count == 0;
+            rpFilmed = new bool[n]; rpAnyHide = new bool[n]; rpHideKey = new int[n]; rpHideId = new int[n];
+            for (int i = 0; i < n; i++)
+            {
+                var cs = spec.cameras[i];
+                if (cs.enabled) enabled++;
+                rpFilmed[i] = cs.enabled && (all || (i < passOf.Length && passOf[i] >= 0));
+                rpAnyHide[i] = rpFilmed[i] && MultiCamShots.AnyHide(spec, i);
+                rpHideKey[i] = -1; rpHideId[i] = -1;
+            }
+            rpPlanAll = all || passCams.Count >= enabled;
+            if (!rpPlanAll) Log("plan: view checks, path checks and hide sets for the " + passCams.Count + " filmed camera(s) only (cams filter); views.csv and run.json views cover those");
+        }
+
+        // The names a camera hides change only with the director's shot on air (and, inside a blend, the shot before it): the
+        // hide set of a camera is looked up again only when that changes.
         void ReplayHidePlan(int idx, MultiCamReplayEntry e)
         {
             if (tlHide.Length != tl.Count * nCams) { tlHide = new int[tl.Count * nCams]; for (int k = 0; k < tlHide.Length; k++) tlHide[k] = -1; }
             for (int i = 0; i < nCams; i++)
             {
+                if (!rpAnyHide[i]) continue;
                 var cs = spec.cameras[i];
-                if (!cs.enabled || !MultiCamShots.AnyHide(spec, i)) continue;
-                var names = MultiCamShots.HideNames(spec, i, e.T, ReplayTimeOf, poses[i].flags);
-                if (names.Count == 0) continue;
-                string key = MultiCamShots.HideKey(names);
-                int id;
-                if (!rpHideIndex.TryGetValue(key, out id))
+                int key = 0;
+                if (cs.mode == "director")
                 {
-                    var rep = new SpecReport();
-                    var set = MultiCamHide.Resolve(names, cs.where + ".hide", rep);
-                    Absorb(rep, "hide");
-                    id = rpHideSets.Count;
-                    rpHideSets.Add(set);
-                    rpHideIndex[key] = id;
-                    Log("hide set " + id + " (first for " + cs.name + " at " + e.T.ToString("0.###", IC) + " s): " + MultiCamHide.Text(set));
+                    int prev;
+                    int k = MultiCamShots.At(cs, e.T, rpTimeOf, out prev);
+                    key = (k + 1) * 4096 + ((poses[i].flags & PoseFlags.Blending) != 0 ? prev + 1 : 0);
                 }
-                tlHide[idx * nCams + i] = id;
+                if (rpHideKey[i] != key)
+                {
+                    rpHideKey[i] = key;
+                    rpHideId[i] = ReplayHideSet(i, cs, e);
+                }
+                if (rpHideId[i] >= 0) tlHide[idx * nCams + i] = rpHideId[i];
             }
+        }
+
+        int ReplayHideSet(int i, CamSpec cs, MultiCamReplayEntry e)
+        {
+            var names = MultiCamShots.HideNames(spec, i, e.T, rpTimeOf, poses[i].flags);
+            if (names.Count == 0) return -1;
+            string key = MultiCamShots.HideKey(names);
+            int id;
+            if (rpHideIndex.TryGetValue(key, out id)) return id;
+            var rep = new SpecReport();
+            var set = MultiCamHide.Resolve(names, cs.where + ".hide", rep);
+            Absorb(rep, "hide");
+            id = rpHideSets.Count;
+            rpHideSets.Add(set);
+            rpHideIndex[key] = id;
+            Log("hide set " + id + " (first for " + cs.name + " at " + e.T.ToString("0.###", IC) + " s): " + MultiCamHide.Text(set));
+            return id;
         }
 
         int ReplayHideAt(int idx, int i)
@@ -1811,7 +2131,7 @@ namespace InsideDev
             {
                 var cs = spec.cameras[i];
                 var p = poses[i];
-                if (!cs.enabled || !p.ok) { pathHas[i] = false; continue; }
+                if (!rpFilmed[i] || !p.ok) { pathHas[i] = false; continue; }
                 if (pathHas[i] && e.step >= 0 && (p.flags & PoseFlags.Cut) == 0)
                 {
                     string hit = "";
@@ -1932,6 +2252,13 @@ namespace InsideDev
             var cl = new List<object>();
             foreach (int i in passCams)
             {
+                if (rpSkip[i])
+                {
+                    var kept = new Json.Obj();
+                    kept["name"] = spec.cameras[i].name; kept["mode"] = spec.cameras[i].mode; kept["pass"] = (double)passOf[i]; kept["kept"] = true;
+                    cl.Add(kept);
+                    continue;
+                }
                 int warm, copies, runs;
                 var acts = ReplayActions(i, r, false, out warm, out copies, out runs);
                 int rend = 0, own = 0;
@@ -1996,6 +2323,13 @@ namespace InsideDev
             return agrab != null ? PipeArgs(Screen.width, Screen.height, o, file, agrab.pixFmt, false) : PipeArgs(Screen.width, Screen.height, o, file);
         }
 
+        // prestarts the pipe of the next pass at or after k that is filmed (resume keeps finished passes: their file stays)
+        void ReplayPrestartFrom(int k)
+        {
+            while (k < passCams.Count && rpSkip[passCams[k]]) k++;
+            ReplayPrestart(k);
+        }
+
         void ReplayPrestart(int k)
         {
             if (spec.output.format != "pipe" || k < 0 || k >= passCams.Count) return;
@@ -2015,7 +2349,12 @@ namespace InsideDev
             ReplayPipeStart job;
             if (!rpStarting.TryGetValue(i, out job)) return null;
             rpStarting.Remove(i);
-            if (!job.thread.Join(15000)) { Warn("pipe " + job.cam + ": the prestart did not finish within 15 s; started again on the game thread"); return null; }
+            if (!job.thread.Join(15000))
+            {
+                // a second ffmpeg for the same file would race the first one: the late one is closed when it arrives
+                rpLate.Add(job);
+                throw new Exception("pipe " + job.cam + ": ffmpeg did not start within 15 s (" + job.ffmpeg + "); the pass is not filmed");
+            }
             if (job.writer == null) { Warn("pipe " + job.cam + ": prestart failed (" + job.error + "); started again on the game thread"); return null; }
             Log("pipe " + job.cam + " (started ahead of the pass): " + job.ffmpeg + " " + job.args);
             return job.writer;
@@ -2028,7 +2367,7 @@ namespace InsideDev
                 var job = kv.Value;
                 try
                 {
-                    if (job.thread != null && !job.thread.Join(15000)) continue;
+                    if (job.thread != null && !job.thread.Join(2000)) { rpLate.Add(job); continue; }
                     if (job.writer == null) continue;
                     job.writer.Close(true, 2000);
                     string file = Path.Combine(outDir, job.cam + ".mkv");
@@ -2038,6 +2377,26 @@ namespace InsideDev
                 catch (Exception e) { DevLog.Error("mcam prestarted pipe " + job.cam, e); }
             }
             rpStarting.Clear();
+            foreach (var job in rpLate) ReplayCloseLate(job);
+            rpLate.Clear();
+        }
+
+        // A pipe start that is still running when the run ends: a small thread waits for it and closes the ffmpeg it
+        // brings, so no process with an open pipe is left behind.
+        static void ReplayCloseLate(ReplayPipeStart job)
+        {
+            var t = new System.Threading.Thread(() =>
+            {
+                try
+                {
+                    if (job.thread != null) job.thread.Join();
+                    if (job.writer != null) job.writer.Close(true, 2000);
+                }
+                catch { }
+            });
+            t.IsBackground = true;
+            t.Name = "mcam pipe close " + job.cam;
+            t.Start();
         }
 
         MultiCamFrameWriter ReplayWriter(int i)
@@ -2053,7 +2412,7 @@ namespace InsideDev
                 string file = Path.Combine(outDir, c.name + ".mkv");
                 string args = agrab != null ? PipeArgs(Screen.width, Screen.height, o, file, agrab.pixFmt, false) : PipeArgs(Screen.width, Screen.height, o, file);
                 writers[i] = MultiCamFrameWriter.Pipe(c.name, Math.Max(1, o.queue), o.ffmpeg, args);
-                Log("pipe " + c.name + ": " + o.ffmpeg + " " + args);
+                Log("pipe " + c.name + ": " + MultiCamFrameWriter.ResolveExe(o.ffmpeg) + " " + args);
             }
             else
             {
@@ -2069,10 +2428,22 @@ namespace InsideDev
             return Path.Combine(camDirs[i], stepIndex.ToString("D5", IC) + (spec.output.format == "raw" ? ".rgba" : ".jpg"));
         }
 
-        bool ReplayCopy(int src, int dst, int stepIndex)
+        // Waits (frozen frames, status kept current) until the file thread has done what was queued: the old frames of a
+        // camera folder before its pass, the holds of a pass at its end.
+        IEnumerator ReplayFilesIdle(string what, float seconds)
         {
-            try { File.Copy(ReplayFramePath(src, stepIndex), ReplayFramePath(dst, stepIndex), true); return true; }
-            catch (Exception e) { RateError("copy " + spec.cameras[src].name + " -> " + spec.cameras[dst].name, e); return false; }
+            if (rpFiles == null) yield break;
+            float until = Time.realtimeSinceStartup + seconds;
+            string was = state;
+            while (!rpFiles.Idle && Time.realtimeSinceStartup < until && !aborted)
+            {
+                state = was + ": " + what + " (" + rpFiles.Pending + " left)";
+                RunProgress(false);
+                yield return null;
+                TickFrozen();
+            }
+            state = was;
+            if (!rpFiles.Idle) Error(what + ": " + rpFiles.Pending + " file job(s) still not done after " + seconds.ToString("0", IC) + " s");
         }
 
         void ReplayWriterCheck(MultiCamFrameWriter w)
@@ -2126,6 +2497,7 @@ namespace InsideDev
             yield return null;
             TickFrozen();
             yield return replayEof;
+            ReplayAlive();
             long now = System.Diagnostics.Stopwatch.GetTimestamp();
             if (rpFrameT0 != 0) rpFrameMs.Add((now - rpFrameT0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
             rpFrameT0 = now;
@@ -2197,9 +2569,23 @@ namespace InsideDev
             state = "pass " + (k + 1) + "/" + passCams.Count + " " + cs.name;
             float start = Time.realtimeSinceStartup;
             int renders0 = renders;
+            int cleaned = 0;
+            if (spec.output.format != "pipe" && Directory.Exists(camDirs[i]))
+            {
+                ReplayFiles().Clean(camDirs[i], spec.output.format == "raw" ? ".rgba" : ".jpg");
+                yield return ReplayFilesIdle("removing the frames of an earlier run", 300f);
+                int l0, c0, f0;
+                string e0, n0;
+                bool cleanDone = rpFiles.Idle;
+                rpFiles.Take(out l0, out c0, out f0, out cleaned, out e0, out n0);
+                if (!cleanDone && e0 == null) e0 = "still not done";
+                if (e0 != null) throw new Exception("pass " + cs.name + ": the frames of an earlier run could not be removed from " + camDirs[i] + " (" + e0 + ")");
+                if (cleaned > 0) Log("pass " + cs.name + ": " + cleaned + " frame file(s) of an earlier run removed from " + camDirs[i]);
+            }
             var w = ReplayWriter(i);
-            ReplayPrestart(k + 1);
+            ReplayPrestartFrom(k + 1);
             yield return replayEof;
+            ReplayAlive();
             int warm, copies, runs;
             var acts = ReplayActions(i, Time.frameCount + 1, true, out warm, out copies, out runs);
             Log(state + ": " + acts.Count + " action(s), " + warm + " warmup render(s), " + copies + " copied step(s), " + runs + " director run(s), first render at frame " + (Time.frameCount + 1));
@@ -2213,7 +2599,8 @@ namespace InsideDev
             WriteRun(false);
             rpTaaPending = false;
             var post = cs.post;
-            int done = 0, copied = 0;
+            int done = 0, held = 0;
+            float budget = Time.realtimeSinceStartup;
             var hideSpans = new List<object>();
             int hideCur = -2;
             double hideFrom = double.NaN, hideLast = double.NaN;
@@ -2225,9 +2612,18 @@ namespace InsideDev
                 var e = tl[act.idx];
                 if (act.kind == MultiCamReplayMath.ActCopy)
                 {
-                    if (ReplayCopy(act.src, i, e.step)) copied++;
+                    // a hold: the file thread links (or copies) the source camera's frame; nothing touches the disk here
+                    ReplayFiles().Hold(ReplayFramePath(act.src, e.step), ReplayFramePath(i, e.step));
+                    held++;
                     done++;
                     step = e.step; frame = e.frame; capturedSteps = done; replay.stepIndex = done;
+                    if (Time.realtimeSinceStartup - budget > 0.05f)
+                    {
+                        RunProgress(false);
+                        yield return null;
+                        TickFrozen();
+                        budget = Time.realtimeSinceStartup;
+                    }
                     continue;
                 }
                 var pose = tlPoses[act.idx * nCams + i];
@@ -2249,7 +2645,8 @@ namespace InsideDev
                 replay.t = e.T;
                 ReplayEta();
                 ReplayWriterCheck(w);
-                Progress(false);
+                RunProgress(false);
+                budget = Time.realtimeSinceStartup;
             }
             ReplayTaaRestore();
             MultiCamHide.Restore();
@@ -2280,11 +2677,25 @@ namespace InsideDev
                 written = w.written;
                 ReplayWriterCheck(w);
             }
+            int linked = 0, holdCopies = 0, holdFails = 0, copied = 0;
+            if (held > 0)
+            {
+                yield return ReplayFilesIdle("holds", 900f);
+                int gone;
+                string holdError, linkNote;
+                rpFiles.Take(out linked, out holdCopies, out holdFails, out gone, out holdError, out linkNote);
+                copied = linked + holdCopies;
+                int notDone = held - copied - holdFails;
+                if (notDone > 0) holdFails += notDone;
+                if (linkNote != null) Warn("pass " + cs.name + ": " + linkNote);
+                if (holdFails > 0) Error("pass " + cs.name + ": " + holdFails + " of " + held + " held frame(s) not written" + (holdError != null ? " (" + holdError + ")" : ""));
+                Log("pass " + cs.name + ": " + held + " hold(s): " + linked + " hard link(s), " + holdCopies + " copy(ies)" + (holdFails > 0 ? ", " + holdFails + " failed" : ""));
+            }
             float secs = Time.realtimeSinceStartup - start;
             int rend = renders - renders0;
             var st = new Json.Obj();
             st["camera"] = cs.name; st["seconds"] = Math.Round(secs, 2); st["renders"] = (double)rend; st["steps"] = (double)done;
-            st["copied"] = (double)copied; st["runs"] = (double)runs; st["frames_written"] = (double)written;
+            st["copied"] = (double)copied; st["linked"] = (double)linked; st["hold_failed"] = (double)holdFails; st["runs"] = (double)runs; st["frames_written"] = (double)written;
             st["ms_per_render"] = MultiCamPlan.Num(rend > 0 ? secs * 1000.0 / rend : double.NaN);
             st["stopped"] = stopRequested;
             if (hideUsed.Count > 0) st["hide"] = ReplayHideJson(hideUsed, hideSpans);
@@ -2374,7 +2785,7 @@ namespace InsideDev
                     noise.Add(nj);
                 }
                 ReplayEta();
-                Progress(false);
+                RunProgress(false);
             }
             replay.phase = "golden"; state = "golden";
             int grabbed = 0;
@@ -2391,7 +2802,7 @@ namespace InsideDev
                 replay.stepIndex = s + 1; replay.t = t; capturedSteps = grabbed;
                 ReplayEta();
                 ReplayWriterCheck(gw);
-                Progress(false);
+                RunProgress(false);
             }
             ReplayTaaRestore();
             try { rp.EndPass("golden"); } catch (Exception ex) { Error("end pass golden: " + ex.GetType().Name + ": " + ex.Message); }
@@ -2428,7 +2839,7 @@ namespace InsideDev
                 if (g.ready)
                 {
                     var jp = MultiCamReplayJpegPipe.Open("golden", outDir, g.w, g.h, g.pixFmt, o, out why);
-                    if (jp != null) { agrab = g; rpGoldenPipe = jp; rpGoldenWriter = jp.writer; rpGoldenEncoder = jp.encoder; Log("golden frames: " + jp.encoder + ": " + o.ffmpeg + " " + jp.args); yield break; }
+                    if (jp != null) { agrab = g; rpGoldenPipe = jp; rpGoldenWriter = jp.writer; rpGoldenEncoder = jp.encoder; Log("golden frames: " + jp.encoder + ": " + MultiCamFrameWriter.ResolveExe(o.ffmpeg) + " " + jp.args); yield break; }
                     g.Close();
                 }
                 if (o.readback == "native") throw new Exception("golden with output.readback native: " + why);
@@ -2475,6 +2886,12 @@ namespace InsideDev
             if (p.fov <= 0) p.fov = recInfo != null && recInfo.header != null && recInfo.header.gameFov > 0 ? recInfo.header.gameFov : MultiCamSession.camFov;
             p.ok = true;
             return p;
+        }
+
+        // The replayer ends itself on a level load: the run must not go on rendering a scene nothing drives any more.
+        void ReplayAlive()
+        {
+            if (rp != null && rpBegun && !rpEnded && !rp.active) throw new Exception("the replay ended under the run: " + rp.EndReason + " at frame " + Fmt.I(rp.EndFrame));
         }
 
         void ReplayEndReplayer()
@@ -2632,6 +3049,13 @@ namespace InsideDev
                     rj["look"] = rplay.look; rj["order"] = rplay.order; rj["interp"] = rplay.interp; rj["particles"] = rplay.particles;
                     rj["warmup"] = (double)rplay.warmup; rj["motionBlur"] = rplay.motionBlur; rj["shutterAngle"] = (double)rplay.shutterAngle;
                     rj["cullers"] = mode == ReplayModes.Golden ? "recorded" : rplay.cullers; rj["realTime"] = rplay.realTime; rj["ramp"] = (double)rplay.ramp; rj["copyHolds"] = rplay.copyHolds;
+                    rj["holds"] = rpHolds;
+                }
+                if (replayArgs != null && replayArgs.resume)
+                {
+                    var res = new Json.Obj();
+                    res["kept"] = MultiCamPlan.Strs(rpKept);
+                    rj["resume"] = res;
                 }
                 if (passCams.Count > 0)
                 {
@@ -2644,7 +3068,8 @@ namespace InsideDev
                 if (recorder != null || recHeader != null) { o["record"] = RecordJson(); o["pacing"] = RecordPacingJson(); }
                 if (rp != null) ReplayInfo();
                 if (recInfo != null) o["recording"] = ReplayJson(recInfo);
-                if (viewNext != null) o["views"] = ReplayViewsJson();
+                if (viewNext != null) { o["views"] = ReplayViewsJson(); o["views_scope"] = rpPlanAll ? "all cameras" : "filmed cameras"; }
+                if (targetsBegun) o["target_state"] = MultiCamTargets.StatusJson();
                 var mon = ReplayMonitorJson();
                 if (mon != null) o["monitor"] = mon;
                 if (tl != null)
@@ -2659,7 +3084,7 @@ namespace InsideDev
                     o["captured_steps"] = (double)nSteps;
                     if (rp != null) o["events"] = ReplayEventsJson();
                 }
-                var pl = new List<object>();
+                var pl = new List<object>(rpPriorPasses);
                 foreach (var p in passInfos) pl.Add(ReplayJson(p));
                 o["passes"] = pl;
                 o["pass_stats"] = new List<object>(passStats);
@@ -2688,6 +3113,8 @@ namespace InsideDev
             try { GoldenCloseWriter(kill || aborted); } catch (Exception e) { DevLog.Error("mcam replay finish golden writer", e); }
             try { ReplayTaaRestore(); } catch (Exception e) { DevLog.Error("mcam replay finish taa", e); }
             try { MultiCamHide.Restore(); } catch (Exception e) { DevLog.Error("mcam replay finish hide", e); }
+            try { if (rpFiles != null) { rpFiles.Close(kill || aborted || failure != null, kill || aborted ? 0 : 5000); rpFiles = null; } } catch (Exception e) { DevLog.Error("mcam replay finish files", e); }
+            try { if (rpProgressFile != null) { rpProgressFile.Close(1000); rpProgressFile = null; } } catch (Exception e) { DevLog.Error("mcam replay finish progress", e); }
             try { ReplayDropPrestarted(); } catch (Exception e) { DevLog.Error("mcam replay finish prestarted pipes", e); }
             try { ReplayEndReplayer(); } catch (Exception e) { DevLog.Error("mcam replay finish replayer", e); }
             try { if (recorder != null && !recEnded) RecordEndRecorder(); } catch (Exception e) { DevLog.Error("mcam replay finish recorder", e); }
@@ -2736,8 +3163,9 @@ namespace InsideDev
                 foreach (var f in Directory.GetFiles(dir, Prefix + "*.jpg")) { try { File.Delete(f); } catch { } }
                 int q = Quality(o.jpeg);
                 var p = new MultiCamReplayJpegPipe { dir = dir };
-                p.args = "-hide_banner -loglevel error -y -f rawvideo -pix_fmt " + pixFmt + " -s " + w + "x" + h + " -framerate 30 -i - -an -c:v mjpeg -q:v " + q +
-                         " -qmin 1 -pix_fmt yuvj444p -f image2 -start_number 0 \"" + Path.Combine(dir, Prefix + "%05d.jpg") + "\"";
+                // a percent sign in the folder name is doubled: the image2 pattern must read it as a character, not as a number field
+                p.args = "-hide_banner -loglevel error -y -f rawvideo -pix_fmt " + pixFmt + " -s " + Fmt.I(w) + "x" + Fmt.I(h) + " -framerate 30 -i - -an -c:v mjpeg -q:v " + Fmt.I(q) +
+                         " -qmin 1 -pix_fmt yuvj444p -f image2 -start_number 0 " + Ffmpeg.Quote(Path.Combine(dir.Replace("%", "%%"), Prefix + "%05d.jpg"));
                 p.writer = MultiCamFrameWriter.Pipe(name, Math.Max(2, o.queue), o.ffmpeg, p.args);
                 p.encoder = "native readback + ffmpeg mjpeg q" + q + " yuvj444p off the game thread";
                 return p;
@@ -2860,36 +3288,77 @@ namespace InsideDev
             return Math.Max(1, (int)Math.Round(samples / ex));
         }
 
-        public static List<MultiCamReplayEntry> Timeline(double from, double to, double fps, double ramp, double[] start, float[] speed, int[] samples, float[] shutter, int warmup,
-                                                         out int nWarm, out int nSteps, out int nFrames)
+        public const int MaxFrames = 1000000;
+
+        // One walk over the output frames for Timeline (steps != null) and TimelineSize (count only). cut = the frame limit
+        // ended the walk before `to`.
+        static void Walk(double from, double to, double fps, double ramp, double[] start, float[] speed, int[] samples, float[] shutter, List<MultiCamReplayEntry> steps,
+                         out long count, out int frames, out bool cut)
         {
-            if (fps <= 0) fps = 30;
             var pieces = Pieces(start, speed, from, to);
-            var steps = new List<MultiCamReplayEntry>();
-            double t = from;
+            double t = from, lastT = double.NegativeInfinity;
             int f = 0;
-            while (t <= to + 1e-9 && f < 1000000)
+            count = 0;
+            while (t <= to + 1e-9 && f < MaxFrames)
             {
                 int si = SegAt(start, t);
                 double o = f / fps;
                 double s = ramp > 0 && pieces.Count > 1 ? RampSpeed(pieces, ramp, o + 0.5 / fps) : speed[si];
                 if (s < 1e-6) s = 1e-6;
                 int m = Math.Max(1, samples[si]);
-                double ex = m > 1 ? Math.Max(1e-9, shutter[si] / 360.0) * s / fps : s / fps;
-                int rate = RateOf(fps, s, m, shutter[si]);
-                for (int i = 0; i < m; i++)
+                if (steps != null)
                 {
-                    var e = new MultiCamReplayEntry();
-                    e.T = m > 1 ? Math.Max(0, t - ex + (i + 1) * ex / m) : t;
-                    e.o = Math.Max(0, o - (t - e.T) / s);
-                    e.step = steps.Count; e.frame = f; e.sub = i; e.seg = si; e.samples = m; e.speed = (float)s; e.rate = rate;
-                    steps.Add(e);
+                    double ex = m > 1 ? Math.Max(1e-9, shutter[si] / 360.0) * s / fps : s / fps;
+                    // The exposure of a frame never reaches back past the last sample of the frame before it (the first
+                    // frame after a speed-up would): record time only moves forward along the timeline.
+                    double exF = m > 1 && count > 0 ? Math.Min(ex, Math.Max(1e-9, t - lastT)) : ex;
+                    int rate = exF < ex ? Math.Max(1, (int)Math.Round(Math.Min(1e6, m / exF))) : RateOf(fps, s, m, shutter[si]);
+                    for (int i = 0; i < m; i++)
+                    {
+                        var e = new MultiCamReplayEntry();
+                        e.T = m > 1 ? Math.Max(0, t - exF + (i + 1) * exF / m) : t;
+                        e.o = Math.Max(0, o - (t - e.T) / s);
+                        e.step = steps.Count; e.frame = f; e.sub = i; e.seg = si; e.samples = m; e.speed = (float)s; e.rate = rate;
+                        steps.Add(e);
+                    }
                 }
+                count += m;
+                lastT = t;
                 t += s / fps;
                 f++;
             }
+            frames = f;
+            cut = t <= to + 1e-9;
+        }
+
+        // Steps and output frames Timeline would build, without building them (the memory check before the plan pass).
+        public static void TimelineSize(double from, double to, double fps, double ramp, double[] start, float[] speed, int[] samples, float[] shutter, out long steps, out int frames, out bool cut)
+        {
+            if (fps <= 0) fps = 30;
+            Walk(from, to, fps, ramp, start, speed, samples, shutter, null, out steps, out frames, out cut);
+        }
+
+        // Seconds of play.ramp that keep the exposure of the first frames after a speed-up from speed a to speed b (samples
+        // per frame and shutter of the faster segment) inside the step of the frame before: 0 = nothing to avoid, -1 = no
+        // ramp can (shutter 360). Without that ramp Timeline shortens the exposure of those frames.
+        public static double OverlapRamp(double a, double b, int samples, float shutter, double fps)
+        {
+            if (samples <= 1 || a <= 0 || b <= a || fps <= 0) return 0;
+            double k = shutter / 360.0;
+            if (k * b <= a * (1 + 1e-9)) return 0;
+            if (k >= 1 - 1e-9) return -1;
+            return (b - a) / (a * (1 / k - 1) * fps);
+        }
+
+        public static List<MultiCamReplayEntry> Timeline(double from, double to, double fps, double ramp, double[] start, float[] speed, int[] samples, float[] shutter, int warmup,
+                                                         out int nWarm, out int nSteps, out int nFrames)
+        {
+            if (fps <= 0) fps = 30;
+            var steps = new List<MultiCamReplayEntry>();
+            long count;
+            bool cut;
+            Walk(from, to, fps, ramp, start, speed, samples, shutter, steps, out count, out nFrames, out cut);
             nSteps = steps.Count;
-            nFrames = f;
             nWarm = Math.Max(0, warmup) + JitterCycle - 1;
             var r = new List<MultiCamReplayEntry>(nWarm + nSteps);
             var first = nSteps > 0 ? steps[0] : null;

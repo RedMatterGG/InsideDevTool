@@ -15,7 +15,10 @@ namespace InsideDev
     // pre-keys bound the error inside a gap by the eps; a pre-key never replaces a key already written for that sample);
     // position is non-uniform Catmull-Rom (Hermite, tangent = slope of the parabola through three keys, exact for constant
     // acceleration) when the keys at b-2..b+1 sit on consecutive samples without a cut, else linear; rotation slerp with the
-    // sign of b flipped when dot < 0; scale lerp. A cut of the object in (t_a, t_b] holds a until t_b. Light, material,
+    // sign of b flipped when dot < 0. A cut of the object in (t_a, t_b] holds a until t_b. Scale keys are exact (the
+    // recorder keys any difference it reads, but reads the scale of a settled object only now and then), so a gap between
+    // two scale keys means "believed constant": it holds a up to the sample before b, then lerps, like the channels
+    // without a pre-key bit. Light, material,
     // probe, fog/post and rope channels have no pre-key bit: an unkeyed gap holds a up to the sample before b (implicit
     // pre-key), then interpolates. The recorder keys lights, materials and fog/post on change and probes and ropes past
     // posEps, so the hold is exact for the first and keeps the gap error below posEps for the others (a gap-wide lerp
@@ -116,7 +119,7 @@ namespace InsideDev
             }
             pos = !Empty(o.pos) ? Position(o.pos, o, t) : o.src != null ? o.src.pos : default(Vector3);
             rot = !Empty(o.rot) ? Rotation(o.rot, o, t) : o.src != null ? o.src.rot : new Quaternion(0f, 0f, 0f, 1f);
-            scale = !Empty(o.scale) ? Linear3(o.scale, o, t, false) : o.src != null ? o.src.scale : new Vector3(1f, 1f, 1f);
+            scale = !Empty(o.scale) ? Linear3(o.scale, o, t, true) : o.src != null ? o.src.scale : new Vector3(1f, 1f, 1f);
             return true;
         }
 
@@ -209,6 +212,14 @@ namespace InsideDev
             if (o == null || o.shared == null || slot < 0 || slot >= o.shared.Count || Empty(o.shared[slot])) return false;
             material = Step(o.shared[slot], t);
             return true;
+        }
+
+        // Shared-material slots that have keys: at least OBJT materialSlots for a renderer whose slots grew during the take
+        // (or that had no material at the scan), so a replay sizes its slot list by max(materialSlots, SharedSlots).
+        public int SharedSlots(int id)
+        {
+            var o = Get(id);
+            return o == null || o.shared == null ? 0 : o.shared.Count;
         }
 
         public bool Probe(int id, double t, out Vector3 pos)
@@ -406,7 +417,7 @@ namespace InsideDev
             frameCounts[i] = s.frameCount;
             fixedSteps[i] = s.fixedSteps;
             stampFlags[i] = s.flags;
-            if (s.gameTime < prev) warnings.Add("sample " + i + ": game time goes back (" + s.gameTime.ToString("0.######") + " < " + prev.ToString("0.######") + "), held");
+            if (s.gameTime < prev) warnings.Add("sample " + i + ": game time goes back (" + s.gameTime.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture) + " < " + prev.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture) + "), held");
             if (i + 1 > count) count = i + 1;
             lastT = double.NaN;
         }
@@ -490,7 +501,7 @@ namespace InsideDev
         void ISrecSink.Material(int sample, int id, byte kind, int prop, Vector4 value, int texture)
         {
             var o = Need(id);
-            if (prop < 0 || kind > SrecConst.MatTexture) return;
+            if (prop < 0 || prop >= SrecConst.MaxMatProps || kind > SrecConst.MatTexture) return;
             if (kind == SrecConst.MatTexture)
             {
                 if (o.tex == null) o.tex = new List<ITrack>();
@@ -548,7 +559,7 @@ namespace InsideDev
 
         void ISrecSink.Render(int sample, int field, byte type, Vector4 value)
         {
-            if (field < 0) return;
+            if (field < 0 || field >= SrecConst.MaxRenderFields) return;
             while (render.Count <= field) render.Add(null);
             if (render[field] == null) render[field] = new FTrack(5);
             int k = render[field].Slot(sample) * 5;
@@ -590,7 +601,7 @@ namespace InsideDev
         void ISrecSink.SharedMat(int sample, int id, int slot, int material)
         {
             var o = Need(id);
-            if (slot < 0) return;
+            if (slot < 0 || slot >= SrecConst.MaxMatSlots) return;
             if (o.shared == null) o.shared = new List<ITrack>();
             while (o.shared.Count <= slot) o.shared.Add(null);
             if (o.shared[slot] == null) o.shared[slot] = new ITrack();
@@ -667,7 +678,7 @@ namespace InsideDev
                 }
                 if (worst <= HalfPi) continue;
                 fast++;
-                if (fast <= MaxListed) warnings.Add("fast rotator: id " + i + " " + (o.src != null ? o.src.path : "") + " turns " + (worst * 180.0 / Math.PI).ToString("0.#") + " deg in one sample at sample " + at + ": record at a higher rate");
+                if (fast <= MaxListed) warnings.Add("fast rotator: id " + i + " " + (o.src != null ? o.src.path : "") + " turns " + (worst * 180.0 / Math.PI).ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) + " deg in one sample at sample " + at + ": record at a higher rate");
             }
             if (fast > MaxListed) warnings.Add("fast rotator: " + (fast - MaxListed) + " more objects turn over 90 deg in one sample");
         }

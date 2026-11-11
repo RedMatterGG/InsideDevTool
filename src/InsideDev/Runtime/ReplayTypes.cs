@@ -53,6 +53,10 @@ namespace InsideDev
         public bool captureGame = false;
         public int captureEvery = 10;
         public List<string> checks = new List<string>();
+        public int maxMB = 0;
+        public float maxSeconds = 0f;
+        public int minFreeMB = 0;
+        public string onLoad = "continue";
     }
 
     public sealed class BoxSpec : SpecNode
@@ -84,6 +88,8 @@ namespace InsideDev
         public float maxUnresolved = 0.01f;
         public bool monitor = true;
         public string restore = "final";
+        public string holds = "link";
+        public float planChunkMs = 50f;
     }
 
     public sealed class AudioCapSpec : SpecNode
@@ -103,6 +109,13 @@ namespace InsideDev
     // MotionBlurModes entry or a number (SpecBind turns a JSON number into its invariant string). PlaySpec.range: given
     // (Has("range")) = [from, to] in record seconds, else the whole recording. PlaySpec.setup null = the record spec's setup
     // without its cues, [] = only the header's load + waitfor streaming. PlaySpec.activateList: {path: "quiet" | "normal"}.
+    // RecordSpec.maxMB / maxSeconds (0 = no limit) end the sampling when scene.srec or the record time reaches them,
+    // minFreeMB (0 = no check, the default) refuses a start and ends the sampling below that much free space on the record
+    // drive (a write that fails on a full disk stops the recording in any case);
+    // onLoad says what a level load (respawn, checkpoint, chapter) does to a running recording: "continue" records on
+    // (unloaded objects end, reloaded subscenes join again; the sampling ends only when no recorded object is left and
+    // none comes back within 3 s of record time), "stop" ends the sampling at the load. The host reads
+    // SceneRecorder.Stopped / StopReason and ends the take.
     public static class ReplayConst
     {
         public static readonly string[] DefaultRoots = { "auto" };
@@ -110,6 +123,7 @@ namespace InsideDev
         public static readonly int[] FixedRates = { 60, 120, 240 };
         public static readonly string[] RecordParticles = { "all", "none", "list" };
         public static readonly string[] ForceCullers = { "zone", "planned", "list", "none" };
+        public static readonly string[] OnLoads = { "continue", "stop" };
         public static readonly string[] Looks = { "game", "clean" };
         public static readonly string[] Orders = { "camera", "step" };
         public static readonly string[] Interps = { "hermite", "linear", "nearest" };
@@ -253,6 +267,9 @@ namespace InsideDev
         public const byte MatFloat = 0, MatColor = 1, MatVector = 2, MatTexture = 3;
         public const byte ValFloat = 0, ValVec4 = 1, ValInt = 2;
         public const byte VirtBoy = 1, VirtHuddle = 2, VirtHuddleMain = 4;
+        // Index limits of the sparse channels (the writer drops an entry at or above them, readers refuse the block):
+        // MaterialInstance property index per kind, shared material slot, fog / post field, ids a Strings entry may skip.
+        public const int MaxMatProps = 4096, MaxMatSlots = 1024, MaxRenderFields = 4096, MaxStringGap = 65536;
     }
 
     // ------------------------------------------------------------------ replay source (read by CORE and RIG while replaying)

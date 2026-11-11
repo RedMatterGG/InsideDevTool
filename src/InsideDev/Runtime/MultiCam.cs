@@ -24,8 +24,35 @@ namespace InsideDev
         internal static MultiCamRunner runner;
         static bool replayLock;
         static float gammaOriginal = float.NaN;
-        public const string BusyText = "busy: mcam capturing (allowed now: mcam status|stop|abort|check|list|pose|schema, srec status|objects|event, acap status, state, game_state, ping, audio)";
-        public const string Help = "mcam check <spec> [json] [replay|v2] | start <spec> <out> | rehearse <spec> <out> | preview <spec> <out> [t] | record <spec> <out> | replay <spec> <out> [cams=a,b] [range=t0:t1] | take <spec> <out> [cams=a,b] [range=t0:t1] | passes <spec> <out> [cams=a,b] [range=t0:t1] | golden <spec> <out> [every] | stop | abort | status [json] | show <cam> [t] | pose <cam> [t] | views <spec> [shots|t,t,...] [cams=a,b] [out=<json>] | list | probe <obj> | probe <x> <y> <z> <r> | schema";
+        // how the last run ended (mcam status json, key "last"); null until a run has ended in this game session
+        internal static Json.Obj lastRun;
+        public const string BusyText = "busy: mcam capturing (allowed now: mcam status|stop|abort|check|list|pose|schema, srec status|objects|event, acap status, state, game_state, ping, audio, doctor, background [status], cfg [list|get])";
+        public const string Help = "mcam check <spec> [json] [replay|v2] | start <spec> [<out>] [overwrite=on] | rehearse <spec> [<out>] [overwrite=on] | preview <spec> [<out>] [t] [overwrite=on] | record <spec> [<out>] [overwrite=on] | replay <spec> [<out>] [cams=a,b] [range=t0:t1] [resume] [overwrite=on] | take <spec> [<out>] [cams=a,b] [range=t0:t1] [overwrite=on] | passes <spec> [<out>] [cams=a,b] [range=t0:t1] | golden <spec> [<out>] [every] | stop | abort | status [json] | show <cam> [t] | pose <cam> [t] | views <spec> [shots|t,t,...] [cams=a,b] [out=<json>] | list | probe <obj> [json] | probe <x> <y> <z> <r> [json] | readback test|status|stat|free | schema  (no <out>: <spec dir>/takes/<name>_<time>; a folder that holds a take needs overwrite=on)";
+
+        static MultiCam()
+        {
+            try { Doctor.Register("mcam", DoctorRows); } catch { }
+        }
+
+        static string PluginFile() { return Path.Combine(Path.Combine(Application.dataPath, "Plugins"), "InsideReadback.dll"); }
+
+        static List<Doctor.Row> DoctorRows()
+        {
+            var rows = new List<Doctor.Row>();
+            string tried;
+            string ff = Ffmpeg.Find(out tried);
+            if (ff != null) rows.Add(new Doctor.Row("mcam", "ffmpeg", Doctor.Ok, ff));
+            else rows.Add(new Doctor.Row("mcam", "ffmpeg", Doctor.Info, "ffmpeg.exe not found (" + tried + "): takes with output.format pipe are refused", "set ffmpeg.path in editor.cfg, or put ffmpeg.exe in <game>\\_mod\\ffmpeg\\ or on PATH"));
+            bool plugin = false;
+            try { plugin = File.Exists(PluginFile()); } catch { }
+            string holder = Owners.Holder(Owners.Readback);
+            rows.Add(new Doctor.Row("mcam", "readback plugin", Doctor.Info, plugin ? "InsideReadback.dll installed" + (ReadbackNative.Version > 0 ? " (version " + Fmt.I(ReadbackNative.Version) + ")" : "") + (holder != null ? ", held by " + holder : "") : "InsideReadback.dll not installed: frames are read with ReadPixels on the game thread"));
+            if (runner != null) rows.Add(new Doctor.Row("mcam", "run", Doctor.Info, runner.StatusLine()));
+            else if (MultiCamSession.active) rows.Add(new Doctor.Row("mcam", "session", Doctor.Fail, "a capture session was left active without a runner", "mcam abort"));
+            else rows.Add(new Doctor.Row("mcam", "session", Doctor.Ok, "idle"));
+            if (MultiCamFreeze.holding) rows.Add(new Doctor.Row("mcam", "freeze", Doctor.Info, "the game is " + MultiCamFreeze.Status(), "ts 1"));
+            return rows;
+        }
 
         public static bool Running { get { return runner != null; } }
         public static bool Capturing { get { return MultiCamSession.active; } }
@@ -60,7 +87,7 @@ namespace InsideDev
                         return "stopping after the current step";
                     case "abort": return Abort("mcam abort");
                     case "status":
-                        if (a.Count > 2 && a[2].ToLowerInvariant() == "json") return runner != null ? runner.ProgressJson() : "{\"state\": \"" + (MultiCamSession.active ? "session active without runner" : "idle") + "\", \"frozen\": " + (MultiCamFreeze.holding ? "true" : "false") + ", \"status\": \"" + status.Replace("\\", "/").Replace("\"", "'").Replace("\n", " ") + "\"}";
+                        if (a.Count > 2 && a[2].ToLowerInvariant() == "json") return StatusJson();
                         return runner != null ? runner.StatusLine() : "multicam " + status + (MultiCamSession.active ? "  [session still active: run mcam abort]" : "") + (MultiCamFreeze.holding ? "  [game " + MultiCamFreeze.Status() + "]" : "");
                     case "show": return ShowPose(true, a);
                     case "pose": return ShowPose(false, a);
@@ -74,6 +101,29 @@ namespace InsideDev
             }
             catch (Exception e) { DevLog.Error("mcam " + sub, e); return "mcam " + sub + " failed: " + e.GetType().Name + ": " + e.Message; }
             return "usage: " + Help;
+        }
+
+        // One line. Running: the keys of progress.json. Idle: state, frozen, status, and under "last" how the last run of
+        // this game session ended. Both: the readback plugin (installed, holder).
+        static string StatusJson()
+        {
+            Json.Obj o;
+            if (runner != null) o = runner.ProgressObj();
+            else
+            {
+                o = new Json.Obj();
+                o["state"] = MultiCamSession.active ? "session active without runner" : "idle";
+                o["frozen"] = MultiCamFreeze.holding;
+                o["status"] = status;
+                o["last"] = lastRun;
+            }
+            var rb = new Json.Obj();
+            bool plugin = ReadbackNative.Version > 0;
+            if (!plugin) { try { plugin = File.Exists(PluginFile()); } catch { } }
+            rb["installed"] = plugin;
+            rb["holder"] = Owners.Holder(Owners.Readback) ?? "";
+            o["readback"] = rb;
+            return JsonLine.Write(o);
         }
 
         static string Check(List<string> a)
@@ -93,7 +143,7 @@ namespace InsideDev
             if (plan.spec != null)
             {
                 plan.ResolveTargets(runner != null || MultiCamSession.active);
-                if (runner == null) last = plan;
+                if (runner == null) { last = plan; plan.Preflight(); }
             }
             return json ? plan.ReportJson() : plan.ReportText();
         }
@@ -101,22 +151,58 @@ namespace InsideDev
         static string Start(List<string> a, DevCore core, string mode)
         {
             string verb = mode == "capture" ? "start" : mode;
+            string usage = "usage: mcam " + verb + " <spec.json> [<out dir>]" + (mode == "preview" ? " [t]" : "") + " [overwrite=on]";
             if (runner != null) return "already running: " + runner.StatusLine();
             if (MultiCamSession.active) return "the previous capture session was not restored: run 'mcam abort' first";
             string owner = SceneOwner();
             if (owner != null) return owner;
-            if (a.Count < 4) return "usage: mcam " + verb + " <spec.json> <out dir>" + (mode == "preview" ? " [t]" : "");
+            if (a.Count < 3) return usage;
+            bool overwrite;
+            string bad;
+            var words = McaXTake.Words(a, 3, out overwrite, out bad);
+            if (bad != null) return bad + "\n" + usage;
             double at = double.NaN;
-            if (mode == "preview" && a.Count > 4 && !double.TryParse(a[4], NumberStyles.Float, IC, out at)) return "preview time must be game seconds";
-            string outDir;
-            try { outDir = Path.GetFullPath(a[3]); } catch (Exception e) { return "bad out dir: " + e.Message; }
+            string given = null;
+            if (mode == "preview")
+            {
+                // preview <spec> [<out dir>] [t]: a single word that reads as a number is t
+                if (words.Count > 2) return "unknown argument '" + words[2] + "'\n" + usage;
+                if (words.Count == 2) { given = words[0]; if (!Fmt.TryD(words[1], out at)) return "preview time must be game seconds"; }
+                else if (words.Count == 1 && !Fmt.TryD(words[0], out at)) { at = double.NaN; given = words[0]; }
+            }
+            else
+            {
+                if (words.Count > 1) return "unknown argument '" + words[1] + "'\n" + usage;
+                if (words.Count == 1) given = words[0];
+            }
             var plan = MultiCamPlan.Load(a[2]);
             if (plan.spec == null || !plan.report.ok) return "spec error(s), not started:\n" + plan.report.Summary(40);
+            string outDir;
+            try { outDir = given != null ? Path.GetFullPath(given) : McaXTake.DefaultOut(plan); } catch (Exception e) { return "bad out dir: " + e.Message; }
+            if (!overwrite)
+            {
+                string held = McaXTake.Holds(verb, outDir);
+                if (held != null) return held;
+            }
+            if (mode != "rehearse")
+            {
+                plan.Preflight();
+                if (plan.blockers.Count > 0) return "refused: " + string.Join("; ", plan.blockers.ToArray()) + "\n(nothing in the game was touched; 'mcam check <spec>' shows the same, 'mcam rehearse' runs without ffmpeg)";
+                if (plan.spec.output.format == "pipe" && plan.spec.output.readback == "native")
+                {
+                    // the spec demands the plugin: say so now, not after the setup and the freeze
+                    string why = ReadbackNative.Unavailable();
+                    string holder = why == null ? Owners.Holder(Owners.Readback) : null;
+                    if (holder != null) why = "the plugin is held by " + holder;
+                    if (why != null) return "refused: output.readback native: " + why + " (output.readback auto reads the frames with ReadPixels)";
+                }
+            }
             last = plan;
             var host = new GameObject("InsideDev MultiCam");
             UnityEngine.Object.DontDestroyOnLoad(host);
             status = mode + " starting -> " + outDir;
             runner = host.AddComponent<MultiCamRunner>();
+            runner.overwrite = overwrite;
             runner.Init(plan, mode, outDir, at, core);
             if (runner == null) return "multicam " + mode + " did not start: " + status;
             var sb = new StringBuilder();
@@ -124,6 +210,7 @@ namespace InsideDev
               .Append(plan.spec.seconds.ToString("0.##", IC)).Append(" game s max");
             if (mode == "capture") sb.Append(", estimate ").Append(plan.estCaptured.ToString("0", IC)).Append(" captured steps, ~").Append(plan.estMinutes.ToString("0.#", IC)).Append(" min");
             sb.Append(" -> ").Append(outDir);
+            if (given == null) sb.Append("\nout: ").Append(outDir).Append(" (no out dir given)");
             if (plan.report.warnings.Count > 0) sb.Append('\n').Append(plan.report.Summary(12));
             return sb.ToString();
         }
@@ -136,16 +223,48 @@ namespace InsideDev
             string owner = SceneOwner();
             if (owner != null) return owner;
             if (AudioCapture.capturing) return "an acap capture is running: run 'acap stop' first";
-            if (a.Count < 4) return usage;
-            string outDir;
-            try { outDir = Path.GetFullPath(a[3]); } catch (Exception e) { return "bad out dir: " + e.Message; }
+            if (a.Count < 3) return usage;
+            bool overwrite;
+            string bad;
+            var words = McaXTake.Words(a, 3, out overwrite, out bad);
+            if (bad != null) return bad + "\n" + usage;
+            // the first word is the out dir unless it is one of the options
+            string given = null;
+            if (words.Count > 0 && !McaXTake.ReplayOption(words[0])) { given = words[0]; words.RemoveAt(0); }
             var plan = MultiCamPlan.Load(a[2], true);
             if (plan.spec == null || !plan.report.ok) return "spec error(s), not started:\n" + plan.report.Summary(40);
             var args = new ReplayArgs();
-            string err = MultiCamLint.ParseArgs(verb, a, 4, plan.spec, args);
+            string err = MultiCamLint.ParseArgs(verb, words, 0, plan.spec, args);
             if (err != null) return err + "\n" + usage;
+            args.overwrite = overwrite;
+            bool recorded = verb == ReplayModes.Replay || verb == ReplayModes.Passes || verb == ReplayModes.Golden;
+            string outDir;
+            try
+            {
+                if (given != null) outDir = Path.GetFullPath(given);
+                else if (recorded && (plan.spec.replay == null || string.IsNullOrEmpty(plan.spec.replay.source)))
+                {
+                    // these film a recording that exists: without an out dir, the newest take folder of this spec that has one
+                    outDir = McaXTake.LatestRecorded(plan);
+                    if (outDir == null) return "no recording: no folder " + McaXTake.DefaultPattern(plan) + " holds " + ReplayConst.RecordFolder + "\\" + ReplayConst.RecordFile + " (run 'mcam record <spec>' or 'mcam take <spec>' first, give the out dir, or set replay.source)";
+                }
+                else outDir = McaXTake.DefaultOut(plan);
+            }
+            catch (Exception e) { return "bad out dir: " + e.Message; }
+            if (!overwrite && (verb == ReplayModes.Record || verb == ReplayModes.Take))
+            {
+                string held = McaXTake.Holds(verb, outDir);
+                if (held != null) return held;
+            }
             string missing = MultiCamLint.MissingRecording(verb, plan.spec, plan.dir, outDir);
             if (missing != null) return missing;
+            string refused = MultiCamRunner.ReplayRefuse(verb, plan.spec, outDir, args);
+            if (refused != null) return refused;
+            if (verb == ReplayModes.Replay || verb == ReplayModes.Take)
+            {
+                plan.Preflight();
+                if (plan.blockers.Count > 0) return "refused: " + string.Join("; ", plan.blockers.ToArray()) + "\n(nothing in the game was touched; 'mcam check <spec>' shows the same)";
+            }
             last = plan;
             replayLock = plan.spec.session.lockInput;
             var host = new GameObject("InsideDev MultiCam");
@@ -153,10 +272,12 @@ namespace InsideDev
             status = verb + " starting -> " + outDir;
             runner = host.AddComponent<MultiCamRunner>();
             runner.replayArgs = args;
+            runner.overwrite = overwrite;
             runner.Init(plan, verb, outDir, double.NaN, core);
             if (runner == null) return "multicam " + verb + " did not start: " + status;
             var sb = new StringBuilder();
             sb.Append("multicam ").Append(verb).Append(" started: ").Append(MultiCamLint.Describe(verb, plan, args)).Append(" -> ").Append(outDir);
+            if (given == null) sb.Append("\nout: ").Append(outDir).Append(recorded ? " (no out dir given: the newest take of this spec with a recording)" : " (no out dir given)");
             if (plan.report.warnings.Count > 0) sb.Append('\n').Append(plan.report.Summary(12));
             return sb.ToString();
         }
@@ -174,6 +295,7 @@ namespace InsideDev
             if (runner != null) { runner.AbortNow(why); r = "aborted: session restored"; }
             else if (MultiCamSession.active) { MultiCamSession.Pop(); r = "no runner was alive; session restored"; status = "aborted (" + why + ")"; }
             else r = "nothing to abort (" + status + ")";
+            if (runner == null) { try { MultiCamAsyncGrab.CloseOrphan(MultiCamAsyncGrab.OwnerMcam); } catch (Exception e) { DevLog.Error("mcam abort readback", e); } }
             if (AudioCapture.capturing && MultiCamSafety.AudioOff(why, null)) r += "; audio capture stopped (rtpc 0 first)";
             if (runner == null && (SceneReplayer.current != null || SceneRecorder.active != null)) r += "; an srec session is still active (srec end | srec record stop)";
             return r;
@@ -274,7 +396,12 @@ namespace InsideDev
             {
                 string k = a[i];
                 if (k.StartsWith("cams=", StringComparison.OrdinalIgnoreCase)) { cams = new HashSet<string>(k.Substring(5).Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)); continue; }
-                if (k.StartsWith("out=", StringComparison.OrdinalIgnoreCase)) { outFile = k.Substring(4); continue; }
+                if (k.StartsWith("out=", StringComparison.OrdinalIgnoreCase))
+                {
+                    outFile = k.Substring(4);
+                    if (!outFile.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) return "refused: out= takes a .json file name (got '" + outFile + "')\n" + usage;
+                    continue;
+                }
                 if (k.ToLowerInvariant() == "shots") { shots = true; continue; }
                 shots = false;
                 foreach (var part in k.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
@@ -335,9 +462,9 @@ namespace InsideDev
                 {
                     var o = new Json.Obj();
                     o["spec"] = plan.path; o["live"] = live; o["checks"] = (double)n2; o["problems"] = (double)bad; o["rows"] = rows;
-                    File.WriteAllText(Path.GetFullPath(outFile), Json.Write(o));
+                    SafeFile.WriteAllText(Path.GetFullPath(outFile), Json.Write(o));
                 }
-                catch (Exception e) { sb.Append("out: ").Append(e.Message).Append('\n'); }
+                catch (Exception e) { sb.Append("out: failed: ").Append(e.Message).Append('\n'); }
             }
             return "mcam views: " + n2 + " check(s), " + bad + " with the target hidden or the near plane inside geometry" +
                    (live ? " (no recording loaded: the live scene as it is now)" : "") + "\n" + sb.ToString().TrimEnd();
@@ -507,6 +634,10 @@ namespace InsideDev
         public readonly List<string> targetLines = new List<string>();
         public readonly HashSet<string> referenced = new HashSet<string>();
         public double estSteps, estCaptured, estRenders, estMinutes, estGB, estGameSeconds;
+        // what makes a take with this spec impossible on this machine although the spec itself is right (no ffmpeg, no
+        // encoder); filled by Preflight
+        public readonly List<string> blockers = new List<string>();
+        bool preflightDone;
         Dictionary<string, double> rehearsal;
 
         public static MultiCamPlan Load(string file) { return Load(file, false); }
@@ -525,6 +656,24 @@ namespace InsideDev
             try { p.Prepare(); }
             catch (Exception e) { p.report.Error("", "spec preparation failed: " + e.GetType().Name + ": " + e.Message); }
             return p;
+        }
+
+        // Main thread, from "mcam check" and the start commands only: for output.format pipe, finds ffmpeg and asks it for
+        // the encoder (McaXFfmpeg.Preflight; the first call per ffmpeg starts it and may take some seconds). Blockers are
+        // also listed as warnings so every report shows them.
+        public void Preflight()
+        {
+            if (preflightDone || spec == null) return;
+            preflightDone = true;
+            if (spec.output.format != "pipe") return;
+            try { McaXFfmpeg.Preflight(spec.output, blockers, report); }
+            catch (Exception e) { blockers.Add("output.ffmpeg: preflight failed: " + e.GetType().Name + ": " + e.Message); }
+            foreach (var b in blockers)
+            {
+                if (report.warnings.Contains(b)) continue;
+                int k = b.IndexOf(": ", StringComparison.Ordinal);
+                if (k > 0) report.Warn(b.Substring(0, k), b.Substring(k + 2)); else report.Warn("", b);
+            }
         }
 
         void Prepare()
@@ -758,6 +907,7 @@ namespace InsideDev
                 string w = string.IsNullOrEmpty(c.where) ? "cameras[" + i + "]" : c.where;
                 if (string.IsNullOrEmpty(c.name)) report.Error(w, "camera name required");
                 else if (!ValidName(c.name, "-_")) report.Error(w + ".name", "'" + c.name + "': only letters, digits, '_' and '-' (it is a folder name)");
+                else if (McaXTake.ReservedName(c.name)) report.Error(w + ".name", "'" + c.name + "' is a Windows device name: no folder or file can have it (it is the camera's folder and file name)");
                 else if (!names.Add(c.name)) report.Error(w + ".name", "duplicate camera name '" + c.name + "'");
                 if (c.enabled) enabled++;
                 var r = c.render;
@@ -788,23 +938,30 @@ namespace InsideDev
             if (o.queue < 1) report.Error("output.queue", ">= 1 required");
             if (o.flushEvery < 1) report.Error("output.flushEvery", ">= 1 required");
             if (o.readback != "auto" && o.readback != "native" && o.readback != "readpixels") report.Error("output.readback", "'auto', 'native' or 'readpixels' expected");
+            if (o.stallSeconds < 0f) report.Error("output.stallSeconds", ">= 0 required (0 = wait for a writer without a limit)");
             if (o.format == "pipe")
             {
                 if (enabled > 8) report.Error("output.format", "pipe mode: " + enabled + " enabled cameras need more NVENC sessions than allowed (8)");
-                string pc = o.pipeCodec.ToLowerInvariant();
-                if (pc.IndexOf("hevc") < 0 && pc.IndexOf("265") < 0) report.Error("output.pipeCodec", "H.265 only (hevc_nvenc or libx265)");
-                if (!File.Exists(MultiCamFrameWriter.ResolveExe(o.ffmpeg))) report.Warn("output.ffmpeg", "not found: " + o.ffmpeg + " (give the full path to ffmpeg.exe or put its folder on PATH)");
+                if (McaXFfmpeg.CodecName(o.pipeCodec) == null) report.Error("output.pipeCodec", "'" + o.pipeCodec + "' is not one of " + McaXFfmpeg.CodecList + " (H.265 only; the name goes on the ffmpeg command line as it is)");
             }
+            if (o.format == "pipe" || replayLint || o.Has("ffmpeg"))
+            {
+                // also remembers the program for the writer threads of this run (McaXFfmpeg.Cached)
+                string why;
+                if (McaXFfmpeg.Resolve(o.ffmpeg, out why) == null && (o.format == "pipe" || o.Has("ffmpeg"))) report.Warn("output.ffmpeg", why);
+            }
+            if (!replayLint && o.readback == "native" && o.format != "pipe") report.Warn("output.readback", "native readback is used only with output.format 'pipe': this take reads its frames with ReadPixels");
+            if (!replayLint && o.readback == "auto" && o.format == "pipe") report.Note("output.readback", "mcam start / preview read frames with ReadPixels unless output.readback is 'native' (the InsideReadback plugin; replay passes use it with 'auto' already)");
             if (o.format == "raw") report.Note("output.format", "raw frames are about " + (ScreenPixels() * 4 / 1e6).ToString("0.#", IC) + " MB each");
             var ss = spec.session;
             if (ss.realTime != "game" && ss.realTime != "wall") report.Error("session.realTime", "'game' or 'wall' expected");
             if ((ss.res.x > 0) != (ss.res.y > 0) || ss.res.x < 0 || ss.res.y < 0) report.Error("session.res", "[width, height] or [0, 0] expected");
             if (ss.gcSteps < 0) report.Error("session.gcSteps", ">= 0 required");
+            if (ss.stopAfterErrors < 0) report.Error("session.stopAfterErrors", ">= 0 required (0 = never stop a take for repeated errors)");
             var st = spec.stream;
             if (st.keepLoaded != "auto" && st.keepLoaded != "none" && st.keepLoaded != "list") report.Error("stream.keepLoaded", "'auto', 'none' or 'list' expected");
             if (st.keepLoaded == "list" && st.cullers.Count == 0) report.Warn("stream.cullers", "keepLoaded 'list' without cullers");
-            if (st.freeze) report.Warn("stream.freeze", "CullingActive = false during the take is experimental");
-            LintEvents();
+            if (st.freeze) report.Warn("stream.freeze", "CullingActive = false during the take is experimental");            LintEvents();
             LintRefs();
             LintSetup();
             for (int i = 0; i < spec.cues.Count; i++)
@@ -1145,17 +1302,23 @@ namespace InsideDev
                 }
             }
             sb.Append(report.Summary(80));
+            foreach (var b in blockers) sb.Append("\na take is refused until this is fixed: ").Append(b);
             return sb.ToString();
         }
 
+        // One line. errors / warnings / notes are the report lines as text ("where: message"); issues has the same lines
+        // with severity, where and message apart; blockers and can_start say whether a take would start on this machine.
         public string ReportJson()
         {
             var o = new Json.Obj();
             o["path"] = path;
             o["ok"] = spec != null && report.ok;
+            o["can_start"] = spec != null && report.ok && blockers.Count == 0;
             o["errors"] = Strs(report.errors);
             o["warnings"] = Strs(report.warnings);
             o["notes"] = Strs(report.notes);
+            o["issues"] = Issues();
+            o["blockers"] = Strs(blockers);
             o["replay_lint"] = replayLint;
             if (spec != null)
             {
@@ -1188,7 +1351,33 @@ namespace InsideDev
                 est["renders"] = Math.Round(estRenders); est["minutes"] = Math.Round(estMinutes, 1); est["gigabytes"] = Math.Round(estGB, 2);
                 o["estimate"] = est;
             }
-            return Json.Write(o);
+            return JsonLine.Write(o);
+        }
+
+        List<object> Issues()
+        {
+            var l = new List<object>();
+            if (report.issues.Count == report.errors.Count + report.warnings.Count + report.notes.Count)
+            {
+                foreach (var it in report.issues) l.Add(Issue(it.severity, it.where, it.message));
+                return l;
+            }
+            // lines that were added to the lists directly: split "where: message" again
+            foreach (var kind in new[] { "error", "warning", "note" })
+                foreach (var line in kind == "error" ? report.errors : kind == "warning" ? report.warnings : report.notes)
+                {
+                    int k = line.IndexOf(": ", StringComparison.Ordinal);
+                    bool key = k > 0 && line.IndexOf(' ') > k;
+                    l.Add(Issue(kind, key ? line.Substring(0, k) : "", key ? line.Substring(k + 2) : line));
+                }
+            return l;
+        }
+
+        static Json.Obj Issue(string severity, string where, string message)
+        {
+            var s = new Json.Obj();
+            s["severity"] = severity; s["where"] = where; s["message"] = message;
+            return s;
         }
 
         static double ScreenPixels()
@@ -1220,9 +1409,11 @@ namespace InsideDev
         {
             switch (verb)
             {
-                case ReplayModes.Record: return "mcam record <spec.json> <out dir>";
-                case ReplayModes.Golden: return "mcam golden <spec.json> <out dir> [every]";
-                default: return "mcam " + verb + " <spec.json> <out dir> [cams=a,b] [range=t0:t1]";
+                case ReplayModes.Record: return "mcam record <spec.json> [<out dir>] [overwrite=on]";
+                case ReplayModes.Golden: return "mcam golden <spec.json> [<out dir>] [every]";
+                case ReplayModes.Replay: return "mcam replay <spec.json> [<out dir>] [cams=a,b] [range=t0:t1] [resume] [overwrite=on]";
+                case ReplayModes.Take: return "mcam take <spec.json> [<out dir>] [cams=a,b] [range=t0:t1] [overwrite=on]";
+                default: return "mcam " + verb + " <spec.json> [<out dir>] [cams=a,b] [range=t0:t1]";
             }
         }
 
@@ -1283,6 +1474,9 @@ namespace InsideDev
             if (rec.rescanEvery < 1) report.Error(RR + "rescanEvery", ">= 1 required");
             if (rec.captureEvery < 1) report.Error(RR + "captureEvery", ">= 1 required");
             if (rec.box != null && (rec.box.size.x <= 0f || rec.box.size.y <= 0f || rec.box.size.z <= 0f)) report.Error(RR + "box.size", "every size component must be > 0");
+            if (rec.post) report.Warn(RR + "post", "not built: post-processing values are not recorded");
+            if (rec.maxMB < 0 || rec.maxSeconds < 0f || rec.minFreeMB < 0) report.Error(RR + "maxMB", "maxMB, maxSeconds and minFreeMB must not be negative");
+            OneOf(RR + "onLoad", rec.onLoad, ReplayConst.OnLoads, report);
             if (rec.settleFrames < 0) report.Error(RR + "settleFrames", ">= 0 required");
             else if (rec.settleFrames > 600) report.Warn(RR + "settleFrames", rec.settleFrames + " frames is a long wait before sample 0");
             if (rec.blocks != null)
@@ -1331,6 +1525,8 @@ namespace InsideDev
             else if (play.warmup == 0) report.Warn(RP + "warmup", "0: no TAA reset at pass start, the previous pass's history leaks into the first frames");
             if (play.ramp < 0f) report.Error(RP + "ramp", ">= 0 required");
             if (play.maxUnresolved < 0f || play.maxUnresolved > 1f) report.Error(RP + "maxUnresolved", "fraction in [0, 1] expected");
+            if (play.holds != "link" && play.holds != "copy") report.Warn(RP + "holds", "unknown value '" + play.holds + "' (link, copy): link is used");
+            if (play.planChunkMs < 5f || play.planChunkMs > 1000f) report.Warn(RP + "planChunkMs", "5..1000 expected: " + Fmt(play.planChunkMs) + " is clamped");
             if (play.activateList != null)
                 foreach (var kv in play.activateList)
                 {
@@ -1542,6 +1738,7 @@ namespace InsideDev
                     if (!int.TryParse(v, NumberStyles.Integer, IC, out n) || n < 1) return "every: whole number >= 1 expected (got '" + v + "')";
                     args.every = n;
                 }
+                else if (ReplayArgs.Extra(verb, s, args) is string extra) { if (extra.Length > 0) return extra; }
                 else return "unknown argument '" + s + "' for mcam " + verb;
             }
             return null;
@@ -1578,6 +1775,8 @@ namespace InsideDev
                 if (args.hasRange) sb.Append(", range ").Append(args.rangeFrom.ToString("0.###", IC)).Append(':').Append(args.rangeTo.ToString("0.###", IC));
             }
             if (verb == ReplayModes.Golden) sb.Append(", grab every ").Append(args.every > 0 ? args.every.ToString(IC) : "captureEvery");
+            if (args.resume) sb.Append(", resume (finished passes are kept)");
+            if (args.overwrite) sb.Append(", overwrite");
             if (verb == ReplayModes.Replay || verb == ReplayModes.Take) sb.Append(", estimate ~").Append(plan.estMinutes.ToString("0.#", IC)).Append(" min");
             return sb.ToString();
         }
@@ -1607,8 +1806,10 @@ namespace InsideDev
         {
             if (a == null || a.Count == 0) return true;
             string c = (a[0] ?? "").ToLowerInvariant();
-            if (c == "state" || c == "game_state" || c == "ping" || c == "audio") return true;
+            if (c == "state" || c == "game_state" || c == "ping" || c == "audio" || c == "doctor") return true;
             string s = a.Count > 1 ? (a[1] ?? "").ToLowerInvariant() : "status";
+            if (c == "background") return s == "status" || s == "json";
+            if (c == "cfg") return s != "set" && s != "reset";
             if (c == "srec") return s == "status" || s == "objects" || s == "event";
             if (c == "acap") return a.Count > 1 && s == "status";
             if (c != "mcam") return false;
@@ -1746,6 +1947,25 @@ namespace InsideDev
         double msStep, msVisit, msRead, nStep, nVisit, nRead;
         bool stopRequested, finished, targetsBegun, aborted, focusWas = true;
         string state = "starting", failure;
+        // overwrite=on was given: the out dir may hold a take
+        internal bool overwrite;
+        // the watcher of a "waitfor event" setup line, kept here so that every end of the run disarms it
+        MultiCamEvents setupEvents;
+        readonly List<string> cmdLines = new List<string>();
+        readonly Dictionary<string, int> errorStreak = new Dictionary<string, int>(), errorStep = new Dictionary<string, int>();
+        // constants of the take, built once at the freeze: per camera its own plain hide names, whether anything can hide,
+        // and for every camera pair whether one may reuse the other's frame (same render and post settings, no hides)
+        static readonly HideSet NoHide = new HideSet();
+        static readonly Predicate<string> NotForLiveVisits = n => n.StartsWith(MultiCamShots.BackfaceMark, StringComparison.Ordinal) || n.IndexOf(HideBoxes.Marker, StringComparison.Ordinal) >= 0;
+        static readonly object NativeFrame = new object();
+        List<string>[] plainHide = new List<string>[0];
+        bool[] anyHide = new bool[0], sameLook = new bool[0];
+        HideSet[] hideSet = new HideSet[0];
+        int[] hideStream = new int[0], hideShot = new int[0], hidePrev = new int[0], copyFrom = new int[0];
+        double[] shotTimes = new double[0];
+        Func<TimeRef, double> timeOfNow;
+        // output.readback native on a live pipe take: frames go from the plugin to the writers, not through ReadPixels
+        bool liveNative;
 
         internal void Init(MultiCamPlan p, string m, string dir, double at, DevCore c)
         {
@@ -1754,6 +1974,8 @@ namespace InsideDev
             seg = plan.segs[0];
             started = DateTime.Now.ToString("s", IC);
             runRealStart = Time.realtimeSinceStartup;
+            MultiCamFrameWriter.StallMs = (int)Math.Min(86400000.0, Math.Max(0.0, spec.output.stallSeconds * 1000.0));
+            timeOfNow = r => ctx.TimeOf(r, 0.0);
             StartCoroutine(Run());
         }
 
@@ -1820,11 +2042,19 @@ namespace InsideDev
             if (!previewNow && spec.preroll > 0) yield return Preroll();
             yield return Freeze();
             yield return KeepLoaded();
-            OpenWriters();
+            yield return OpenWriters();
             WriteRun(false);
             state = mode == "capture" ? "capturing" : mode;
             if (previewNow) yield return PreviewNow();
             else yield return Loop();
+            if (liveNative && agrab != null)
+            {
+                // the last frames are still on their way from the GPU
+                var drain = agrab.Drain(30f);
+                while (drain.MoveNext()) { yield return drain.Current; TickFrozen(); }
+                if (agrab.error != null) throw new Exception("readback: " + agrab.error);
+                Log(agrab.StatsLine());
+            }
         }
 
         // ---------------------------------------------------------------- setup, seed, resolution, preroll
@@ -1867,6 +2097,7 @@ namespace InsideDev
             if (kind == "event")
             {
                 tmp = new MultiCamEvents(spec, plan);
+                setupEvents = tmp;
                 tmp.logMonitor = false;
                 tmp.row = (k, n, s, d) => { if (k == "event") EventRow("setup", n, "waitfor event", d); };
                 tctx = new MultiCamContext();
@@ -1893,7 +2124,7 @@ namespace InsideDev
                 TickFree();
                 if (tmp != null) { tctx.t = Time.realtimeSinceStartup - start; tmp.PollFrame(tctx); tmp.PollStep(tctx); }
             }
-            if (tmp != null) tmp.Disarm();
+            if (tmp != null) { tmp.Disarm(); setupEvents = null; }
             string took = (Time.realtimeSinceStartup - start).ToString("0.0", IC) + " s";
             EventRow("setup", kind, line, "ok after " + took);
             Log("setup: " + line + " ok after " + took);
@@ -1963,6 +2194,7 @@ namespace InsideDev
             rigs = new ICamRig[n]; poses = new CamPose[n]; evaluated = new bool[n]; visited = new bool[n];
             frameThisStep = new object[n]; lastCopy = new string[n]; hides = new List<Renderer>[n];
             cueDone = new bool[spec.cues.Count];
+            TakeConstants();
             for (int i = 0; i < n; i++) rigs[i] = MultiCamRig.Create(spec.cameras[i]);
             ctx.step = -1; ctx.t = 0; ctx.dt = 0; ctx.frame = -1; ctx.sub = -1; ctx.captured = false; ctx.outputTime = 0; ctx.outputDt = 0;
             MultiCamRig.SampleGame(cam, ctx);
@@ -2027,13 +2259,42 @@ namespace InsideDev
             }
         }
 
+        // What does not change during the take, so that the step loop does not work it out again on every visit.
+        void TakeConstants()
+        {
+            int n = spec.cameras.Count, shots = 0;
+            plainHide = new List<string>[n]; anyHide = new bool[n]; sameLook = new bool[n * n];
+            hideSet = new HideSet[n]; hideStream = new int[n]; hideShot = new int[n]; hidePrev = new int[n]; copyFrom = new int[n];
+            for (int i = 0; i < n; i++)
+            {
+                var c = spec.cameras[i];
+                anyHide[i] = MultiCamShots.AnyHide(spec, i);
+                if (c.shots != null && c.shots.Count > shots) shots = c.shots.Count;
+                copyFrom[i] = -1;
+                if (c.hide == null || c.hide.Count == 0) continue;
+                var names = new List<string>(c.hide);
+                names.RemoveAll(NotForLiveVisits);
+                if (names.Count > 0) plainHide[i] = names;
+            }
+            shotTimes = new double[shots];
+            for (int i = 0; i < n; i++)
+                for (int s = 0; s < n; s++)
+                {
+                    if (i == s || anyHide[i] || anyHide[s]) continue;
+                    var a = spec.cameras[i];
+                    var b = spec.cameras[s];
+                    sameLook[i * n + s] = Same(a.render, b.render) && Same(a.post, b.post);
+                }
+        }
+
+        // The freeze-time report of every camera's own `hide`; the renderers themselves are resolved per visit (HiddenNow),
+        // so objects that streaming unloads and loads again during the take stay hidden.
         void ResolveHides(SpecReport rep)
         {
             for (int i = 0; i < spec.cameras.Count; i++)
             {
                 var c = spec.cameras[i];
                 if (c.hide == null || c.hide.Count == 0) continue;
-                var list = new List<Renderer>();
                 foreach (var q in c.hide)
                 {
                     string path, boxError;
@@ -2042,11 +2303,39 @@ namespace InsideDev
                     if (!box && boxError.Length > 0) { rep.Warn(c.where + ".hide", boxError + ": " + q); continue; }
                     var go = MultiCamTargets.ResolveObject(path, c.where + ".hide", rep);
                     if (go == null) { rep.Warn(c.where + ".hide", "not resolved: " + q); continue; }
-                    if (box) { rep.Note(c.where + ".hide", "box " + MultiCamHide.BoxText(min, max) + " of " + Inspector.PathOf(go.transform) + " is cut in replay passes and mcam show only; live visits draw it whole"); continue; }
-                    foreach (var r in go.GetComponentsInChildren<Renderer>(true)) if (r != null) list.Add(r);
+                    if (box) rep.Note(c.where + ".hide", "box " + MultiCamHide.BoxText(min, max) + " of " + Inspector.PathOf(go.transform) + " is cut in replay passes and mcam show only; live visits draw it whole");
                 }
-                hides[i] = list;
             }
+        }
+
+        // The renderers camera i hides right now (null = none): its own plain `hide`, for a director the set of the shot on
+        // air (and of the previous shot inside a blend). Resolved again only when streaming changed or another shot came on.
+        List<Renderer> HiddenNow(int i)
+        {
+            if (i < 0 || i >= hideSet.Length || i >= spec.cameras.Count) return null;
+            var cs = spec.cameras[i];
+            bool director = cs.mode == "director" && anyHide[i];
+            if (!director && plainHide[i] == null) return null;
+            int shot = -1, prev = -1;
+            if (director)
+            {
+                shot = MultiCamShots.At(cs, ctx.t, timeOfNow, shotTimes, out prev);
+                if (i >= poses.Length || (poses[i].flags & PoseFlags.Blending) == 0) prev = -1;
+            }
+            int version = Levels.StreamVersion;
+            if (hideSet[i] == null || hideStream[i] != version || hideShot[i] != shot || hidePrev[i] != prev)
+            {
+                var names = plainHide[i];
+                if (director)
+                {
+                    names = MultiCamShots.HideNames(spec, i, ctx.t, timeOfNow, i < poses.Length ? poses[i].flags : 0);
+                    names.RemoveAll(NotForLiveVisits);
+                }
+                hideSet[i] = names != null && names.Count > 0 ? MultiCamHide.Resolve(names, cs.where + ".hide", null) : NoHide;
+                hideStream[i] = version; hideShot[i] = shot; hidePrev[i] = prev;
+            }
+            var l = hideSet[i].renderers;
+            return l.Count > 0 ? l : null;
         }
 
         // ---------------------------------------------------------------- keep-loaded subscenes
@@ -2130,13 +2419,14 @@ namespace InsideDev
             if (!st.addDuringTake || st.keepLoaded == "none") return;
             var mgr = SubsceneCullingManager.instance;
             var all = mgr.GetAllSubsceneCullers();
+            var always = MultiCamSession.AlwaysNow();
             for (int i = 0; i < poses.Length; i++)
             {
                 if (!spec.cameras[i].enabled) continue;
                 Plane[] planes = null;
                 foreach (var c in all)
                 {
-                    if (c == null || c.IsLoaded || MultiCamSession.IsKept(c)) continue;
+                    if (c == null || c.IsLoaded || MultiCamSession.IsKept(c, always)) continue;
                     var b = c.CullingBounds;
                     if (b.size == Vector3.zero) continue;
                     if (planes == null) planes = Frustum(poses[i], ctx.aspect, poses[i].near > 0 ? poses[i].near : gameNear);
@@ -2268,7 +2558,12 @@ namespace InsideDev
                 due.Add(i);
             }
             if (due == null) return;
-            due.Sort((x, y) => ctx.TimeOf(spec.cues[x].at, 0.0).CompareTo(ctx.TimeOf(spec.cues[y].at, 0.0)));
+            // List.Sort is not stable: cues of the same time keep their spec order through the index
+            due.Sort((x, y) =>
+            {
+                int c = ctx.TimeOf(spec.cues[x].at, 0.0).CompareTo(ctx.TimeOf(spec.cues[y].at, 0.0));
+                return c != 0 ? c : x.CompareTo(y);
+            });
             foreach (int i in due)
             {
                 cueDone[i] = true;
@@ -2335,48 +2630,52 @@ namespace InsideDev
         {
             float fov = pose.fov > 0 ? pose.fov : (ctx.game.rendered.fov > 0 ? ctx.game.rendered.fov : MultiCamSession.camFov);
             float near = pose.near > 0 ? pose.near : gameNear;
-            CameraControl.Set(pose.p, pose.r, fov, near);
+            if (!CameraControl.Set(pose.p, pose.r, fov, near)) RateError("camera pose", new Exception("no gameplay camera, or the pose is not finite"));
         }
 
         // ---------------------------------------------------------------- visits
 
         IEnumerator VisitAll()
         {
+            int n = spec.cameras.Count;
+            bool copies = false;
             for (int i = 0; i < frameThisStep.Length; i++) { frameThisStep[i] = null; visited[i] = false; }
-            List<int> copies = null;
-            for (int i = 0; i < spec.cameras.Count; i++)
+            for (int i = 0; i < n; i++)
             {
-                if (!spec.cameras[i].enabled) continue;
-                if (CopySource(i) >= 0) { if (copies == null) copies = new List<int>(); copies.Add(i); continue; }
+                copyFrom[i] = spec.cameras[i].enabled ? CopySource(i) : -1;
+                if (copyFrom[i] >= 0) copies = true;
+            }
+            for (int i = 0; i < n; i++)
+            {
+                if (!spec.cameras[i].enabled || copyFrom[i] >= 0) continue;
                 yield return Visit(i, poses[i]);
             }
-            if (copies == null) yield break;
-            foreach (int i in copies)
+            if (!copies) yield break;
+            for (int i = 0; i < n; i++)
             {
-                int s = CopySource(i);
-                if (s >= 0 && visited[s] && frameThisStep[s] != null)
+                int s = copyFrom[i];
+                if (s < 0) continue;
+                if (visited[s] && frameThisStep[s] != null)
                 {
                     frameThisStep[i] = frameThisStep[s];
                     visited[i] = true;
-                    Enqueue(i, frameThisStep[s]);
+                    // a native frame went to this camera's writer when its source was visited (Visit)
+                    if (!ReferenceEquals(frameThisStep[s], NativeFrame)) Enqueue(i, frameThisStep[s]);
                 }
-                else yield return Visit(i, poses[i]);
+                else { copyFrom[i] = -1; yield return Visit(i, poses[i]); }
             }
         }
 
+        // The camera whose frame camera i shows unchanged at this step (a director on a shot with the same render and post
+        // settings and no hides), -1 when camera i needs its own visit.
         int CopySource(int i)
         {
             var p = poses[i];
             if (string.IsNullOrEmpty(p.copyOf)) return -1;
-            int s;
+            int s, n = spec.cameras.Count;
             if (!plan.camIndex.TryGetValue(p.copyOf, out s) || s == i) return -1;
-            var a = spec.cameras[i];
-            var b = spec.cameras[s];
-            if (!b.enabled || !string.IsNullOrEmpty(poses[s].copyOf)) return -1;
-            if (!Same(a.render, b.render) || !Same(a.post, b.post)) return -1;
-            if ((hides[i] != null && hides[i].Count > 0) || (hides[s] != null && hides[s].Count > 0)) return -1;
-            if (MultiCamShots.AnyHide(spec, i) || MultiCamShots.AnyHide(spec, s)) return -1;
-            return s;
+            if (!spec.cameras[s].enabled || !string.IsNullOrEmpty(poses[s].copyOf)) return -1;
+            return sameLook.Length == n * n && sameLook[i * n + s] ? s : -1;
         }
 
         static bool Same(SpecNode a, SpecNode b)
@@ -2393,6 +2692,7 @@ namespace InsideDev
             var rs = cs.render ?? spec.render;
             currentCam = i;
             float v0 = Time.realtimeSinceStartup;
+            if (cam == null) throw new Exception("the capture camera is gone (a level load destroyed it): the take cannot go on");
             ApplyPose(pose);
             SetHidden(i, true);
             MultiCamLook.post = cs.post;
@@ -2408,11 +2708,24 @@ namespace InsideDev
             }
             yield return new WaitForEndOfFrame();
             float r0 = Time.realtimeSinceStartup;
-            object data = grab != null ? grab.Grab() : null;
+            int fw = liveNative && agrab != null ? agrab.w : grab != null ? grab.w : 0, fh = liveNative && agrab != null ? agrab.h : grab != null ? grab.h : 0;
+            if (fw > 0 && Screen.width > 0 && Screen.height > 0 && (Screen.width != fw || Screen.height != fh))
+                throw new Exception("the game window is now " + Screen.width + "x" + Screen.height + " but the frames of this take are " + fw + "x" + fh + ": the size must not change during a take");
+            object data = null;
+            if (liveNative && agrab != null)
+            {
+                // the back buffer holds this camera's frame only until the next visit: cameras that copy it get theirs now
+                var w0 = writers != null && i < writers.Length ? writers[i] : null;
+                if (w0 != null) agrab.Grab(w0, null);
+                for (int k = 0; k < copyFrom.Length; k++)
+                    if (copyFrom[k] == i && writers != null && k < writers.Length && writers[k] != null) agrab.Grab(writers[k], null);
+                data = NativeFrame;
+            }
+            else if (grab != null) data = grab.Grab();
             msRead += (Time.realtimeSinceStartup - r0) * 1000.0; nRead++;
             frameThisStep[i] = data;
             visited[i] = true;
-            if (data != null) Enqueue(i, data);
+            if (data != null && !ReferenceEquals(data, NativeFrame)) Enqueue(i, data);
             SetHidden(i, false);
             MultiCamSession.TaaEnd();
             MultiCamLook.post = null;
@@ -2422,16 +2735,10 @@ namespace InsideDev
 
         void SetHidden(int i, bool hide)
         {
-            var l = hides.Length > i ? hides[i] : null;
-            if (hide && i < spec.cameras.Count && spec.cameras[i].mode == "director" && MultiCamShots.AnyHide(spec, i))
-            {
-                var names = MultiCamShots.HideNames(spec, i, ctx.t, r => ctx.TimeOf(r, 0.0), poses.Length > i ? poses[i].flags : 0);
-                names.RemoveAll(n => n.StartsWith(MultiCamShots.BackfaceMark, StringComparison.Ordinal));
-                l = names.Count > 0 ? MultiCamHide.Resolve(names, spec.cameras[i].where + ".hide", null).renderers : null;
-            }
-            if (l == null) { if (!hide) MultiCamSession.ShowHidden(); return; }
-            if (hide) { foreach (var r in l) if (r != null && r.enabled) { r.enabled = false; MultiCamSession.hidden.Add(r); } }
-            else MultiCamSession.ShowHidden();
+            if (!hide) { MultiCamSession.ShowHidden(); return; }
+            var l = HiddenNow(i);
+            if (l == null) return;
+            foreach (var r in l) if (r != null && r.enabled) { r.enabled = false; MultiCamSession.hidden.Add(r); }
         }
 
         void Enqueue(int i, object data)
@@ -2476,15 +2783,14 @@ namespace InsideDev
 
         string RunCmd(string line)
         {
-            var ls = DevLog.Lines;
-            string lastLine = ls.Count > 0 ? ls[ls.Count - 1] : null;
+            int logged = DevLog.Total;
             string res;
             try { res = Remote.RunInternal(line, core); }
             catch (Exception e) { res = "ERROR " + e.GetType().Name + ": " + e.Message; }
             var extra = new StringBuilder();
-            int start = 0;
-            if (lastLine != null) { start = ls.Count; for (int i = ls.Count - 1; i >= 0; i--) if (ReferenceEquals(ls[i], lastLine)) { start = i + 1; break; } }
-            for (int i = start; i < ls.Count; i++) { if (extra.Length > 0) extra.Append(" | "); extra.Append(ls[i]); }
+            cmdLines.Clear();
+            DevLog.Since(logged, cmdLines);
+            foreach (var l in cmdLines) { if (extra.Length > 0) extra.Append(" | "); extra.Append(l); }
             string r = (res ?? "").Trim();
             if (extra.Length > 0) r = r.Length > 0 ? r + " | " + extra : extra.ToString();
             r = r.Replace('\n', ' ').Replace('\r', ' ');
@@ -2503,8 +2809,11 @@ namespace InsideDev
         void OpenOutput()
         {
             Directory.CreateDirectory(outDir);
-            if (File.Exists(Path.Combine(outDir, "run.json"))) DevLog.Write("[mcam] note: " + outDir + " already holds a take; files are overwritten");
-            File.WriteAllText(Path.Combine(outDir, "spec.json"), spec.text);
+            // the start command let this through: an older preview or rehearsal, or a take with overwrite=on
+            string before = McaXTake.RunMode(outDir);
+            bool held = before != null;
+            if (held) DevLog.Write("[mcam] note: " + outDir + " held a run (mode " + before + "); it is replaced" + (overwrite ? " (overwrite=on)" : ""));
+            SafeFile.WriteAllText(Path.Combine(outDir, "spec.json"), spec.text);
             logW = new StreamWriter(Path.Combine(outDir, "log.txt"), false, new UTF8Encoding(false));
             logW.AutoFlush = true;
             meta = new MultiCamCsv(Path.Combine(outDir, "meta.csv"), "step,game_time,rate,group,frame,sub,captured,speed,real_time,fixed_steps,segment");
@@ -2513,19 +2822,34 @@ namespace InsideDev
             if (spec.output.tracks) tracksCsv = new MultiCamCsv(Path.Combine(outDir, "tracks.csv"), "step,game_time,target,ok,x,y,z,vx,vy,vz,count,bmin_x,bmin_y,bmin_z,bmax_x,bmax_y,bmax_z");
             if (spec.output.rig) rigCsv = new MultiCamCsv(Path.Combine(outDir, "rig.csv"), "step,game_time,box,cam_x,cam_y,cam_z,aim_x,aim_y,aim_z,up_x,up_y,up_z,x,y,z,qx,qy,qz,qw,fov,clean_x,clean_y,clean_z,clean_qx,clean_qy,clean_qz,clean_qw,vel_x,vel_y,vel_z,probe_x,probe_y,probe_z,extrap,hand_x,hand_y,hand_z,shake_x,shake_y,shake_z,cut");
             camDirs = new string[spec.cameras.Count];
+            int removed = 0;
             for (int i = 0; i < spec.cameras.Count; i++)
             {
                 camDirs[i] = Path.Combine(outDir, spec.cameras[i].name);
-                if (!rehearse && spec.cameras[i].enabled && spec.output.format != "pipe") Directory.CreateDirectory(camDirs[i]);
+                if (rehearse || !spec.cameras[i].enabled || spec.output.format == "pipe") continue;
+                Directory.CreateDirectory(camDirs[i]);
+                if (held) removed += McaXTake.ClearFrames(camDirs[i]);
             }
+            if (removed > 0) Log(removed + " frame file(s) of the run that was here deleted (mode " + before + ")");
         }
 
-        void OpenWriters()
+        IEnumerator OpenWriters()
         {
-            if (rehearse) return;
+            if (rehearse) yield break;
             var o = spec.output;
             int w = Screen.width, h = Screen.height;
-            grab = new MultiCamGrab(w, h, o.format == "jpg", Mathf.Clamp(o.jpeg, 1, 100));
+            liveNative = false;
+            if (o.format == "pipe" && o.readback == "native")
+            {
+                var g = new MultiCamAsyncGrab();
+                var open = g.Open(w, h);
+                while (open.MoveNext()) { yield return open.Current; TickFrozen(); }
+                if (!g.ready) throw new Exception("output.readback native: " + g.error);
+                agrab = g;
+                liveNative = true;
+                Log("readback: native async (InsideReadback " + g.w + "x" + g.h + " " + g.pixFmt + ")");
+            }
+            if (!liveNative) grab = new MultiCamGrab(w, h, o.format == "jpg", Mathf.Clamp(o.jpeg, 1, 100));
             writers = new MultiCamFrameWriter[spec.cameras.Count];
             for (int i = 0; i < spec.cameras.Count; i++)
             {
@@ -2534,8 +2858,12 @@ namespace InsideDev
                 if (o.format == "pipe")
                 {
                     string file = Path.Combine(outDir, c.name + ".mkv");
-                    writers[i] = MultiCamFrameWriter.Pipe(c.name, Math.Max(1, o.queue), o.ffmpeg, PipeArgs(w, h, o, file));
-                    Log("pipe " + c.name + ": " + o.ffmpeg + " " + PipeArgs(w, h, o, file));
+                    string args = liveNative ? PipeArgs(w, h, o, file, agrab.pixFmt, false) : PipeArgs(w, h, o, file);
+                    string why;
+                    string exe = McaXFfmpeg.Resolve(o.ffmpeg, out why);
+                    if (exe == null) throw new Exception("output.ffmpeg: " + why);
+                    writers[i] = MultiCamFrameWriter.Pipe(c.name, Math.Max(1, o.queue), o.ffmpeg, args);
+                    Log("pipe " + c.name + ": " + exe + " " + args);
                 }
                 else writers[i] = new MultiCamFrameWriter(c.name, Math.Max(1, o.queue));
             }
@@ -2543,13 +2871,14 @@ namespace InsideDev
 
         string PipeArgs(int w, int h, OutputSpec o, string file) { return PipeArgs(w, h, o, file, "rgba", true); }
 
+        // The ffmpeg command line of one camera pipe. The encoder name comes from the fixed list (McaXFfmpeg.Codec), numbers
+        // are written with a decimal point whatever the Windows language is, the file name is quoted for CreateProcess.
         string PipeArgs(int w, int h, OutputSpec o, string file, string pixFmt, bool flip)
         {
-            bool nv = o.pipeCodec.ToLowerInvariant().IndexOf("nvenc") >= 0;
-            string q = nv ? "-preset p5 -rc constqp -qp " + o.pipeQp : "-preset fast -crf " + o.pipeQp;
-            return "-hide_banner -loglevel error -y -f rawvideo -pix_fmt " + pixFmt + " -s " + w + "x" + h + " -framerate " + spec.timing.fps.ToString("0.###", IC) +
-                   " -i - -an -vf \"" + (flip ? "vflip," : "") + "scale=out_color_matrix=bt709:out_range=tv,format=" + (nv ? "p010le" : "yuv420p10le") + "\" -c:v " + o.pipeCodec + " " + q +
-                   " -color_primaries bt709 -color_trc bt709 -colorspace bt709 \"" + file + "\"";
+            string codec = McaXFfmpeg.Codec(o);
+            return "-hide_banner -loglevel error -y -f rawvideo -pix_fmt " + pixFmt + " -s " + Fmt.I(w) + "x" + Fmt.I(h) + " -framerate " + Fmt.F(spec.timing.fps, "0.###") +
+                   " -i - -an -vf " + Ffmpeg.Quote((flip ? "vflip," : "") + "scale=out_color_matrix=bt709:out_range=tv,format=" + McaXFfmpeg.PixelFormat(codec)) + " -c:v " + codec + " " + McaXFfmpeg.QualityArgs(codec, o.pipeQp) +
+                   " -color_primaries bt709 -color_trc bt709 -colorspace bt709 " + Ffmpeg.Quote(file);
         }
 
         void Rows(bool cap)
@@ -2597,6 +2926,7 @@ namespace InsideDev
             if (writers != null)
                 foreach (var w in writers)
                     if (w != null && w.error != null) throw new Exception("frame writer " + w.name + ": " + w.error);
+            if (liveNative && agrab != null && agrab.error != null) throw new Exception("readback: " + agrab.error);
             Progress(false);
         }
 
@@ -2643,6 +2973,19 @@ namespace InsideDev
             errorCounts.TryGetValue(key, out n);
             errorCounts[key] = ++n;
             if (n <= 3 || n % 200 == 0) Error(key + " (" + n + "x): " + e.GetType().Name + ": " + e.Message);
+            // A live take in which the same thing fails step after step (the game camera, the targets or a rig died with a
+            // reload) only renders fallback frames from here on: it stops with the reason. Replay passes count on their own.
+            int limit = spec != null ? spec.session.stopAfterErrors : 0;
+            if (limit <= 0 || step < 0 || ReplayModes.Is(mode)) return;
+            int at, streak;
+            if (!errorStep.TryGetValue(key, out at)) at = int.MinValue;
+            if (at == step) return;
+            errorStreak.TryGetValue(key, out streak);
+            streak = at == step - 1 ? streak + 1 : 1;
+            errorStep[key] = step;
+            errorStreak[key] = streak;
+            if (streak >= limit)
+                throw new Exception("'" + key + "' failed in " + streak + " steps in a row (" + e.GetType().Name + ": " + e.Message + "): the take is broken and stops here (session.stopAfterErrors " + limit + ")");
         }
 
         void Progress(bool force)
@@ -2651,7 +2994,8 @@ namespace InsideDev
             if (!force && now < nextProgress) return;
             nextProgress = now + 0.5f;
             MultiCam.status = StatusLine();
-            try { File.WriteAllText(Path.Combine(outDir, "progress.json"), ProgressJson()); } catch { }
+            // through a temp file and a rename: a poller never reads half a file
+            try { SafeFile.WriteAllText(Path.Combine(outDir, "progress.json"), ProgressJson()); } catch { }
         }
 
         double EtaSeconds()
@@ -2694,13 +3038,16 @@ namespace InsideDev
                 double eta = EtaSeconds();
                 if (!double.IsNaN(eta)) sb.Append(", eta ").Append((eta / 60.0).ToString("0.0", IC)).Append(" min");
             }
+            if (targetsBegun) { string ts = MultiCamTargets.StatusText(); if (ts.Length > 0) sb.Append(", targets ").Append(ts); }
             if (warnings.Count > 0) sb.Append(", ").Append(warnings.Count).Append(" warn");
             if (errors.Count > 0) sb.Append(", ").Append(errors.Count).Append(" err");
             sb.Append(" -> ").Append(outDir);
             return sb.ToString();
         }
 
-        internal string ProgressJson()
+        internal string ProgressJson() { return Json.Write(ProgressObj()); }
+
+        internal Json.Obj ProgressObj()
         {
             var o = new Json.Obj();
             o["state"] = state; o["mode"] = mode; o["name"] = spec.name; o["out"] = outDir;
@@ -2725,6 +3072,7 @@ namespace InsideDev
             o["gc"] = (double)GC.CollectionCount(0);
             o["warnings"] = (double)warnings.Count; o["errors"] = (double)errors.Count;
             o["last_error"] = errors.Count > 0 ? errors[errors.Count - 1] : "";
+            if (targetsBegun) o["targets"] = MultiCamTargets.StatusJson();
             if (ReplayModes.Is(mode))
             {
                 o["status"] = StatusLine();
@@ -2733,7 +3081,7 @@ namespace InsideDev
                 if (!string.IsNullOrEmpty(replay.camera)) o["camera"] = replay.camera;
                 o["replay"] = MultiCamProgressText.ToJson(replay);
             }
-            return Json.Write(o);
+            return o;
         }
 
         void WriteRun(bool final)
@@ -2813,6 +3161,7 @@ namespace InsideDev
                     rw["w"] = (double)grab.w; rw["h"] = (double)grab.h; rw["format"] = "rgba"; rw["rowOrder"] = "bottomUp";
                     o["raw"] = rw;
                 }
+                if (!ReplayModes.Is(mode) && !rehearse) o["frame_readback"] = liveNative ? "native" : "readpixels";
                 o["steps"] = (double)(step + 1);
                 o["frames"] = (double)frame;
                 o["captured_steps"] = (double)capturedSteps;
@@ -2826,7 +3175,7 @@ namespace InsideDev
                     try { ReplayRunJson(o, final); }
                     catch (Exception e) { DevLog.Error("mcam run.json replay", e); o["replay_error"] = e.GetType().Name + ": " + e.Message; }
                 }
-                File.WriteAllText(Path.Combine(outDir, "run.json"), Json.Write(o));
+                SafeFile.WriteAllText(Path.Combine(outDir, "run.json"), Json.Write(o));
             }
             catch (Exception e) { DevLog.Error("mcam run.json", e); }
         }
@@ -2849,6 +3198,8 @@ namespace InsideDev
                 MultiCamSafety.EndLeftovers(why, Log);
             }
             try { if (events != null) events.Disarm(); } catch (Exception e) { DevLog.Error("mcam finish events", e); }
+            try { if (setupEvents != null) setupEvents.Disarm(); } catch (Exception e) { DevLog.Error("mcam finish setup events", e); }
+            setupEvents = null;
             foreach (var r in rigs) { try { if (r != null) r.End(); } catch (Exception e) { DevLog.Error("mcam finish rig", e); } }
             try { if (targetsBegun) MultiCamTargets.End(); } catch (Exception e) { DevLog.Error("mcam finish targets", e); }
             try { MultiCamSession.Pop(); } catch (Exception e) { DevLog.Error("mcam finish session", e); }
@@ -2858,14 +3209,24 @@ namespace InsideDev
                 try { Log("the game stays frozen at the final sample (REPLAY_DESIGN 2.4.8, 3.4): Time.timeScale 0 is held until 'ts 1'"); } catch { }
             }
             try { if (agrab != null) { agrab.Close(); if (agrab.error != null) errors.Add("readback: " + agrab.error); agrab = null; } } catch (Exception e) { DevLog.Error("mcam finish readback", e); }
+            // an Open that was still probing when the run ended is known to nobody else
+            try { MultiCamAsyncGrab.CloseOrphan(MultiCamAsyncGrab.OwnerMcam); } catch (Exception e) { DevLog.Error("mcam finish readback orphan", e); }
             int written = 0;
             if (writers != null)
+            {
+                // all pipes end together: the wait is for the slowest ffmpeg, not for each in turn; a writer that failed
+                // or stalled is not waited for
+                try { MultiCamFrameWriter.CloseAll(writers, kill || aborted, 30000, 60000); }
+                catch (Exception e) { DevLog.Error("mcam finish writers", e); }
                 foreach (var w in writers)
                 {
                     if (w == null) continue;
-                    try { w.Close(kill || aborted, 30000); written += w.written; if (w.error != null) errors.Add("writer " + w.name + ": " + w.error); if (w.stderr.Length > 0) Log("ffmpeg " + w.name + ": " + w.stderr); }
+                    try { written += w.written; if (w.error != null) errors.Add("writer " + w.name + ": " + w.error); if (w.stderr.Length > 0) Log("ffmpeg " + w.name + ": " + w.stderr); }
                     catch (Exception e) { DevLog.Error("mcam finish writer", e); }
                 }
+            }
+            MultiCamFrameWriter.StallMs = MultiCamFrameWriter.DefaultStallMs;
+            try { MultiCamAsyncGrab.FreeBuffers(); } catch { }
             try { if (grab != null) grab.Dispose(); } catch { }
             if (spec != null && cueDone != null)
                 for (int i = 0; i < spec.cues.Count && i < cueDone.Length; i++)
@@ -2876,6 +3237,7 @@ namespace InsideDev
             else MultiCam.status = how + ": " + (step + 1) + " steps, " + frame + " frames, " + capturedSteps + " captured steps, " + written + " frames written, game " + ctx.t.ToString("0.###", IC) + " s, " +
                                    (Time.realtimeSinceStartup - runRealStart).ToString("0", IC) + " s real" + tail;
             try { Log(MultiCam.status); } catch { }
+            try { MultiCam.lastRun = Result(how, written); } catch (Exception e) { DevLog.Error("mcam finish result", e); }
             try { FlushCsv(); } catch { }
             foreach (var c in new[] { meta, posesCsv, eventsCsv, tracksCsv, rigCsv, viewsCsv }) { try { if (c != null) c.Close(); } catch { } }
             WriteRun(true);
@@ -2884,6 +3246,49 @@ namespace InsideDev
             logW = null;
             if (MultiCam.runner == this) MultiCam.runner = null;
             try { if (this != null && gameObject != null) Destroy(gameObject); } catch { }
+        }
+
+        // How this run ended, for "mcam status json" after it (key "last").
+        Json.Obj Result(string how, int written)
+        {
+            var o = new Json.Obj();
+            bool replayMode = ReplayModes.Is(mode);
+            o["mode"] = mode; o["name"] = spec != null ? spec.name : ""; o["spec"] = plan != null ? plan.path : ""; o["out"] = outDir;
+            o["result"] = how;
+            o["ok"] = (how == "done" || how == "stopped") && errors.Count == 0;
+            o["end_reason"] = endReason;
+            o["started"] = started; o["finished"] = DateTime.Now.ToString("s", IC);
+            o["steps"] = step + 1; o["frames"] = frame; o["captured_steps"] = capturedSteps; o["frames_written"] = written;
+            o["game_time"] = Math.Round(replayMode ? replay.t : ctx.t, 6);
+            o["real_seconds"] = Math.Round((double)(Time.realtimeSinceStartup - runRealStart), 1);
+            o["warning_count"] = warnings.Count; o["error_count"] = errors.Count;
+            o["warnings"] = Tail(warnings, 40); o["errors"] = Tail(errors, 40);
+            if (replayMode) o["summary"] = replay.summary ?? "";
+            var cl = new List<object>();
+            if (writers != null && spec != null)
+                for (int i = 0; i < writers.Length && i < spec.cameras.Count; i++)
+                {
+                    var w = writers[i];
+                    if (w == null) continue;
+                    var c = new Json.Obj();
+                    c["name"] = spec.cameras[i].name;
+                    c["output"] = spec.output.format == "pipe" ? spec.cameras[i].name + ".mkv" : spec.cameras[i].name;
+                    c["frames"] = w.written;
+                    c["error"] = w.error ?? "";
+                    string se = w.stderr;
+                    c["ffmpeg"] = se.Length > 600 ? se.Substring(se.Length - 600) : se;
+                    cl.Add(c);
+                }
+            o["cameras"] = cl;
+            o["status"] = MultiCam.status;
+            return o;
+        }
+
+        static List<object> Tail(List<string> l, int max)
+        {
+            var r = new List<object>();
+            for (int i = Math.Max(0, l.Count - max); i < l.Count; i++) r.Add(l[i]);
+            return r;
         }
 
         // ---------------------------------------------------------------- evaluation without a run (mcam show / pose)
@@ -3115,6 +3520,14 @@ namespace InsideDev
             return l != null && l.Contains(c);
         }
 
+        // The manager's always-loaded list, read once by a caller that asks about many cullers (IsKept(c, list)).
+        internal static FastList<SubsceneCuller> AlwaysNow() { return AlwaysList(); }
+
+        internal static bool IsKept(SubsceneCuller c, FastList<SubsceneCuller> always)
+        {
+            return kept.Contains(c) || c.AlwaysLoaded || (always != null && always.Contains(c));
+        }
+
         public static bool Keep(SubsceneCuller c)
         {
             if (c == null || IsKept(c)) return false;
@@ -3160,6 +3573,7 @@ namespace InsideDev
             if (!active) return;
             Try("hidden", ShowHidden);
             Try("hide", MultiCamHide.Restore);
+            Try("hide cache", MultiCamHide.ClearCache);
             Try("camera control", CameraControl.EndCapture);
             Try("camera script", () =>
             {
@@ -3264,7 +3678,10 @@ namespace InsideDev
         {
             if (held || timeScale == 0f) { Hold(why); return; }
             Time.timeScale = timeScale;
-            try { GameManager.TimeScale = gmTimeScale == timeScale ? gmTimeScale : timeScale; } catch { }
+            // GameManager.TimeScale gets Time.timeScale's saved value on purpose, not its own (gmTimeScale): the game's
+            // TimeScaleController writes it every frame anyway, and a saved 0 next to a running Time.timeScale would freeze
+            // the game again through GameManager.UpdateTimeScale.
+            try { GameManager.TimeScale = timeScale; } catch { }
         }
 
         public static string Status() { return holding ? "frozen (" + reason + "; ts 1 resumes)" : ""; }
@@ -3288,7 +3705,7 @@ namespace InsideDev
                 if (!holding) { Release("not holding"); return; }
                 bool loading = false;
                 try { loading = GameManager.IsLoading(); } catch { }
-                if (loading) { Release("level load"); return; }
+                if (loading) { Release("level load"); RplXLoad.TimeToGame(); return; }
                 if (Time.timeScale == 0f) return;
                 reforced++;
                 if (reforced <= 5 || reforced % 100 == 0) DevLog.Write("[mcam] freeze hold: timeScale " + Time.timeScale.ToString("0.###", CultureInfo.InvariantCulture) + " written by the game (pause menu or time scale script), re-forced 0 (" + reforced + ")");
@@ -3518,12 +3935,18 @@ namespace InsideDev
     internal sealed class MultiCamFrameWriter
     {
         struct Job { public string path; public byte[] bytes; public Color32[] px; public IntPtr native; public int len, slot; }
+        // How long Add may wait for a full queue before the writer counts as stalled (output.stallSeconds of the run that is
+        // starting; 0 = no limit). Add runs on the game thread, so without a limit a hung ffmpeg or disk hangs the game.
+        public const int DefaultStallMs = 30000;
+        public static int StallMs = DefaultStallMs;
         readonly Queue<Job> q = new Queue<Job>();
         readonly object gate = new object();
-        readonly int limit;
+        readonly int limit, stallMs;
         public readonly string name;
         Thread thread;
         bool closing;
+        internal bool killed;
+        long progressAt;
         public volatile string error;
         public int written;
         public double waitMs;
@@ -3537,6 +3960,7 @@ namespace InsideDev
         MultiCamFrameWriter(string camName, int queueLimit, bool start)
         {
             name = camName; limit = Math.Max(1, queueLimit);
+            stallMs = StallMs;
             if (start) StartThread();
         }
 
@@ -3548,35 +3972,26 @@ namespace InsideDev
             thread.Start();
         }
 
-        // output.ffmpeg: a full path, or a program name looked up in the folders of PATH (name and name.exe)
+        // The program a spec's output.ffmpeg stands for (McaXFfmpeg: the tool's own search for "ffmpeg", else a full local path
+        // to an ffmpeg.exe); the value itself when nothing was found.
         public static string ResolveExe(string exe)
         {
-            if (string.IsNullOrEmpty(exe)) return exe;
-            try
-            {
-                if (Path.IsPathRooted(exe) || exe.IndexOf('/') >= 0 || exe.IndexOf('\\') >= 0) return exe;
-                string path = Environment.GetEnvironmentVariable("PATH") ?? "";
-                foreach (var dir in path.Split(Path.PathSeparator))
-                {
-                    string d = dir.Trim().Trim('"');
-                    if (d.Length == 0) continue;
-                    foreach (var name in new[] { exe, exe + ".exe" })
-                    {
-                        string f = Path.Combine(d, name);
-                        if (File.Exists(f)) return f;
-                    }
-                }
-            }
-            catch (Exception) { }
-            return exe;
+            string why;
+            return McaXFfmpeg.Cached(exe, out why) ?? exe;
         }
 
+        // Any thread. ffmpeg = a spec's output.ffmpeg: what is started is only what McaXFfmpeg accepts for it, and the child
+        // dies with the game (ChildJob).
         public static MultiCamFrameWriter Pipe(string camName, int queueLimit, string ffmpeg, string args)
         {
+            string why;
+            string exe = McaXFfmpeg.Cached(ffmpeg, out why);
+            if (exe == null) throw new Exception("ffmpeg: " + why);
             var w = new MultiCamFrameWriter(camName, queueLimit, false);
-            var psi = new System.Diagnostics.ProcessStartInfo(ResolveExe(ffmpeg), args);
+            var psi = new System.Diagnostics.ProcessStartInfo(exe, args);
             psi.UseShellExecute = false; psi.RedirectStandardInput = true; psi.RedirectStandardError = true; psi.RedirectStandardOutput = false; psi.CreateNoWindow = true;
             w.proc = System.Diagnostics.Process.Start(psi);
+            ChildJob.Add(w.proc);
             w.pipe = w.proc.StandardInput.BaseStream;
             var et = new Thread(() =>
             {
@@ -3607,17 +4022,31 @@ namespace InsideDev
             Enqueue(new Job { path = path, native = data, len = len, slot = slot });
         }
 
+        // Waits while the queue is full, but never without an end: when the writer thread has taken no frame for stallMs
+        // (ffmpeg or the disk stopped taking data without failing) the writer gets an error, which ends the take with that
+        // reason. A frame that is not queued (error, closing) gives its native slot back here.
         void Enqueue(Job j)
         {
-            var sw = System.Diagnostics.Stopwatch.StartNew();
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            bool queued = false;
             lock (gate)
             {
-                if (closing && j.slot >= 0) { ReadbackNative.rb_release(j.slot); return; }
-                while (q.Count >= limit && error == null && !closing) Monitor.Wait(gate, 50);
-                q.Enqueue(j);
-                Monitor.PulseAll(gate);
+                while (q.Count >= limit && error == null && !closing)
+                {
+                    Monitor.Wait(gate, 50);
+                    if (stallMs <= 0 || q.Count < limit || error != null || closing) continue;
+                    long idle = (System.Diagnostics.Stopwatch.GetTimestamp() - Math.Max(t0, progressAt)) * 1000L / System.Diagnostics.Stopwatch.Frequency;
+                    if (idle > stallMs) error = "writer stalled: " + (proc != null ? "ffmpeg" : "the disk") + " took no frame for " + Fmt.I(stallMs / 1000) + " s (output.stallSeconds)";
+                }
+                if (error == null && !closing)
+                {
+                    q.Enqueue(j);
+                    queued = true;
+                    Monitor.PulseAll(gate);
+                }
             }
-            waitMs += sw.Elapsed.TotalMilliseconds;
+            if (!queued && j.slot >= 0) ReadbackNative.rb_release(j.slot);
+            waitMs += (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         }
 
         void Loop()
@@ -3630,9 +4059,16 @@ namespace InsideDev
                     while (q.Count == 0 && !closing) Monitor.Wait(gate);
                     if (q.Count == 0) return;
                     j = q.Dequeue();
+                    progressAt = System.Diagnostics.Stopwatch.GetTimestamp();
                     Monitor.PulseAll(gate);
                 }
-                try { Write(j); written++; }
+                try
+                {
+                    // a frame file of an earlier replay take can be a hard link to another camera's frame: writing through it
+                    // would change that camera's file too
+                    if (pipe == null && j.path != null && File.Exists(j.path)) File.Delete(j.path);
+                    Write(j); written++;
+                }
                 catch (Exception e) { if (error == null) error = e.GetType().Name + ": " + e.Message; }
                 finally { if (j.slot >= 0) ReadbackNative.rb_release(j.slot); }
             }
@@ -3691,6 +4127,15 @@ namespace InsideDev
 
         public void Close(bool kill, int timeoutMs)
         {
+            BeginClose(kill);
+            FinishInput(timeoutMs);
+            WaitExit(kill ? 2000 : 60000);
+        }
+
+        // Step 1 of Close: no more frames are taken. kill: what is queued is dropped and ffmpeg ends at once.
+        internal void BeginClose(bool kill)
+        {
+            if (kill) killed = true;
             lock (gate)
             {
                 closing = true;
@@ -3702,13 +4147,44 @@ namespace InsideDev
                 Monitor.PulseAll(gate);
             }
             if (kill && proc != null) { try { if (!proc.HasExited) proc.Kill(); } catch { } }
-            if (thread != null && !thread.Join(timeoutMs)) { if (error == null) error = "writer did not finish within " + timeoutMs + " ms"; }
-            if (proc != null)
+        }
+
+        // Step 2: waits for the writer thread to send what is queued, then closes ffmpeg's input. A thread that is not back
+        // in time is blocked in a write: ffmpeg is ended, which ends that write too.
+        internal void FinishInput(int timeoutMs)
+        {
+            if (thread != null && !thread.Join(Math.Max(0, timeoutMs)))
             {
-                try { if (pipe != null) pipe.Close(); } catch { }
-                try { if (!proc.WaitForExit(kill ? 2000 : 60000)) { proc.Kill(); if (error == null) error = "ffmpeg did not exit; killed"; } } catch { }
-                try { if (proc.HasExited && proc.ExitCode != 0 && error == null && !kill) error = "ffmpeg exit code " + proc.ExitCode; } catch { }
+                if (error == null) error = "writer did not finish within " + timeoutMs + " ms";
+                killed = true;
+                if (proc != null)
+                {
+                    try { if (!proc.HasExited) proc.Kill(); } catch { }
+                    thread.Join(2000);
+                }
             }
+            if (proc != null) { try { if (pipe != null) pipe.Close(); } catch { } }
+        }
+
+        // Step 3: waits for ffmpeg to write the end of its file and exit.
+        internal void WaitExit(int timeoutMs)
+        {
+            if (proc == null) return;
+            try { if (!proc.WaitForExit(Math.Max(0, timeoutMs))) { proc.Kill(); if (error == null) error = "ffmpeg did not exit; killed"; } } catch { }
+            try { if (proc.HasExited && proc.ExitCode != 0 && error == null && !killed) error = "ffmpeg exit code " + proc.ExitCode; } catch { }
+        }
+
+        // Closes several writers together: all stop taking frames, their queues drain side by side within joinMs, every
+        // ffmpeg gets its end of input, and then all of them are waited for within exitMs. A writer with an error (dead or
+        // stalled ffmpeg) is ended at once instead of being waited for.
+        public static void CloseAll(MultiCamFrameWriter[] ws, bool kill, int joinMs, int exitMs)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            foreach (var w in ws) if (w != null) w.BeginClose(kill || w.error != null);
+            foreach (var w in ws) if (w != null) w.FinishInput((int)Math.Max(0L, joinMs - sw.ElapsedMilliseconds));
+            sw.Reset();
+            sw.Start();
+            foreach (var w in ws) if (w != null) w.WaitExit(w.killed ? 2000 : (int)Math.Max(1000L, exitMs - sw.ElapsedMilliseconds));
         }
     }
 
@@ -3806,6 +4282,8 @@ namespace InsideDev
             public Vector3 lastVel, lastCam;
             public bool hasVel, hasCam;
             public string lastName;
+            public int bindVersion = -1;
+            public bool lost;
         }
 
         struct Pending { public Src src; public string source, detail; }
@@ -3893,7 +4371,7 @@ namespace InsideDev
                 catch (Exception e) { rep.Error("events." + s.spec.name, "arm failed: " + e.GetType().Name + ": " + e.Message); }
             }
             armed = true;
-            if (EventMonitor.enabled) monitorSeen = EventMonitor.total;
+            if (EventMonitor.enabled) { if (logMonitor) EventMonitor.Want(5f); monitorSeen = EventMonitor.total; }
         }
 
         static bool NeedsObject(string type) { return type == "signal" || type == "signalIn" || type == "fsm" || type == "sound" || type == "probe" || type == "field"; }
@@ -3906,6 +4384,7 @@ namespace InsideDev
             {
                 s.go = MultiCamTargets.ResolveObject(e.obj, w + ".obj", rep);
                 if (s.go == null) { rep.Error(w + ".obj", "object not resolved: " + e.obj); return; }
+                s.bindVersion = Levels.StreamVersion;
             }
             switch (e.type)
             {
@@ -4029,6 +4508,36 @@ namespace InsideDev
             if (s.taps.Count != before && row != null) row("mark", s.spec.name, "events", "signal taps " + before + " -> " + s.taps.Count);
         }
 
+        static bool BoundToObject(string type) { return type == "fsm" || type == "probe" || type == "field" || type == "sound"; }
+
+        // fsm, probe, field and sound sources hold the object and components found in Arm. When streaming unloads the object
+        // and loads it again (a death and checkpoint reload inside the take) those are dead: the source binds to the new
+        // instance, and the first poll after that is the baseline, not an edge. Signals have their own Rehook.
+        void Rebind(Src s)
+        {
+            s.bindVersion = Levels.StreamVersion;
+            if (s.go != null) return;
+            var rep = new SpecReport();
+            GameObject go = null;
+            try { go = MultiCamTargets.ResolveObject(s.spec.obj, "events." + s.spec.name + ".obj", rep); } catch { }
+            if (go == null)
+            {
+                if (!s.lost && row != null) row("warn", s.spec.name, "events", "object unloaded (" + s.spec.obj + "): the event cannot fire until it is loaded again");
+                s.lost = true;
+                return;
+            }
+            s.lost = false;
+            s.go = go;
+            switch (s.spec.type)
+            {
+                case "fsm": s.fsmState.Clear(); s.logIndex.Clear(); HookFsm(s, rep); break;
+                case "probe": s.probe = null; s.onProbe = null; HookProbe(s, rep); break;
+                case "field": s.comp = null; s.field = null; s.prop = null; s.countOf = false; BindField(s, rep); break;
+            }
+            s.prevKnown = false;
+            if (row != null) row("warn", s.spec.name, "events", "object re-resolved after a stream change: " + Inspector.PathOf(go.transform) + (rep.errors.Count > 0 ? " (" + rep.errors[0] + ")" : ""));
+        }
+
         void Unhook(Src s)
         {
             foreach (var kv in s.taps)
@@ -4125,6 +4634,8 @@ namespace InsideDev
             {
                 if (!s.armed || s.spec.type != "sound") continue;
                 if (!string.Equals(name, s.spec.sound, StringComparison.OrdinalIgnoreCase)) continue;
+                // the spec names an object and it is unloaded: no match, not a match with every object
+                if (s.spec.obj.Length > 0 && s.go == null) continue;
                 if (s.go != null && (go == null || (go != s.go && !go.transform.IsChildOf(s.go.transform)))) continue;
                 pending.Add(new Pending { src = s, source = "sound", detail = name + (go != null ? " @" + go.name : "") });
             }
@@ -4172,6 +4683,8 @@ namespace InsideDev
             foreach (var s in srcs)
             {
                 if (!s.armed) continue;
+                try { if (s.spec.obj.Length > 0 && Levels.StreamVersion != s.bindVersion && BoundToObject(s.spec.type)) Rebind(s); }
+                catch (Exception e) { Fail(s, e); }
                 if (Gated(s, c.t)) continue;
                 try
                 {
@@ -4189,7 +4702,7 @@ namespace InsideDev
                 }
                 catch (Exception e) { Fail(s, e); }
             }
-            if (logMonitor && EventMonitor.enabled) RawRows();
+            if (logMonitor && EventMonitor.enabled) { EventMonitor.Want(5f); RawRows(); }
         }
 
         bool Gated(Src s, double t)
@@ -4257,7 +4770,7 @@ namespace InsideDev
             TargetSample ts;
             if (!Sample(s.spec.target, out ts)) return;
             bool inside = new Bounds(s.spec.center, s.spec.size).Contains(ts.pos);
-            Edge(s, s.spec.edge == "exit" ? !inside : inside, "box", (inside ? "inside " : "outside ") + ts.pos.ToString("F2"), false);
+            Edge(s, s.spec.edge == "exit" ? !inside : inside, "box", (inside ? "inside " : "outside ") + Fmt.V3(ts.pos, "F2"), false);
         }
 
         void PollCond(Src s)
@@ -4400,23 +4913,32 @@ namespace InsideDev
 
     // ------------------------------------------------------------------ authoring probe (mcam probe)
 
+    // mcam probe <obj> [json] | mcam probe <x> <y> <z> <radius> [json]: what an object (or the objects around a point) offers
+    // as event sources. The text form ends with JSON snippets to paste; the json form gives the same as objects, with the
+    // snippets under "events" as a name map that fits a spec's "events" as it is.
     internal static class MultiCamProbe
     {
         static readonly CultureInfo IC = CultureInfo.InvariantCulture;
+        const string Usage = "usage: mcam probe <obj> [json] | mcam probe <x> <y> <z> <radius> [json]";
 
         public static string Run(List<string> a)
         {
-            if (a.Count < 3) return "usage: mcam probe <obj> | mcam probe <x> <y> <z> <radius>";
+            var w = a.GetRange(Math.Min(2, a.Count), Math.Max(0, a.Count - 2));
+            bool json = w.Count > 1 && w[w.Count - 1].ToLowerInvariant() == "json";
+            if (json) w.RemoveAt(w.Count - 1);
+            if (w.Count < 1) return Usage;
             float x, y, z, r;
-            if (a.Count >= 6 && TryF(a[2], out x) && TryF(a[3], out y) && TryF(a[4], out z) && TryF(a[5], out r)) return Area(new Vector3(x, y, z), r);
-            string q = string.Join(" ", a.GetRange(2, a.Count - 2).ToArray());
+            if (w.Count >= 4 && TryF(w[0], out x) && TryF(w[1], out y) && TryF(w[2], out z) && TryF(w[3], out r)) return Area(new Vector3(x, y, z), r, json);
+            string q = string.Join(" ", w.ToArray());
             var rep = new SpecReport();
             GameObject go = null;
             try { go = MultiCamTargets.ResolveObject(q, "probe", rep); } catch { }
             string how = "strict";
             if (go == null) { go = Remote.Resolve(q); how = "loose match (not strict: use the printed path in specs)"; }
-            if (go == null) return "not found: " + q + (rep.errors.Count + rep.warnings.Count > 0 ? "\n" + rep.Summary(10) : "");
-            return Describe(go, how);
+            if (go == null)
+                return json ? JsonLine.Obj("found", false, "query", q, "error", "not found")
+                            : "not found: " + q + (rep.errors.Count + rep.warnings.Count > 0 ? "\n" + rep.Summary(10) : "");
+            return Describe(go, how, json);
         }
 
         static bool TryF(string s, out float v) { return float.TryParse(s, NumberStyles.Float, IC, out v); }
@@ -4425,12 +4947,60 @@ namespace InsideDev
 
         static string J(string s) { return "\"" + (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"") + "\""; }
 
-        static string Describe(GameObject go, string how)
+        static List<object> Vec(Vector3 v) { return new List<object> { Math.Round((double)v.x, 3), Math.Round((double)v.y, 3), Math.Round((double)v.z, 3) }; }
+
+        static Json.Obj Snippet(params string[] keyValues)
+        {
+            var o = new Json.Obj();
+            for (int i = 0; i + 1 < keyValues.Length; i += 2) o[keyValues[i]] = keyValues[i + 1];
+            return o;
+        }
+
+        // the snippet as the text form prints it: {"type": "signal", "obj": "...", "signal": "..."}
+        static string SnippetText(Json.Obj o)
+        {
+            var sb = new StringBuilder("{");
+            int n = 0;
+            foreach (var k in o.order)
+            {
+                if (n++ > 0) sb.Append(", ");
+                sb.Append(J(k)).Append(": ");
+                var v = o[k];
+                if (v is double) sb.Append(((double)v).ToString("0.0###", IC)); else sb.Append(J(v as string));
+            }
+            return sb.Append('}').ToString();
+        }
+
+        // A name for the snippet that passes the lint of event names (letters, digits, '_' and '.'), unique in `used`.
+        static string EventName(Json.Obj s, HashSet<string> used)
+        {
+            string obj = s.Str("obj", null) ?? s.Str("target", "");
+            int cut = obj.LastIndexOf('/');
+            string leaf = cut >= 0 ? obj.Substring(cut + 1) : obj;
+            string tail = s.Str("signal", null) ?? s.Str("state", null) ?? s.Str("sound", "");
+            var sb = new StringBuilder();
+            foreach (char c in s.Str("type", "event") + "_" + leaf + (tail.Length > 0 ? "_" + tail : ""))
+            {
+                bool ok = c < 128 && (char.IsLetterOrDigit(c) || c == '.');
+                if (ok) sb.Append(c);
+                else if (sb.Length > 0 && sb[sb.Length - 1] != '_') sb.Append('_');
+            }
+            string name = sb.ToString().Trim('_');
+            if (name.Length == 0) name = "event";
+            if (name.Length > 48) name = name.Substring(0, 48).Trim('_');
+            string unique = name;
+            for (int k = 2; !used.Add(unique); k++) unique = name + "_" + k.ToString(IC);
+            return unique;
+        }
+
+        static string Describe(GameObject go, string how, bool json)
         {
             var sb = new StringBuilder();
             string path = Inspector.PathOf(go.transform);
-            sb.Append(path).Append("  #").Append(go.GetInstanceID()).Append(go.activeInHierarchy ? "  active" : "  inactive").Append("  pos ").Append(go.transform.position.ToString("F2")).Append("  [").Append(how).Append("]\n");
-            var snippets = new List<string>();
+            sb.Append(path).Append("  #").Append(go.GetInstanceID()).Append(go.activeInHierarchy ? "  active" : "  inactive").Append("  pos ").Append(Fmt.V3(go.transform.position, "F2")).Append("  [").Append(how).Append("]\n");
+            var snippets = new List<Json.Obj>();
+            var jOuts = new List<object>(); var jIns = new List<object>(); var jFsms = new List<object>(); var jProbes = new List<object>();
+            var jBodies = new List<object>(); var jSounds = new List<object>();
             SignalManager sm = null;
             try { sm = PersistentBehaviour<SignalManager>.instance; } catch { }
             if (sm != null && sm.signalOuts != null)
@@ -4445,10 +5015,22 @@ namespace InsideDev
                         outs++;
                         string sp = Inspector.PathOf(so.gameObject.transform);
                         sb.Append("  signal out  ").Append(sp).Append(" .").Append(so.debugName);
+                        var to = new List<object>();
                         int n = 0;
-                        if (list != null) for (int i = 0; i < list.Count; i++) { var c = list[i]; if (c == null || c.signalInName == "InsideDev.tap") continue; sb.Append(n++ == 0 ? "  ->  " : ", ").Append(c.signalInGameObject != null ? c.signalInGameObject.name : "?").Append('.').Append(c.signalInName); }
+                        if (list != null)
+                            for (int i = 0; i < list.Count; i++)
+                            {
+                                var c = list[i];
+                                if (c == null || c.signalInName == "InsideDev.tap") continue;
+                                string target = (c.signalInGameObject != null ? c.signalInGameObject.name : "?") + "." + c.signalInName;
+                                sb.Append(n++ == 0 ? "  ->  " : ", ").Append(target);
+                                to.Add(target);
+                            }
                         sb.Append('\n');
-                        snippets.Add("{\"type\": \"signal\", \"obj\": " + J(sp) + ", \"signal\": " + J(so.debugName) + "}");
+                        var jo = new Json.Obj();
+                        jo["obj"] = sp; jo["signal"] = so.debugName; jo["to"] = to;
+                        jOuts.Add(jo);
+                        snippets.Add(Snippet("type", "signal", "obj", sp, "signal", so.debugName));
                     }
                     if (list == null) continue;
                     for (int i = 0; i < list.Count && ins < 40; i++)
@@ -4458,7 +5040,10 @@ namespace InsideDev
                         ins++;
                         string rp = Inspector.PathOf(c.signalInGameObject.transform);
                         sb.Append("  signal in   ").Append(rp).Append(" .").Append(c.signalInName).Append("  <-  ").Append(so.gameObject.name).Append('.').Append(so.debugName).Append('\n');
-                        snippets.Add("{\"type\": \"signalIn\", \"obj\": " + J(rp) + ", \"signal\": " + J(c.signalInName) + "}");
+                        var ji = new Json.Obj();
+                        ji["obj"] = rp; ji["signal"] = c.signalInName; ji["from"] = so.gameObject.name + "." + so.debugName;
+                        jIns.Add(ji);
+                        snippets.Add(Snippet("type", "signalIn", "obj", rp, "signal", c.signalInName));
                     }
                 }
             }
@@ -4467,6 +5052,8 @@ namespace InsideDev
                 if (f == null) continue;
                 string fp = Inspector.PathOf(f.transform);
                 sb.Append("  fsm         ").Append(fp).Append(" '").Append(f.FsmName).Append("'  active ").Append(f.ActiveStateName ?? "-");
+                var jf = new Json.Obj();
+                jf["obj"] = fp; jf["fsm"] = f.FsmName; jf["active"] = f.ActiveStateName ?? "";
                 try
                 {
                     var st = f.FsmStates; var names = new List<string>();
@@ -4475,9 +5062,11 @@ namespace InsideDev
                     var ev = f.FsmEvents; var en = new List<string>();
                     if (ev != null) foreach (var e in ev) if (e != null && !e.IsSystemEvent && en.Count < 30) en.Add(e.Name);
                     if (en.Count > 0) sb.Append("\n              events: ").Append(string.Join(", ", en.ToArray()));
-                    if (names.Count > 0) snippets.Add("{\"type\": \"fsm\", \"obj\": " + J(fp) + ", \"fsm\": " + J(f.FsmName) + ", \"state\": " + J(names[names.Count > 1 ? 1 : 0]) + ", \"edge\": \"enter\"}");
+                    jf["states"] = MultiCamPlan.Strs(names); jf["events"] = MultiCamPlan.Strs(en);
+                    if (names.Count > 0) snippets.Add(Snippet("type", "fsm", "obj", fp, "fsm", f.FsmName, "state", names[names.Count > 1 ? 1 : 0], "edge", "enter"));
                 }
                 catch { }
+                jFsms.Add(jf);
                 sb.Append('\n');
             }
             foreach (var p in go.GetComponentsInChildren<IsTriggeredByProbe>(true))
@@ -4485,14 +5074,20 @@ namespace InsideDev
                 if (p == null) continue;
                 string pp = Inspector.PathOf(p.transform);
                 sb.Append("  probe       ").Append(pp).Append(" (IsTriggeredByProbe)\n");
-                snippets.Add("{\"type\": \"probe\", \"obj\": " + J(pp) + ", \"edge\": \"enter\"}");
+                jProbes.Add(pp);
+                snippets.Add(Snippet("type", "probe", "obj", pp, "edge", "enter"));
             }
             foreach (var rb in go.GetComponentsInChildren<Rigidbody>(true))
             {
                 if (rb == null) continue;
                 string rp = Inspector.PathOf(rb.transform);
                 sb.Append("  rigidbody   ").Append(rp).Append("  mass ").Append(rb.mass.ToString("0.###", IC)).Append("  ").Append(rb.interpolation).Append(rb.isKinematic ? "  kinematic" : "").Append(rb.IsSleeping() ? "  sleeping" : "").Append('\n');
-                snippets.Add("{\"type\": \"impact\", \"target\": " + J(rp) + ", \"min\": 1.0}");
+                var jb = new Json.Obj();
+                jb["obj"] = rp; jb["mass"] = Math.Round((double)rb.mass, 3); jb["interpolation"] = rb.interpolation.ToString(); jb["kinematic"] = rb.isKinematic; jb["sleeping"] = rb.IsSleeping();
+                jBodies.Add(jb);
+                var sn = Snippet("type", "impact", "target", rp);
+                sn["min"] = 1.0;
+                snippets.Add(sn);
             }
             int ca = go.GetComponentsInChildren<CollisionAnalyzer>(true).Length;
             if (ca > 0) sb.Append("  collision analyzers: ").Append(ca).Append('\n');
@@ -4505,26 +5100,42 @@ namespace InsideDev
                 if (ev.kind != 'A' || !ids.Contains(ev.goId)) continue;
                 shown++;
                 sb.Append("  sound       ").Append(ev.text).Append('\n');
+                jSounds.Add(ev.text);
                 int k = ev.text.IndexOf("  posts  ");
-                if (k >= 0) snippets.Add("{\"type\": \"sound\", \"sound\": " + J(ev.text.Substring(k + 9).Trim()) + ", \"obj\": " + J(path) + "}");
+                if (k >= 0) snippets.Add(Snippet("type", "sound", "sound", ev.text.Substring(k + 9).Trim(), "obj", path));
             }
-            if (snippets.Count > 0)
+            var seen = new HashSet<string>();
+            var kept = new List<Json.Obj>();
+            foreach (var s in snippets) if (seen.Add(SnippetText(s)) && seen.Count <= 40) kept.Add(s);
+            if (!json)
             {
-                sb.Append("events snippets (add a \"name\"):\n");
-                var seen = new HashSet<string>();
-                foreach (var s in snippets) if (seen.Add(s) && seen.Count <= 40) sb.Append("  ").Append(s).Append('\n');
+                if (kept.Count > 0)
+                {
+                    sb.Append("events snippets (add a \"name\"):\n");
+                    foreach (var s in kept) sb.Append("  ").Append(SnippetText(s)).Append('\n');
+                }
+                return sb.ToString();
             }
-            return sb.ToString();
+            var o = new Json.Obj();
+            o["found"] = true; o["path"] = path; o["id"] = go.GetInstanceID(); o["active"] = go.activeInHierarchy; o["pos"] = Vec(go.transform.position); o["match"] = how;
+            o["signals_out"] = jOuts; o["signals_in"] = jIns; o["fsms"] = jFsms; o["probes"] = jProbes; o["rigidbodies"] = jBodies; o["collision_analyzers"] = ca; o["sounds"] = jSounds;
+            var events = new Json.Obj();
+            var used = new HashSet<string>();
+            foreach (var s in kept) events[EventName(s, used)] = s;
+            o["events"] = events;
+            return JsonLine.Write(o);
         }
 
-        static string Area(Vector3 c, float r)
+        static string Area(Vector3 c, float r, bool json)
         {
             var withSignals = new HashSet<int>();
             SignalManager sm = null;
             try { sm = PersistentBehaviour<SignalManager>.instance; } catch { }
             if (sm != null && sm.signalOuts != null) foreach (var so in sm.signalOuts) if (so != null && so.isActive && so.gameObject != null) withSignals.Add(so.gameObject.GetInstanceID());
             var sb = new StringBuilder();
+            var rows = new List<object>();
             int n = 0;
+            bool more = false;
             foreach (var t in Inspector.AllSceneTransforms())
             {
                 if (t == null || (t.position - c).magnitude > r) continue;
@@ -4536,10 +5147,22 @@ namespace InsideDev
                 var rb = go.GetComponent<Rigidbody>();
                 if (rb != null && !rb.isKinematic) kinds.Add("rigidbody " + rb.mass.ToString("0.##", IC) + " kg");
                 if (kinds.Count == 0) continue;
-                if (++n > 80) { sb.Append("  ... more (narrow the radius)\n"); break; }
-                sb.Append("  ").Append(((t.position - c).magnitude).ToString("0.0", IC)).Append(" m  ").Append(Inspector.PathOf(t)).Append("  [").Append(string.Join(", ", kinds.ToArray())).Append("]\n");
+                if (++n > 80) { sb.Append("  ... more (narrow the radius)\n"); more = true; n = 80; break; }
+                float d = (t.position - c).magnitude;
+                string p = Inspector.PathOf(t);
+                sb.Append("  ").Append(d.ToString("0.0", IC)).Append(" m  ").Append(p).Append("  [").Append(string.Join(", ", kinds.ToArray())).Append("]\n");
+                var row = new Json.Obj();
+                row["dist"] = Math.Round((double)d, 2); row["path"] = p; row["pos"] = Vec(t.position); row["kinds"] = MultiCamPlan.Strs(kinds);
+                rows.Add(row);
             }
-            return n == 0 ? "nothing with signals / FSMs / probes / rigidbodies within " + r + " m" : "within " + r.ToString("0.#", IC) + " m of " + c.ToString("F2") + " (then: mcam probe <path>):\n" + sb;
+            if (json)
+            {
+                var o = new Json.Obj();
+                o["center"] = Vec(c); o["radius"] = Math.Round((double)r, 3); o["count"] = n; o["more"] = more; o["objects"] = rows;
+                return JsonLine.Write(o);
+            }
+            return n == 0 ? "nothing with signals / FSMs / probes / rigidbodies within " + r.ToString("0.#", IC) + " m"
+                          : "within " + r.ToString("0.#", IC) + " m of " + Fmt.V3(c, "F2") + " (then: mcam probe <path>):\n" + sb;
         }
     }
 }

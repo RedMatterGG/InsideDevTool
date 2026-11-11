@@ -13,7 +13,10 @@ namespace InsideDev
     // ::Component, #id; ambiguity or no match is an error with candidates, never a substring fallback. Points: boy bones,
     // huddle cloth, game camera / aim / probe, object pivot, bounds (DECAL_* excluded), com, rb, collider, top, bottom, bone:*.
     // Groups (of / find / list) with filters, hysteresis, modes and smoothing. Samples are cached per step; Step refreshes them
-    // once and re-resolves lost objects from the ObjectDatabase snapshot after streaming changes (no synchronous scans).
+    // once and re-resolves lost objects from the ObjectDatabase snapshot after streaming changes. The background scanners
+    // sleep while a run is active, so Step asks for one database pass itself when streaming changed and a target is lost or a
+    // find group could gain members (Rescan: at most one pass every RescanEvery seconds, never in the real-time record pass,
+    // off with the spec key stream.rescan "off").
     // Replay (REPLAY_DESIGN 8.3 RIG, while ReplayHub.replaying): velocities by finite difference over the replay step (frozen
     // Rigidbody.velocity never read), character pos3/centre and velocity from IReplaySource.Character, probe from
     // IReplaySource.Probe, game points from ctx.game (CORE fills it from GameCam) or GameCam, never CameraScript; bones, bounds,
@@ -32,9 +35,27 @@ namespace InsideDev
         static MultiCamSpec active;
         static MultiCamContext ctx;
         static int session = 1, stamp, streamSeen = -1, passSeen = -1;
-        static bool recheck, noRegister;
-        static bool Live { get { return active != null && Time.realtimeSinceStartup - lastStepAt < 60f; } }
+        static bool recheck, noRegister, runOwned, lean, quietLookups;
         static float retryAt, lastStepAt = -100f;
+        const float RescanQuiet = 0.5f, RescanEvery = 2f;
+        static string rescanMode = "auto";
+        static bool rescanWanted, rescanSkipSaid;
+        static int guestFrom = -1;
+        static MultiCamContext guestCtx;
+        static int rescans, relinked, joined, recheckPass = -1, recheckStream = -1;
+        static float rescanAt = -100f, rescanMs;
+
+        // A run owns the targets from its Begin to its End: a spec that is only checked meanwhile never takes them over.
+        // Sessions without a runner (mcam check, show, pose, the srec monitor) count as left behind 60 s after their last Step.
+        static bool Live
+        {
+            get
+            {
+                if (active == null) return false;
+                if (runOwned && MultiCam.runner != null) return true;
+                return Time.realtimeSinceStartup - lastStepAt < 60f;
+            }
+        }
         static readonly ReplayClock clock = new ReplayClock();
         static readonly GameCamState replayCam = new GameCamState();
         static readonly Dictionary<int, int> replayIds = new Dictionary<int, int>();
@@ -45,12 +66,23 @@ namespace InsideDev
         {
             if (spec == null) return;
             if (report == null) report = new SpecReport();
-            if (Live && spec != active) { CheckOnly(spec, report); return; }
+            if (Live && spec != active)
+            {
+                // another spec is only looked at while the session stays with its owner; what a one-shot evaluation of it
+                // registers from here on (mcam pose / show during a run) is taken out again by its End
+                if (runOwned) { EndGuest(); guestFrom = entries.Count; }
+                CheckOnly(spec, report);
+                return;
+            }
             Reset();
             active = spec;
+            runOwned = MultiCam.runner != null;
+            rescanMode = new McbXSpecKeys(spec).Str("auto", "stream", "rescan");
+            if (rescanMode != "auto" && rescanMode != "off") { report.Warn("stream.rescan", "unknown value '" + rescanMode + "' (auto, off): auto is used"); rescanMode = "auto"; }
             streamSeen = Levels.StreamVersion;
-            passSeen = ObjectDatabase.completedPasses;
             try { ObjectDatabase.EnsureFresh(3f); } catch (Exception e) { report.Warn("", "object database refresh failed: " + e.Message); }
+            passSeen = recheckPass = ObjectDatabase.completedPasses;
+            recheckStream = streamSeen;
             var refs = new List<TargetRef>();
             SpecBind.Walk(spec, "", (node, where) =>
             {
@@ -116,37 +148,238 @@ namespace InsideDev
             return FindObject(query, where, report, Live, out comp);
         }
 
+        // true = the call comes with another context than the run that owns the session
+        static bool Foreign(MultiCamContext c)
+        {
+            if (!runOwned) return false;
+            var run = MultiCam.runner;
+            return run != null && !ReferenceEquals(c, run.RunContext);
+        }
+
+        static void EndGuest()
+        {
+            if (guestFrom >= 0)
+                for (int i = entries.Count - 1; i >= guestFrom; i--)
+                {
+                    var e = entries[i];
+                    try { e.Release(); } catch { }
+                    if (e.r != null && e.r.cache == e) { e.r.cache = null; e.r.cacheVersion = -1; }
+                    entries.RemoveAt(i);
+                }
+            guestFrom = -1;
+            guestCtx = null;
+        }
+
         public static void Step(MultiCamContext c)
         {
+            if (guestFrom >= 0)
+            {
+                // the guest's own step: its samples are taken with its context, the run's samples and history stay as they are
+                if (Foreign(c)) { guestCtx = c; return; }
+                EndGuest();
+            }
             ctx = c;
             stamp++;
             lastStepAt = Time.realtimeSinceStartup;
             bool replaying = Replaying;
             if (replaying && c != null) clock.Step(c.t);
-            if (Levels.StreamVersion != streamSeen) { streamSeen = Levels.StreamVersion; recheck = true; try { ObjectDatabase.Demand(10f); } catch { } }
-            if (ObjectDatabase.completedPasses != passSeen) { passSeen = ObjectDatabase.completedPasses; foreach (var e in entries) { var g = e as GroupEntry; if (g != null) g.passDirty = true; } }
+            if (Levels.StreamVersion != streamSeen) { streamSeen = Levels.StreamVersion; recheck = true; rescanWanted = true; try { ObjectDatabase.Demand(10f); } catch { } }
+            if (rescanWanted) Rescan(c);
+            if (ObjectDatabase.completedPasses != passSeen)
+            {
+                passSeen = ObjectDatabase.completedPasses;
+                recheck = true;
+                foreach (var e in entries) { var g = e as GroupEntry; if (g != null) g.passDirty = true; }
+            }
             if (recheck || (!replaying && Time.realtimeSinceStartup >= retryAt)) Recheck(c);
             for (int i = 0; i < entries.Count; i++)
             {
+                if (lean && !entries[i].wanted) continue;
                 try { entries[i].Refresh(c); }
                 catch (Exception ex) { entries[i].Fail(c, ex); }
             }
         }
 
+        // Entries that read the object database are tried again only when the snapshot or the streaming state is new since
+        // the last try (the answer could not differ otherwise); characters are tried on the one-second timer.
         static void Recheck(MultiCamContext c)
         {
             recheck = false;
             retryAt = Time.realtimeSinceStartup + 1f;
+            bool fresh = ObjectDatabase.completedPasses != recheckPass || Levels.StreamVersion != recheckStream;
+            recheckPass = ObjectDatabase.completedPasses;
+            recheckStream = Levels.StreamVersion;
             for (int i = 0; i < entries.Count; i++)
             {
                 var e = entries[i];
                 if (!e.Lost && (e.ok || !e.retryable)) continue;
-                string before = e.ok ? e.resolved : "unresolved";
+                if (e.usesSnapshot && !fresh)
+                {
+                    if (e.Lost && !e.lostSaid)
+                    {
+                        e.lostSaid = true;
+                        if (c != null) c.Log("warn target " + e.text + " lost: its object was destroyed (" + e.resolvedText + "); it is looked up again after the next streaming change");
+                    }
+                    continue;
+                }
+                e.lostSaid = false;
+                string before = e.Lost ? "lost" : e.ok ? e.resolved : "unresolved: " + e.error;
                 var rep = new SpecReport();
-                bool ok = SafeBind(e, rep, true);
+                quietLookups = true;
+                bool ok;
+                try { ok = SafeBind(e, rep, true); }
+                finally { quietLookups = false; }
                 string after = ok ? e.resolved : "unresolved: " + e.error;
-                if (before != after && c != null) c.Log("warn target " + e.text + " re-resolved: " + before + " -> " + after);
+                if (before == after) continue;
+                if (ok) relinked++;
+                if (c != null) c.Log("warn target " + e.text + " re-resolved: " + before + " -> " + after);
             }
+        }
+
+        static bool NeedsSnapshot()
+        {
+            for (int i = 0; i < entries.Count; i++)
+            {
+                var e = entries[i];
+                if (e.findsMembers) return true;
+                if (e.usesSnapshot && (e.Lost || (!e.ok && e.retryable))) return true;
+            }
+            return false;
+        }
+
+        // One database pass for the run after streaming changed, once it has been quiet for RescanQuiet seconds. A pass costs
+        // 30-170 ms of the game thread: fine between capture steps on virtual time, never done inside the real-time record
+        // pass (DevCore.quietBackground).
+        static void Rescan(MultiCamContext c)
+        {
+            float now = Time.realtimeSinceStartup;
+            if (now - Levels.StreamChangedAt < RescanQuiet || now - rescanAt < RescanEvery) return;
+            rescanWanted = false;
+            if (!NeedsSnapshot()) return;
+            if (rescanMode == "off" || DevCore.quietBackground)
+            {
+                if (!rescanSkipSaid && c != null)
+                {
+                    rescanSkipSaid = true;
+                    c.Log("targets: streaming changed; no object rescan " + (rescanMode == "off" ? "(stream.rescan off)" : "inside the real-time record pass") + ": a lost target or a find group is not looked up again here");
+                }
+                return;
+            }
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            try { ObjectDatabase.EnsureFresh(RescanQuiet); }
+            catch (Exception e) { if (c != null) c.Log("warn targets: object rescan failed: " + e.GetType().Name + ": " + e.Message); return; }
+            float ms = (float)((System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+            rescanAt = Time.realtimeSinceStartup;
+            rescans++;
+            rescanMs += ms;
+            if (c != null) c.Log("targets: object rescan " + rescans.ToString(IC) + " after streaming: " + ms.ToString("0", IC) + " ms, " + ObjectDatabase.all.Count.ToString(IC) + " objects");
+        }
+
+        // The record pass evaluates no rig: only the entries somebody samples from now on are refreshed by Step (tracked
+        // targets, event conditions); the others cost nothing per recorded frame. End switches it off.
+        public static void Lean(bool on)
+        {
+            lean = on;
+            if (on) foreach (var e in entries) e.wanted = false;
+        }
+
+        // "5 of 6 resolved, 1 lost, 2 rescans" for status lines; "" without a session.
+        public static string StatusText()
+        {
+            if (active == null || entries.Count == 0) return "";
+            int ok, lost, bad, groups, members;
+            Tally(out ok, out lost, out bad, out groups, out members);
+            var sb = new StringBuilder();
+            sb.Append(ok.ToString(IC)).Append(" of ").Append(entries.Count.ToString(IC)).Append(" resolved");
+            if (lost > 0) sb.Append(", ").Append(lost.ToString(IC)).Append(" lost");
+            if (bad > 0) sb.Append(", ").Append(bad.ToString(IC)).Append(" unresolved");
+            if (groups > 0) sb.Append(", ").Append(members.ToString(IC)).Append(" in ").Append(groups.ToString(IC)).Append(" group(s)");
+            if (rescans > 0) sb.Append(", ").Append(rescans.ToString(IC)).Append(" rescan(s)");
+            return sb.ToString();
+        }
+
+        // The same as numbers, for progress.json and run.json (block "targets").
+        public static Json.Obj StatusJson()
+        {
+            int ok, lost, bad, groups, members;
+            Tally(out ok, out lost, out bad, out groups, out members);
+            var o = new Json.Obj();
+            o["total"] = entries.Count; o["resolved"] = ok; o["lost"] = lost; o["unresolved"] = bad;
+            o["groups"] = groups; o["group_members"] = members;
+            o["rescan"] = DevCore.quietBackground ? "off (record pass)" : rescanMode;
+            o["rescans"] = rescans; o["rescan_ms"] = Math.Round(rescanMs, 1); o["re_resolved"] = relinked; o["joined"] = joined;
+            var names = new List<object>();
+            for (int i = 0; i < entries.Count && names.Count < 12; i++)
+            {
+                var e = entries[i];
+                if (e.Lost) names.Add(e.text + ": lost"); else if (!e.ok) names.Add(e.text + ": " + e.error);
+            }
+            o["problems"] = names;
+            return o;
+        }
+
+        static void Tally(out int ok, out int lost, out int bad, out int groups, out int members)
+        {
+            ok = lost = bad = groups = members = 0;
+            for (int i = 0; i < entries.Count; i++)
+            {
+                var e = entries[i];
+                if (e.Lost) lost++; else if (e.ok) ok++; else bad++;
+                var g = e as GroupEntry;
+                if (g != null) { groups++; members += g.MemberCount; }
+            }
+        }
+
+        // One sample of a target outside any spec (commands such as "cam look"): of = "boy", "huddle", "main", "game",
+        // "gameaim", "probe" or a strict object query, point = "" or a point name. Nothing is registered or kept.
+        public static bool SampleOnce(string of, string point, out TargetSample s, out string resolved, out string error)
+        {
+            s = default(TargetSample); resolved = ""; error = null;
+            if (string.IsNullOrEmpty(of)) { error = "empty target"; return false; }
+            var r = TargetRef.Of(of.Trim());
+            r.where = "target";
+            if (!string.IsNullOrEmpty(point)) { r.point = point.Trim(); r.given.Add("point"); }
+            if (r.isNone || r.isSelf) { error = "'" + r.of + "' is not a place"; return false; }
+            var rep = new SpecReport();
+            Entry e;
+            bool was = noRegister;
+            noRegister = true;
+            try { e = Build(r, rep, Live); }
+            finally { noRegister = was; }
+            if (e == null || !e.ok)
+            {
+                error = rep.errors.Count > 0 ? rep.errors[0] : e != null ? e.error : "not resolved";
+                return false;
+            }
+            var c = ctx;
+            if (c == null && Replaying)
+            {
+                // an srec viewer without a run: recorded points are read at the time the viewer shows
+                var rp = ReplayHub.source as SceneReplayer;
+                if (rp != null) { c = new MultiCamContext(); c.t = rp.T; }
+            }
+            try { e.Refresh(c); }
+            catch (Exception ex) { error = ex.GetType().Name + ": " + ex.Message; return false; }
+            finally { try { e.Release(); } catch { } }
+            s = e.sample;
+            resolved = e.resolved;
+            if (!s.ok) error = "resolved (" + e.resolvedText + ") but it has no position now";
+            return s.ok;
+        }
+
+        // Why a point name cannot work for a target, or null (static check: no scene access). Object points that need a
+        // Rigidbody or a Collider are checked when the target is resolved.
+        internal static string PointError(TargetRef target, string point)
+        {
+            string p = (point ?? "").Trim();
+            if (p.Length == 0 || target == null || target.fixedPoint || target.isGroup) return null;
+            if (p.StartsWith("bone:", StringComparison.Ordinal)) return p.Length > 5 ? null : "bone: needs a name";
+            string of = (target.of ?? "").Trim();
+            if (of == "boy") return Array.IndexOf(CharEntry.BoyPoints, p) >= 0 ? null : "unknown boy point '" + p + "' (torso, head, neck, root, pos3, pivot, bounds, top, bottom, probe, bone:<name>)";
+            if (of == "huddle") return Array.IndexOf(CharEntry.HuddlePoints, p) >= 0 ? null : "unknown huddle point '" + p + "' (visual, centre, pos3, pivot, bounds, top, bottom, probe, bone:<name>)";
+            if (of == "main") return Array.IndexOf(CharEntry.BoyPoints, p) >= 0 || Array.IndexOf(CharEntry.HuddlePoints, p) >= 0 ? null : "unknown character point '" + p + "'";
+            if (of == "game" || of == "gameaim" || of == "probe" || of == "none" || of == "self") return null;
+            return Array.IndexOf(ObjectEntry.Points, p) >= 0 ? null : "unknown object point '" + p + "' (pivot, bounds, com, rb, collider, top, bottom, bone:<child>)";
         }
 
         public static bool Sample(TargetRef r, out TargetSample s)
@@ -162,8 +395,10 @@ namespace InsideDev
                 if (rep.errors.Count > 0 && ctx != null) ctx.Log("warn target " + r.text + ": " + rep.errors[0]);
             }
             if (e == null) return false;
-            try { e.Refresh(ctx); }
-            catch (Exception ex) { e.Fail(ctx, ex); }
+            e.wanted = true;
+            var c = guestCtx ?? ctx;
+            try { e.Refresh(c); }
+            catch (Exception ex) { e.Fail(c, ex); }
             s = e.sample;
             return s.ok;
         }
@@ -180,6 +415,8 @@ namespace InsideDev
 
         public static void End()
         {
+            // the End of a one-shot evaluation that ran as a guest of a run's session ends only what it registered
+            if (guestFrom >= 0 && guestCtx != null) { EndGuest(); return; }
             foreach (var e in entries)
             {
                 try { e.Release(); } catch { }
@@ -197,6 +434,11 @@ namespace InsideDev
             ctx = null;
             lastStepAt = -100f;
             recheck = false;
+            runOwned = false; lean = false;
+            guestFrom = -1; guestCtx = null;
+            rescanMode = "auto"; rescanWanted = false; rescanSkipSaid = false;
+            rescans = relinked = joined = 0;
+            rescanAt = -100f; rescanMs = 0f;
             session++;
             stamp = 0;
             clock.Restart();
@@ -284,7 +526,7 @@ namespace InsideDev
             }
             if (cands.Count == 0)
             {
-                report.Error(where, "no object '" + q + "'" + Hints(q));
+                report.Error(where, "no object '" + q + "'" + (quietLookups ? "" : Hints(q)));
                 return null;
             }
             if (index >= 0)
@@ -308,7 +550,7 @@ namespace InsideDev
                 report.Note(where, "'" + q + "' matches " + cands.Count.ToString(IC) + " objects; using the only active one " + Inspector.PathOf(only) + " #" + only.gameObject.GetInstanceID().ToString(IC));
                 return only.gameObject;
             }
-            report.Error(where, "'" + q + "' is ambiguous: " + cands.Count.ToString(IC) + " matches; use a longer path, [i] or #id" + List(cands));
+            report.Error(where, "'" + q + "' is ambiguous: " + cands.Count.ToString(IC) + " matches; use a longer path, [i] or #id" + (quietLookups ? "" : List(cands)));
             return null;
         }
 
@@ -324,12 +566,12 @@ namespace InsideDev
                     foreach (var rec in ObjectDatabase.ByPath(q)) if (rec.t != null) res.Add(rec.t);
                     if (res.Count > 0) return res;
                     string suffix = "/" + q;
-                    foreach (var rec in ObjectDatabase.all)
-                        if (rec.t != null && rec.path != null && rec.path.EndsWith(suffix, StringComparison.Ordinal)) res.Add(rec.t);
+                    foreach (var rec in McbXNameIndex.Named(q.Substring(q.LastIndexOf('/') + 1)))
+                        if (rec.path != null && rec.path.EndsWith(suffix, StringComparison.Ordinal) && rec.t != null) res.Add(rec.t);
                 }
                 else
                 {
-                    foreach (var rec in ObjectDatabase.all) if (rec.t != null && rec.name == q) res.Add(rec.t);
+                    foreach (var rec in McbXNameIndex.Named(q)) if (rec.name == q && rec.t != null) res.Add(rec.t);
                 }
                 return res;
             }
@@ -369,7 +611,7 @@ namespace InsideDev
             int n = 0;
             foreach (var rec in ObjectDatabase.all)
             {
-                if (rec.go == null || rec.nameLower == null || rec.nameLower.IndexOf(last, StringComparison.Ordinal) < 0) continue;
+                if (rec.nameLower == null || rec.nameLower.IndexOf(last, StringComparison.Ordinal) < 0 || rec.go == null) continue;
                 sb.Append(n == 0 ? "; similar: " : ", ").Append(rec.path);
                 if (++n >= 6) break;
             }
@@ -504,6 +746,22 @@ namespace InsideDev
             return tr.position + tr.rotation * rb.centerOfMass;
         }
 
+        // Centre of a collider. In replay the box, sphere and capsule centres come from the replayed transform (the same
+        // point as the bounds centre, without waiting for a physics step that a frozen game never runs).
+        static Vector3 ColliderCentre(Collider col, bool replaying)
+        {
+            if (replaying)
+            {
+                var box = col as BoxCollider;
+                if (box != null) return box.transform.TransformPoint(box.center);
+                var sph = col as SphereCollider;
+                if (sph != null) return sph.transform.TransformPoint(sph.center);
+                var cap = col as CapsuleCollider;
+                if (cap != null) return cap.transform.TransformPoint(cap.center);
+            }
+            return col.bounds.center;
+        }
+
         static string Who(Character ch) { return ch is Huddle ? "huddle" : ch is Boy ? "boy" : ""; }
 
         static int ReplayId(Transform t, out SceneReplayer rp)
@@ -568,6 +826,10 @@ namespace InsideDev
             public TargetRef r;
             public int session, stamp = -1;
             public bool ok, retryable = true;
+            public bool wanted;            // sampled by somebody since Lean(true)
+            public bool lostSaid;          // the log already says that its object is gone
+            public bool usesSnapshot;      // resolved through the object database: a new try needs a new snapshot
+            public bool findsMembers;      // a find group: a new snapshot can add members
             public string error = "";
             public string resolvedText = "";
             public TargetSample sample;
@@ -703,8 +965,8 @@ namespace InsideDev
 
         sealed class CharEntry : Entry
         {
-            static readonly string[] BoyPoints = { "", "torso", "head", "neck", "root", "pos3", "pivot", "bounds", "top", "bottom", "probe" };
-            static readonly string[] HuddlePoints = { "", "visual", "centre", "center", "pos3", "pivot", "bounds", "top", "bottom", "probe" };
+            internal static readonly string[] BoyPoints = { "", "torso", "head", "neck", "root", "pos3", "pivot", "bounds", "top", "bottom", "probe" };
+            internal static readonly string[] HuddlePoints = { "", "visual", "centre", "center", "pos3", "pivot", "bounds", "top", "bottom", "probe" };
             string kind, point, bone;
             Actor boneActor; int boneIndex = -1; Transform boneTransform; UnityEngine.Object boneOwner;
 
@@ -804,7 +1066,7 @@ namespace InsideDev
                 string p = point;
                 if (p == "pos3" || p == "centre" || p == "center") { s.pos = pos3; return true; }
                 if (p == "pivot") { s.pos = ch.transform.position; return true; }
-                if (p == "probe") return Probe(c, ref s);
+                if (p == "probe") { hasVel = false; return Probe(c, ref s); }
                 if (p == "bounds" && hb) { s.pos = b.center; return true; }
                 if (p == "top" && hb) { s.pos = new Vector3(b.center.x, b.max.y, b.center.z); return true; }
                 if (p == "bottom" && hb) { s.pos = new Vector3(b.center.x, b.min.y, b.center.z); return true; }
@@ -928,7 +1190,7 @@ namespace InsideDev
 
         sealed class ObjectEntry : Entry
         {
-            static readonly string[] Points = { "", "pivot", "bounds", "com", "rb", "collider", "top", "bottom" };
+            internal static readonly string[] Points = { "", "pivot", "bounds", "com", "rb", "collider", "top", "bottom" };
             GameObject go;
             Component comp;
             Rigidbody rb;
@@ -942,6 +1204,7 @@ namespace InsideDev
 
             public override bool Bind(SpecReport report, bool snapshotOnly)
             {
+                usesSnapshot = true;
                 point = (r.point ?? "").Trim();
                 string boneName = point.StartsWith("bone:", StringComparison.Ordinal) ? point.Substring(5).Trim() : null;
                 if (boneName == null && Array.IndexOf(Points, point) < 0) { retryable = false; return Fail(report, "unknown object point '" + point + "' (pivot, bounds, com, rb, collider, top, bottom, bone:<child>)"); }
@@ -990,7 +1253,7 @@ namespace InsideDev
                 else if (point == "bottom") s.pos = hb ? new Vector3(b.center.x, b.min.y, b.center.z) : go.transform.position;
                 else if (point == "com" || (point.Length == 0 && rb != null)) s.pos = replaying ? TransformCom(rb) : rb.worldCenterOfMass;
                 else if (point == "rb") s.pos = replaying ? rb.transform.position : rb.position;
-                else if (point == "collider") s.pos = col != null ? col.bounds.center : go.transform.position;
+                else if (point == "collider") s.pos = col != null ? ColliderCentre(col, replaying) : go.transform.position;
                 else s.pos = go.transform.position;
                 if (replaying)
                 {
@@ -1016,9 +1279,10 @@ namespace InsideDev
                 public Component comp, deadOwner;
                 public FieldInfo dead;
                 public Rigidbody rb;
+                public Collider col;
                 public List<Renderer> rends;
                 public Entry entry;
-                public bool inGroup, seen, hasB;
+                public bool inGroup, seen, hasB, colKnown;
                 public double lastPass = -1e9;
                 public Vector3 pos, vel;
                 public Bounds b;
@@ -1039,9 +1303,11 @@ namespace InsideDev
             readonly List<Member> fixedMembers = new List<Member>();
             readonly List<Member> selected = new List<Member>();
             public bool passDirty;
-            bool searchDirty = true;
+            bool searchDirty = true, searched;
             float searchAt = -100f;
             bool init;
+
+            public int MemberCount { get { return fixedMembers.Count > 0 ? fixedMembers.Count : members.Count; } }
             Vector3 curPos, velPos, curExt, velExt;
             double lastT;
 
@@ -1052,6 +1318,9 @@ namespace InsideDev
                 resultPoint = (r.point ?? "").Trim();
                 nearRef = g.filter != null ? g.filter.near : null;
                 members.Clear(); fixedMembers.Clear(); init = false;
+                searched = false;
+                findsMembers = g.find.Length > 0;
+                usesSnapshot = g.find.Length > 0 || g.list.Length > 0;
                 int sources = (g.of.Count > 0 ? 1 : 0) + (g.find.Length > 0 ? 1 : 0) + (g.list.Length > 0 ? 1 : 0);
                 if (sources != 1) { retryable = false; return Fail(report, "group needs exactly one of 'of', 'find', 'list'"); }
                 string[] modes = { "centroid", "weighted", "bounds", "nearest", "fastest" };
@@ -1136,7 +1405,8 @@ namespace InsideDev
                 passDirty = false;
                 searchAt = Time.realtimeSinceStartup;
                 foreach (var m in members.Values) m.seen = false;
-                int n = 0;
+                int n = 0, had = members.Count, added = 0;
+                StringBuilder who = null;
                 foreach (var rec in ObjectDatabase.Search(searchQuery, 1024))
                 {
                     if (rec.go == null) continue;
@@ -1146,18 +1416,32 @@ namespace InsideDev
                         c = FindComponent(rec.go, typeName);
                         if (c == null) continue;
                     }
-                    Touch(rec.go, c);
+                    if (Touch(rec.go, c) && searched)
+                    {
+                        if (who == null) who = new StringBuilder();
+                        if (added < 6) who.Append(added == 0 ? "" : ", ").Append(rec.path);
+                        added++;
+                    }
                     n++;
                 }
                 Prune();
+                if (searched && (added > 0 || members.Count != had + added))
+                {
+                    joined += added;
+                    if (ctx != null) ctx.Log("target " + text + ": " + members.Count.ToString(IC) + " member(s) after a new object pass (" + added.ToString(IC) + " joined" + (added > 0 ? ": " + who + (added > 6 ? ", ..." : "") : "") +
+                                             ", " + (had + added - members.Count).ToString(IC) + " gone)");
+                }
+                searched = true;
                 return n;
             }
 
-            void Touch(GameObject go, Component c)
+            // true = a new member
+            bool Touch(GameObject go, Component c)
             {
                 int id = go.GetInstanceID();
                 Member m;
-                if (!members.TryGetValue(id, out m))
+                bool isNew = !members.TryGetValue(id, out m);
+                if (isNew)
                 {
                     m = new Member { go = go, comp = c };
                     m.rb = c as Rigidbody;
@@ -1171,6 +1455,7 @@ namespace InsideDev
                     members[id] = m;
                 }
                 m.seen = true;
+                return isNew;
             }
 
             void Prune()
@@ -1220,7 +1505,11 @@ namespace InsideDev
                 else if (memberPoint == "bottom") m.pos = m.hasB ? new Vector3(b.center.x, b.min.y, b.center.z) : tr.position;
                 else if (memberPoint == "com" && m.rb != null) m.pos = replaying ? TransformCom(m.rb) : m.rb.worldCenterOfMass;
                 else if (memberPoint == "rb" && m.rb != null) m.pos = replaying ? m.rb.transform.position : m.rb.position;
-                else if (memberPoint == "collider") { var col = m.comp as Collider ?? m.go.GetComponent<Collider>(); m.pos = col != null ? col.bounds.center : tr.position; }
+                else if (memberPoint == "collider")
+                {
+                    if (!m.colKnown) { m.col = m.comp as Collider ?? m.go.GetComponent<Collider>(); m.colKnown = true; }
+                    m.pos = m.col != null ? ColliderCentre(m.col, replaying) : tr.position;
+                }
                 else m.pos = tr.position;
                 bool given = !replaying && m.rb != null && !m.rb.isKinematic;
                 m.vel = m.fd.Step(m.pos, t, given ? m.rb.velocity : m.vel, given, false);
@@ -1258,7 +1547,7 @@ namespace InsideDev
             {
                 hasVel = true;
                 double t = Now(c);
-                if (g.find.Length > 0 && (Replaying ? searchDirty : (searchDirty || passDirty) && Time.realtimeSinceStartup - searchAt >= 1f)) Search();
+                if (g.find.Length > 0 && (searchDirty || passDirty) && (Replaying || Time.realtimeSinceStartup - searchAt >= 1f)) Search();
                 if (g.list.Length > 0) ReadList();
                 TargetSample ns = default(TargetSample);
                 bool nearOk = nearRef != null && MultiCamTargets.Sample(nearRef, out ns);

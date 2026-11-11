@@ -49,19 +49,41 @@ namespace InsideDev
         static readonly Dictionary<Type, List<Setting>> cache = new Dictionary<Type, List<Setting>>();
         static int appliedCam; static float nextCheck;
         static readonly System.Globalization.CultureInfo IC = System.Globalization.CultureInfo.InvariantCulture;
+        static readonly Dictionary<Type, bool> effectTypes = new Dictionary<Type, bool>();
+        static List<Behaviour> effects = new List<Behaviour>();
+        static int effectsCam; static float effectsAt = -100f;
+        static bool described;
 
+        // The post effects on a camera. The list is kept for one second per camera (the settings panel asks every frame)
+        // and is shared: callers read it and do not change it.
         public static List<Behaviour> Effects(Camera c)
         {
+            if (c == null) return new List<Behaviour>();
+            int id = c.GetInstanceID();
+            float now = Time.realtimeSinceStartup;
+            if (id == effectsCam && now - effectsAt < 1f && now >= effectsAt)
+            {
+                bool alive = true;
+                for (int i = 0; i < effects.Count; i++) if (effects[i] == null) { alive = false; break; }
+                if (alive) return effects;
+            }
             var l = new List<Behaviour>();
-            if (c == null) return l;
             foreach (var b in c.GetComponents<Behaviour>())
             {
                 if (b == null || b is Camera) continue;
-                var t = b.GetType();
-                if (t.Name.StartsWith("D11") || t.Name.StartsWith("PD") || t.GetMethod("OnRenderImage", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic) != null)
-                    l.Add(b);
+                if (IsEffect(b.GetType())) l.Add(b);
             }
+            effects = l; effectsCam = id; effectsAt = now;
             return l;
+        }
+
+        static bool IsEffect(Type t)
+        {
+            bool yes;
+            if (effectTypes.TryGetValue(t, out yes)) return yes;
+            yes = t.Name.StartsWith("D11") || t.Name.StartsWith("PD") || t.GetMethod("OnRenderImage", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic) != null;
+            effectTypes[t] = yes;
+            return yes;
         }
 
         static bool Editable(Type t) { return t == typeof(float) || t == typeof(int) || t == typeof(bool); }
@@ -107,7 +129,7 @@ namespace InsideDev
             EditorState.Set(Key(b, s.name), Text(v));
             return b.GetType().Name + "." + s.name + " = " + Text(v);
         }
-        public static string Text(object v) { return v is float ? ((float)v).ToString("0.####", IC) : v is bool ? ((bool)v ? "1" : "0") : v == null ? "null" : v.ToString(); }
+        public static string Text(object v) { return v is float ? ((float)v).ToString("0.####", IC) : v is bool ? ((bool)v ? "1" : "0") : v is int ? ((int)v).ToString(IC) : v == null ? "null" : v.ToString(); }
 
         public static bool IsChanged(Behaviour b, string s) { return EditorState.Get(Key(b, s), (string)null) != null; }
 
@@ -124,6 +146,11 @@ namespace InsideDev
         {
             if (Time.realtimeSinceStartup < nextCheck) return;
             nextCheck = Time.realtimeSinceStartup + 1f;
+            if (!described)
+            {
+                described = true;
+                EditorState.Describe("postfx", "postfx.<Type>.<setting>", "", "a changed setting of a post effect on the gameplay camera (postfx set, Settings > Rendering), re-applied to every new camera; postfx.<Type>.(enabled) is 1 or 0");
+            }
             var c = G.Cam(); if (c == null) return;
             if (c.GetInstanceID() == appliedCam) return;
             appliedCam = c.GetInstanceID();
@@ -139,11 +166,41 @@ namespace InsideDev
 
         public static Setting Find(Behaviour b, string name) { foreach (var s in Settings(b)) if (s.name.Equals(name, StringComparison.OrdinalIgnoreCase)) return s; return null; }
 
+        // The report as one line of JSON ("postfx json"): numbers as numbers, the settings of every effect by name.
+        public static string ReportJson()
+        {
+            var c = G.Cam();
+            if (c == null) return JsonLine.Obj("ok", false, "error", "no gameplay camera");
+            var o = new Json.Obj();
+            o["ok"] = true; o["camera"] = c.name; o["depth"] = c.depth; o["hdr"] = c.hdr;
+            o["target"] = c.targetTexture != null ? c.targetTexture.name : "screen";
+            o["screen"] = new List<object> { Screen.width, Screen.height };
+            var fx = new List<object>();
+            foreach (var b in Effects(c))
+            {
+                var e = new Json.Obj();
+                e["type"] = b.GetType().Name; e["enabled"] = b.enabled;
+                var values = new Json.Obj();
+                var changed = new List<object>();
+                foreach (var s in Settings(b))
+                {
+                    object v = null;
+                    try { v = s.Get(b); } catch { }
+                    values[s.name] = v;
+                    if (IsChanged(b, s.name)) changed.Add(s.name);
+                }
+                e["settings"] = values; e["changed"] = changed;
+                fx.Add(e);
+            }
+            o["effects"] = fx;
+            return JsonLine.Write(o);
+        }
+
         public static string Report()
         {
             var c = G.Cam(); if (c == null) return "no gameplay camera";
             var d = Display.main;
-            var sb = new System.Text.StringBuilder("gameplay camera " + c.name + "  depth " + c.depth + "  hdr " + c.hdr + "  target " + (c.targetTexture != null ? c.targetTexture.name : "screen") + "   display system " + d.systemWidth + "x" + d.systemHeight + " rendering " + d.renderingWidth + "x" + d.renderingHeight + "  screen " + Screen.width + "x" + Screen.height + "\n");
+            var sb = new System.Text.StringBuilder("gameplay camera " + c.name + "  depth " + Fmt.F(c.depth, "0.##") + "  hdr " + c.hdr + "  target " + (c.targetTexture != null ? c.targetTexture.name : "screen") + "   display system " + Fmt.I(d.systemWidth) + "x" + Fmt.I(d.systemHeight) + " rendering " + Fmt.I(d.renderingWidth) + "x" + Fmt.I(d.renderingHeight) + "  screen " + Fmt.I(Screen.width) + "x" + Fmt.I(Screen.height) + "\n");
             foreach (var b in Effects(c))
             {
                 sb.Append("  ").Append(b.enabled ? "[on]  " : "[off] ").Append(b.GetType().FullName).Append('\n');
@@ -152,7 +209,7 @@ namespace InsideDev
             sb.Append("all components on the camera: ");
             foreach (var x in c.GetComponents<Component>()) sb.Append(x.GetType().Name).Append(", ");
             sb.Append("\nall cameras:\n");
-            foreach (var x in Camera.allCameras) sb.Append("  ").Append(x.name).Append("  depth ").Append(x.depth).Append("  target ").Append(x.targetTexture != null ? x.targetTexture.name : "screen").Append('\n');
+            foreach (var x in Camera.allCameras) sb.Append("  ").Append(x.name).Append("  depth ").Append(Fmt.F(x.depth, "0.##")).Append("  target ").Append(x.targetTexture != null ? x.targetTexture.name : "screen").Append('\n');
             return sb.ToString();
         }
     }

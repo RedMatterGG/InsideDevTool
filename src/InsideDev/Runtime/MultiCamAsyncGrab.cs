@@ -17,9 +17,14 @@ namespace InsideDev
     // frames, in grab order, to the frame writers (ffmpeg pipes) which free them after writing. Frames are top row first
     // (no vflip) in the back buffer's byte order (rgba or bgra). output.readback "auto" falls back to MultiCamGrab
     // (ReadPixels on the game thread) when the plugin is missing or does not find the swap chain.
+    // The plugin has one session. Whoever opens it takes Owners.Readback first ("mcam", "readback test" here, "grec" in the
+    // Play module) and gives it back when the session is closed, so a second opener gets a refusal that names the holder
+    // instead of taking the session away from under the first one.
     internal static class ReadbackNative
     {
         public const int Event = 0x52420000, OpGrab = 1, OpFlush = 2, OpProbe = 3;
+        public const int InfoCpuBytes = 0, InfoStagingBytes = 1, InfoState = 2;
+        public const int StateOpen = 1, StateFrameHeld = 2, StateHooked = 4, StateReleasePending = 8;
 
         [StructLayout(LayoutKind.Sequential)]
         public struct Stat
@@ -33,7 +38,7 @@ namespace InsideDev
 
             public string Text()
             {
-                return "device type " + deviceType + " (2 = D3D11), device " + hasDevice + ", device calls " + deviceCalls + " (last event " + lastDeviceEvent + "), render events " + calls + " (last 0x" + lastEvent.ToString("X8") + "), probes " + probes + ", grabs " + grabs + ", flushes " + flushes + ", frames " + frames + ", produced " + produced + ", taken " + taken + ", released " + released + ", dropped " + dropped + ", pending " + pending + ", source " + source + ", " + width + "x" + height + " DXGI " + dxgiFormat + ", render thread " + renderThread + ", errors " + errors + " (last: " + ErrorText(lastError) + "), session " + session + ", ignored " + ignored + ", hooks " + hooked + " (OMSetRenderTargets checks " + hookCalls + "), marker hits " + markerHits + ", queued " + queued + " (depth " + queueDepth + ")";
+                return "device type " + deviceType + " (2 = D3D11), device " + hasDevice + ", device calls " + deviceCalls + " (last event " + lastDeviceEvent + "), render events " + calls + " (last 0x" + lastEvent.ToString("X8", CultureInfo.InvariantCulture) + "), probes " + probes + ", grabs " + grabs + ", flushes " + flushes + ", frames " + frames + ", produced " + produced + ", taken " + taken + ", released " + released + ", dropped " + dropped + ", pending " + pending + ", source " + source + ", " + width + "x" + height + " DXGI " + dxgiFormat + ", render thread " + renderThread + ", errors " + errors + " (last: " + ErrorText(lastError) + "), session " + session + ", ignored " + ignored + ", hooks " + hooked + " (OMSetRenderTargets checks " + hookCalls + "), marker hits " + markerHits + ", queued " + queued + " (depth " + queueDepth + ")";
             }
         }
 
@@ -54,6 +59,11 @@ namespace InsideDev
         [DllImport("InsideReadback")] public static extern int rb_stat_get(ref Stat s);
         [DllImport("InsideReadback")] public static extern int rb_push(int eventID);
         [DllImport("InsideReadback")] public static extern void rb_set_marker(IntPtr tex, IntPtr tex2);
+        [DllImport("InsideReadback")] static extern long rb_info(int what);
+
+        // rb_version of the loaded plugin; 0 until Unavailable() has answered null once (nothing here loads the plugin
+        // before somebody asks for it)
+        public static int Version;
 
         static readonly string[] Errors = { "none", "no D3D11 device", "no render target bound", "bound target is not the swap chain", "unsupported back buffer format", "staging texture creation failed", "Map failed", "no free CPU frame (writer too slow)", "out of memory", "closed", "Map timed out (GPU copy not finished in 2 s)" };
 
@@ -69,9 +79,24 @@ namespace InsideDev
 
         public static Stat Get() { var s = new Stat(); rb_stat_get(ref s); return s; }
 
+        // InfoCpuBytes / InfoStagingBytes / InfoState of the plugin; -1 when the installed plugin is older than version 2.
+        public static long Info(int what)
+        {
+            if (Version < 2) return -1;
+            try { return rb_info(what); } catch { return -1; }
+        }
+
+        // Why rb_open answered 0 although Owners.Readback was free.
+        public static string BusyText()
+        {
+            long st = Info(InfoState);
+            if (st >= 0 && (st & StateOpen) != 0) return "InsideReadback busy: a session is open that no owner registered (stop the recording that uses it; 'mcam readback free force' closes a session that was left behind)";
+            return "InsideReadback busy: CPU frames are still held by a writer";
+        }
+
         public static string Unavailable()
         {
-            try { int v = rb_version(); return v >= 1 ? null : "InsideReadback version " + v; }
+            try { int v = rb_version(); if (v >= 1) Version = v; return v >= 1 ? null : "InsideReadback version " + v; }
             catch (DllNotFoundException) { return "INSIDE_Data/Plugins/InsideReadback.dll is not installed"; }
             catch (EntryPointNotFoundException e) { return "InsideReadback: " + e.Message; }
             catch (Exception e) { return "InsideReadback: " + e.GetType().Name + ": " + e.Message; }
@@ -82,6 +107,11 @@ namespace InsideDev
     {
         static readonly CultureInfo IC = CultureInfo.InvariantCulture;
         public const int Stages = 4, Lag = 2, CpuFrames = 6;
+        public const string OwnerMcam = "mcam", OwnerTest = "readback test";
+
+        // the object whose native session is open (main thread)
+        static MultiCamAsyncGrab current;
+        string owner;
 
         sealed class Target { public MultiCamFrameWriter w; public string path; public int tag; public byte[] capture; public bool discard; public bool done; }
 
@@ -103,13 +133,22 @@ namespace InsideDev
         public int Issued { get { return issued; } }
         public int Delivered { get { lock (gate) return delivered; } }
 
-        public IEnumerator Open(int expectW, int expectH)
+        public IEnumerator Open(int expectW, int expectH) { return Open(expectW, expectH, OwnerMcam); }
+
+        // who = the Owners.Readback name of the caller. Open takes it and Close gives it back; a refusal names the holder.
+        public IEnumerator Open(int expectW, int expectH, string who)
         {
             ready = false;
             string why = ReadbackNative.Unavailable();
             if (why != null) { error = why; yield break; }
+            // an Open of the same owner that was dropped half way (a run aborted during the probe frames) still holds the session
+            if (current != null && current != this && current.owner == who) current.Close();
+            string holder;
+            if (!Owners.TryTake(Owners.Readback, who, out holder)) { error = "InsideReadback busy: held by " + holder + (holder == "grec" ? " (grec stop first)" : holder == OwnerMcam ? " (an mcam run)" : ""); yield break; }
+            owner = who;
             session = ReadbackNative.rb_open(Stages, Lag, CpuFrames);
-            if (session == 0) { error = "InsideReadback busy: CPU frames are still held by a writer"; yield break; }
+            if (session == 0) { error = ReadbackNative.BusyText(); Owners.Release(Owners.Readback, who); owner = null; yield break; }
+            current = this;
             marker = NewMarker();
             marker2 = NewMarker();
             IntPtr mp = marker.GetNativeTexturePtr(), mp2 = marker2.GetNativeTexturePtr();
@@ -200,12 +239,17 @@ namespace InsideDev
                     if (error == null) error = "readback frame " + f.seq + " without a grab";
                     continue;
                 }
-                if ((f.tag & 0xFFF) != t.tag && error == null) error = "readback order: frame tag " + (f.tag & 0xFFF) + ", expected " + t.tag;
                 if (f.error != 0 || f.data == IntPtr.Zero)
                 {
                     if (f.slot >= 0) ReadbackNative.rb_release(f.slot);
                     Interlocked.Increment(ref dropped);
                     if (error == null) error = "readback frame " + f.seq + ": " + ReadbackNative.ErrorText(f.error);
+                }
+                else if ((f.tag & 0xFFF) != t.tag)
+                {
+                    ReadbackNative.rb_release(f.slot);
+                    Interlocked.Increment(ref dropped);
+                    if (error == null) error = "readback order: frame tag " + (f.tag & 0xFFF) + ", expected " + t.tag;
                 }
                 else if (t.capture != null || t.discard)
                 {
@@ -217,23 +261,49 @@ namespace InsideDev
             }
         }
 
+        // Main thread. Safe on an object that never opened and safe to call twice: the native session, the markers and
+        // Owners.Readback are touched only by the object that holds them.
         public void Close()
         {
+            bool had = session != 0;
+            session = 0;
             stopping = true;
-            try { ReadbackNative.rb_close(); } catch { }
+            if (had) { try { ReadbackNative.rb_close(); } catch { } }
             if (pump != null && !pump.Join(5000) && error == null) error = "readback pump did not stop";
             pump = null;
-            try
+            if (had)
             {
-                var f = new ReadbackNative.Frame();
-                while (ReadbackNative.rb_take(0, ref f) == 1) if (f.slot >= 0) ReadbackNative.rb_release(f.slot);
+                try
+                {
+                    var f = new ReadbackNative.Frame();
+                    while (ReadbackNative.rb_take(0, ref f) == 1) if (f.slot >= 0) ReadbackNative.rb_release(f.slot);
+                }
+                catch { }
+                try { ReadbackNative.rb_set_marker(IntPtr.Zero, IntPtr.Zero); } catch { }
+                // frames a writer is still sending stay; FreeBuffers after the writers have closed takes the rest
+                try { ReadbackNative.rb_free_buffers(); } catch { }
             }
-            catch { }
             lock (gate) fifo.Clear();
-            try { ReadbackNative.rb_set_marker(IntPtr.Zero, IntPtr.Zero); } catch { }
             if (marker != null) { marker.Release(); UnityEngine.Object.Destroy(marker); marker = null; }
             if (marker2 != null) { marker2.Release(); UnityEngine.Object.Destroy(marker2); marker2 = null; }
             ready = false;
+            if (current == this) current = null;
+            if (owner != null) { Owners.Release(Owners.Readback, owner); owner = null; }
+        }
+
+        // Main thread. Closes the session of an Open that its caller lost (the run ended while Open was still probing).
+        public static void CloseOrphan(string who)
+        {
+            var c = current;
+            if (c != null && c.owner == who) c.Close();
+        }
+
+        // Main thread. Gives the plugin's CPU frames back to the system when nobody holds the plugin. Does nothing when
+        // the plugin was never used in this process.
+        public static void FreeBuffers()
+        {
+            if (ReadbackNative.Version < 1 || Owners.Holder(Owners.Readback) != null) return;
+            try { ReadbackNative.rb_free_buffers(); } catch { }
         }
 
         public Json.Obj StatsJson()
@@ -281,17 +351,25 @@ namespace InsideDev
         public static string result = "not run";
         public static bool running;
         const int Frames = 120;
+        const string Usage = "usage: mcam readback test | status [json] | stat [json] | free [force]";
         int vsync0, target0;
-        bool fcAuto0, paced;
+        bool fcAuto0, paced, finished;
+        MultiCamAsyncGrab grab;
+        Texture2D tex;
+        MultiCamGrab raw, jpg;
 
         public static string Command(List<string> a)
         {
             string s = a.Count > 2 ? a[2].ToLowerInvariant() : "status";
-            if (s == "status") return (running ? "running: " : "") + result;
-            if (s == "stat") { string why = ReadbackNative.Unavailable(); return why ?? ReadbackNative.Get().Text(); }
-            if (s != "test") return "usage: mcam readback test|status|stat";
+            bool json = a.Count > 3 && a[a.Count - 1].ToLowerInvariant() == "json";
+            if (s == "status") return json ? JsonLine.Obj("running", running, "result", result, "holder", Owners.Holder(Owners.Readback) ?? "") : (running ? "running: " : "") + result;
+            if (s == "stat") return Stat(json);
+            if (s == "free") return Free(a.Count > 3 && a[3].ToLowerInvariant() == "force");
+            if (s != "test") return Usage;
             if (running) return "readback test already running";
             if (MultiCam.Running) return "mcam is capturing; run the readback test when it is idle";
+            string held = Owners.Holder(Owners.Readback);
+            if (held != null) return "busy: the readback plugin is held by " + held;
             var go = new GameObject("InsideDev ReadbackTest");
             DontDestroyOnLoad(go);
             go.AddComponent<MultiCamReadbackTest>();
@@ -300,18 +378,111 @@ namespace InsideDev
             return "readback test started (about " + (Frames * 4 / 60 + 4) + " s); poll 'mcam readback status'";
         }
 
-        void Start() { StartCoroutine(Run()); }
+        static double Mb(long bytes) { return bytes < 0 ? -1.0 : Math.Round(bytes / 1048576.0, 1); }
+
+        static string Stat(bool json)
+        {
+            string why = ReadbackNative.Unavailable();
+            string holder = Owners.Holder(Owners.Readback) ?? "";
+            if (why != null) return json ? JsonLine.Obj("installed", false, "reason", why, "holder", holder) : why;
+            var s = ReadbackNative.Get();
+            long cpu = ReadbackNative.Info(ReadbackNative.InfoCpuBytes), staging = ReadbackNative.Info(ReadbackNative.InfoStagingBytes), state = ReadbackNative.Info(ReadbackNative.InfoState);
+            if (!json)
+                return s.Text() + ", plugin version " + Fmt.I(s.version) + ", holder " + (holder.Length > 0 ? holder : "none") +
+                       (state >= 0 ? ", session " + ((state & ReadbackNative.StateOpen) != 0 ? "open" : "closed") + ", memory held: CPU frames " + Fmt.F(Mb(cpu), "0.#") + " MB, staging textures " + Fmt.F(Mb(staging), "0.#") + " MB" : "");
+            var o = new Json.Obj();
+            o["installed"] = true; o["version"] = s.version; o["holder"] = holder;
+            o["open"] = state >= 0 ? (object)((state & ReadbackNative.StateOpen) != 0) : null;
+            o["frame_held"] = state >= 0 ? (object)((state & ReadbackNative.StateFrameHeld) != 0) : null;
+            o["hooked"] = s.hooked != 0;
+            o["cpu_mb"] = cpu >= 0 ? (object)Mb(cpu) : null; o["staging_mb"] = staging >= 0 ? (object)Mb(staging) : null;
+            o["device"] = s.hasDevice != 0; o["source"] = s.source; o["width"] = s.width; o["height"] = s.height; o["dxgi_format"] = s.dxgiFormat;
+            o["session"] = s.session; o["grabs"] = s.grabs; o["frames"] = s.frames; o["produced"] = s.produced; o["taken"] = s.taken; o["released"] = s.released;
+            o["dropped"] = s.dropped; o["errors"] = s.errors; o["last_error"] = ReadbackNative.ErrorText(s.lastError); o["pending"] = s.pending;
+            o["ignored_events"] = s.ignored; o["marker_hits"] = s.markerHits; o["hook_calls"] = s.hookCalls; o["queue_depth"] = s.queueDepth;
+            return JsonLine.Write(o);
+        }
+
+        // Gives the memory of the plugin back between runs. With `force` it also closes a native session that no owner
+        // registered (left open by a recorder that died).
+        static string Free(bool force)
+        {
+            string why = ReadbackNative.Unavailable();
+            if (why != null) return "cannot free: " + why;
+            string holder = Owners.Holder(Owners.Readback);
+            if (holder != null) return "busy: the readback plugin is held by " + holder + " (nothing freed)";
+            long state = ReadbackNative.Info(ReadbackNative.InfoState), before = ReadbackNative.Info(ReadbackNative.InfoCpuBytes);
+            string closed = "";
+            if (state >= 0 && (state & ReadbackNative.StateOpen) != 0)
+            {
+                if (!force) return "busy: a native readback session is open that no owner registered (stop the recording that uses it; 'mcam readback free force' closes a session that was left behind)";
+                try
+                {
+                    ReadbackNative.rb_close();
+                    var f = new ReadbackNative.Frame();
+                    while (ReadbackNative.rb_take(0, ref f) == 1) if (f.slot >= 0) ReadbackNative.rb_release(f.slot);
+                    ReadbackNative.rb_set_marker(IntPtr.Zero, IntPtr.Zero);
+                }
+                catch (Exception e) { return "failed: " + e.GetType().Name + ": " + e.Message; }
+                closed = "the open session was closed; ";
+            }
+            try { ReadbackNative.rb_free_buffers(); } catch (Exception e) { return "failed: " + e.GetType().Name + ": " + e.Message; }
+            long after = ReadbackNative.Info(ReadbackNative.InfoCpuBytes), staging = ReadbackNative.Info(ReadbackNative.InfoStagingBytes);
+            if (before < 0) return "readback: " + closed + "CPU frames freed";
+            return "readback: " + closed + "CPU frames " + Fmt.F(Mb(before), "0.#") + " -> " + Fmt.F(Mb(after), "0.#") + " MB, staging textures " + Fmt.F(Mb(staging), "0.#") +
+                   " MB (the render thread releases them at its first frame after a session is closed)";
+        }
+
+        void Start() { StartCoroutine(Drive()); }
+
+        // Run and the enumerators it yields, on one stack: an exception anywhere in them ends in Finish, which closes the
+        // plugin and puts vsync back.
+        IEnumerator Drive()
+        {
+            var stack = new Stack<IEnumerator>();
+            stack.Push(Run());
+            while (stack.Count > 0)
+            {
+                object cur = null;
+                bool moved;
+                try
+                {
+                    moved = stack.Peek().MoveNext();
+                    if (moved) cur = stack.Peek().Current;
+                }
+                catch (Exception e)
+                {
+                    DevLog.Error("mcam readback test", e);
+                    Finish("FAIL: " + e.GetType().Name + ": " + e.Message);
+                    yield break;
+                }
+                if (!moved) { stack.Pop(); continue; }
+                var nested = cur as IEnumerator;
+                if (nested != null) { stack.Push(nested); continue; }
+                yield return cur;
+            }
+            if (!finished) Finish("FAIL: the test ended without a result");
+        }
+
+        void OnDestroy()
+        {
+            if (finished) return;
+            finished = true;
+            Cleanup();
+            result = "FAIL: the test object was destroyed before the test ended";
+            running = false;
+        }
 
         IEnumerator Run()
         {
             var sb = new StringBuilder();
             var eof = new WaitForEndOfFrame();
-            var grab = new MultiCamAsyncGrab();
+            grab = new MultiCamAsyncGrab();
             int sw = Screen.width, sh = Screen.height;
-            yield return StartCoroutine(grab.Open(sw, sh));
+            yield return grab.Open(sw, sh, MultiCamAsyncGrab.OwnerTest);
             if (!grab.ready) { Finish("FAIL open: " + grab.error); yield break; }
             sb.Append("plugin: back buffer ").Append(grab.w).Append('x').Append(grab.h).Append(' ').Append(grab.pixFmt).Append(" (DXGI ").Append(grab.dxgiFormat).Append("), render thread ").Append(ReadbackNative.Get().renderThread).Append(", game thread ").Append(Thread.CurrentThread.ManagedThreadId).Append(" (managed id)\n");
-            var tex = new Texture2D(sw, sh, TextureFormat.RGBA32, false);
+            tex = new Texture2D(sw, sh, TextureFormat.RGBA32, false);
             tex.hideFlags = HideFlags.HideAndDontSave;
             int worst = -1; long diffPx = 0;
             for (int k = 0; k < 3; k++)
@@ -322,7 +493,7 @@ namespace InsideDev
                 tex.ReadPixels(new Rect(0, 0, sw, sh), 0, 0, false);
                 RenderTexture.active = prev;
                 byte[] nat = grab.CaptureNext();
-                yield return StartCoroutine(grab.Drain(5f));
+                yield return grab.Drain(5f);
                 if (grab.error != null) break;
                 Color32[] px = tex.GetPixels32();
                 bool bgra = grab.pixFmt != "rgba";
@@ -342,6 +513,7 @@ namespace InsideDev
                 }
             }
             Destroy(tex);
+            tex = null;
             if (grab.error != null) { string stat = ReadbackNative.Get().Text(); grab.Close(); Finish(sb + "FAIL compare: " + grab.error + " | " + stat); yield break; }
             sb.Append("compare: 3 frame(s), max channel difference ").Append(worst).Append(", ").Append(diffPx).Append(" differing pixel(s) -> ").Append(worst == 0 ? "PASS (pixel exact)" : worst <= 2 ? "PASS (rounding)" : "FAIL").Append('\n');
             vsync0 = QualitySettings.vSyncCount; target0 = Application.targetFrameRate;
@@ -352,8 +524,8 @@ namespace InsideDev
             sb.Append("timing with vsync off, no frame limit\n");
             var times = new double[4];
             string[] names = { "no grab", "plugin", "ReadPixels+GetPixels32", "ReadPixels+EncodeToJPG" };
-            var raw = new MultiCamGrab(sw, sh, false, 95);
-            var jpg = new MultiCamGrab(sw, sh, true, 95);
+            raw = new MultiCamGrab(sw, sh, false, 95);
+            jpg = new MultiCamGrab(sw, sh, true, 95);
             for (int mode = 0; mode < 4; mode++)
             {
                 var ft = new List<double>();
@@ -368,15 +540,31 @@ namespace InsideDev
                     if (i >= 10) ft.Add((now - last) * 1000.0);
                     last = now;
                 }
-                if (mode == 1) yield return StartCoroutine(grab.Drain(5f));
+                if (mode == 1) yield return grab.Drain(5f);
                 ft.Sort();
                 times[mode] = ft[ft.Count / 2];
                 sb.Append(names[mode]).Append(": median frame ").Append(times[mode].ToString("0.0", IC)).Append(" ms (p90 ").Append(ft[ft.Count * 9 / 10].ToString("0.0", IC)).Append(" ms, ").Append((1000.0 / times[mode]).ToString("0", IC)).Append(" fps)\n");
             }
-            raw.Dispose(); jpg.Dispose();
             sb.Append(grab.StatsLine());
-            grab.Close();
             Finish(sb.ToString());
+        }
+
+        // Everything the test holds: the plugin session (and with it Owners.Readback), its textures, the vsync setting.
+        void Cleanup()
+        {
+            try { if (grab != null) grab.Close(); } catch (Exception e) { DevLog.Error("readback test close", e); }
+            grab = null;
+            try { if (tex != null) Destroy(tex); } catch { }
+            tex = null;
+            try { if (raw != null) raw.Dispose(); if (jpg != null) jpg.Dispose(); } catch { }
+            raw = null; jpg = null;
+            if (paced)
+            {
+                paced = false;
+                try { QualitySettings.vSyncCount = vsync0; Application.targetFrameRate = target0; } catch { }
+                try { FramerateController.SetVSyncCount(vsync0); FramerateController.automatic = fcAuto0; } catch { }
+            }
+            MultiCamAsyncGrab.FreeBuffers();
         }
 
         static void Dump(Color32[] unity, byte[] nat, int w, int h, bool bgra)
@@ -404,13 +592,9 @@ namespace InsideDev
 
         void Finish(string text)
         {
-            if (paced)
-            {
-                QualitySettings.vSyncCount = vsync0;
-                Application.targetFrameRate = target0;
-                try { FramerateController.SetVSyncCount(vsync0); FramerateController.automatic = fcAuto0; } catch { }
-                paced = false;
-            }
+            if (finished) return;
+            finished = true;
+            Cleanup();
             result = text;
             running = false;
             DevLog.Write("mcam readback test:\n" + text);

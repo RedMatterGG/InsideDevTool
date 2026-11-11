@@ -74,6 +74,7 @@ namespace InsideDev
         static Camera maskCam;
         static int maskBefore, maskOurs, layer = -1, cacheStream = -1;
         static string appliedKey = "";
+        static HideSet appliedSet;
         public static string owner = "";
         public static string layerNote = "";
         public static int restores;
@@ -82,7 +83,39 @@ namespace InsideDev
         public static bool Active { get { return applied.Count > 0 || cutApplied.Count > 0 || maskCam != null; } }
         public static string AppliedKey { get { return appliedKey; } }
 
-        public static void ClearCache() { cache.Clear(); cacheStream = -1; }
+        // Forgets the resolved sets and destroys the mesh copies that no MeshFilter shows right now. A set a caller still
+        // holds loses its cuts with this (they stop applying), so call it only between uses: at a replay begin, at a
+        // session end.
+        public static void ClearCache() { cache.Clear(); cacheStream = -1; FreeCuts(false); }
+
+        // Every cut and two-sided copy is a whole mesh instance (up to a 65k-vertex batch mesh) kept in a static table, which
+        // also keeps the level's own mesh alive. ownerGone: only the copies whose MeshFilter / SkinnedMeshRenderer was
+        // unloaded (nothing can show them again: a reloaded object is a new instance with a new id); else every copy that
+        // is not applied at this moment.
+        static void FreeCuts(bool ownerGone)
+        {
+            if (cutCache.Count == 0) return;
+            List<string> drop = null;
+            foreach (var kv in cutCache)
+            {
+                var c = kv.Value;
+                bool gone = c.filter == null && c.skin == null;
+                if (ownerGone && !gone) continue;
+                if (!gone && cutApplied.Contains(c)) continue;
+                if (drop == null) drop = new List<string>();
+                drop.Add(kv.Key);
+            }
+            if (drop == null) return;
+            foreach (var k in drop)
+            {
+                var c = cutCache[k];
+                cutCache.Remove(k);
+                cutApplied.Remove(c);
+                try { if (c.cut != null) UnityEngine.Object.Destroy(c.cut); } catch (Exception e) { DevLog.Error("mcam hide free", e); }
+                c.cut = null;
+                c.original = null;
+            }
+        }
 
         // `<path> box=x0,y0,z0,x1,y1,z1[;...]` -> the path and its world boxes (HideBoxes.Split); false for a plain path or a bad box.
         public static bool SplitBox(string name, out string path, out List<Vector3> mins, out List<Vector3> maxs, out string error)
@@ -104,7 +137,7 @@ namespace InsideDev
         // (backfaces) are merged into one copy with all their boxes.
         public static HideSet Resolve(List<string> names, string where, SpecReport report)
         {
-            if (cacheStream != Levels.StreamVersion) { cache.Clear(); cacheStream = Levels.StreamVersion; }
+            if (cacheStream != Levels.StreamVersion) { cache.Clear(); cacheStream = Levels.StreamVersion; FreeCuts(true); }
             string key = MultiCamShots.HideKey(names);
             HideSet set;
             if (cache.TryGetValue(key, out set)) return set;
@@ -372,11 +405,12 @@ namespace InsideDev
         }
 
         // Applies the set to the camera (restores the previous set first when it differs); the same set on the same camera only
-        // re-asserts the mask bit and the cut meshes.
+        // re-asserts the mask bit and the cut meshes. "The same" is the same object: after a stream change Resolve builds a
+        // new set for the same names (other renderers, new cuts), and that one has to be applied in full.
         public static void Apply(Camera cam, HideSet set, string who)
         {
             if (set == null || set.Empty || cam == null) { Restore(); return; }
-            if (Active && set.key == appliedKey && cam == maskCam)
+            if (Active && ReferenceEquals(set, appliedSet) && cam == maskCam)
             {
                 if (layer >= 0 && (cam.cullingMask & (1 << layer)) != 0) { cam.cullingMask &= ~(1 << layer); maskOurs = cam.cullingMask; }
                 foreach (var c in cutApplied) if (c.Alive && c.Current == c.original) c.Set(c.cut);
@@ -386,6 +420,7 @@ namespace InsideDev
             if (layer < 0) PickLayer();
             owner = who ?? "";
             appliedKey = set.key;
+            appliedSet = set;
             maskCam = cam;
             maskBefore = cam.cullingMask;
             cam.cullingMask = maskBefore & ~(1 << layer);
@@ -434,6 +469,7 @@ namespace InsideDev
             catch { }
             maskCam = null;
             appliedKey = "";
+            appliedSet = null;
             owner = "";
             restores++;
         }

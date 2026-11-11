@@ -40,6 +40,21 @@ namespace InsideDev
     // property blocks on change, all in preCullMain (after the frozen game writers of Update and LateUpdate), ApplyNow and
     // the final sample; pass isolation puts materials and blocks back to their Begin values (globals cannot be read back).
     // Shared-material swaps keep a live material whose name equals the recorded one.
+    // Level load: Begin remembers GameManager.LoadCount; preUpdate and lateWrite (and ApplyNow, End) compare it and ask
+    // GameManager.IsLoading. A load that started under a replay ends the replay at once (EndReason "level load"): flags the
+    // replay changed on objects that still live are put back, no recorded pose, final sample or camera state is written,
+    // CullingActive is left to the load and the time scale goes back to the game (RplXLoad.TimeToGame), because the load
+    // waits for a FixedUpdate that never comes at timeScale 0. Begin is refused while a load runs.
+    // What Begin changes and where End puts it back (every path: end, failed Begin, level load): time scale (time step);
+    // free camera (camera step; a free camera the user had before `srec load` is kept when the caller set KeepFreeCamera);
+    // AlwaysLoaded subscenes and CullingActive (streaming); culler valid flags, the UpdateBoundsCullers hook and the culler
+    // hold (cullers); disabled controllers, started ropes and CrowdDudes (neutralize); Rigidbody kinematic / interpolation
+    // (rigidbodies); paused particle systems (particles); ColorBlendProbe overrides (probes); activations with their
+    // switched-off behaviours (activations); Renderer.enabled, Light.enabled and Light.useStaticShadows of shadows
+    // "dynamic" (renderers, only when the Begin snapshot was taken); monitor handlers; the three SceneHooks handlers.
+    // Left at the recording's final sample by design (restore: final): transforms, particles, materials, shared materials,
+    // meshes, light values, fog, shader state.
+    // Dry run (Load with dry: true): reads and resolves only, writes no baseline file and changes nothing in the scene.
 #if !PLAY_B_MATH_ONLY
     public sealed partial class SceneReplayer : IReplaySource
     {
@@ -75,7 +90,7 @@ namespace InsideDev
 
         sealed class Rend
         {
-            public Obj x; public Renderer r; public int[] cullers; public bool begin, last, multi; public int slots; public int[] applied; public Material[] snap;
+            public Obj x; public Renderer r; public int[] cullers; public bool begin, last, multi, rec; public int slots; public int[] applied; public Material[] snap;
         }
 
         struct LightValues
@@ -85,7 +100,7 @@ namespace InsideDev
 
         sealed class Lite
         {
-            public Obj x; public Light l; public int[] cullers; public bool last, multi; public LightValues begin;
+            public Obj x; public Light l; public int[] cullers; public bool last, multi, rec; public LightValues begin;
         }
 
         sealed class Parts
@@ -141,9 +156,15 @@ namespace InsideDev
         SceneRecording rec;
         SceneRecorder sessionRec;
         RecordHeader header;
-        bool velocitiesFinal, sameSession, begun, ended, fullApply, hasLastRender, particlesOn = true, streamingPending, cullingSaved, cullingBefore, cameraTaken, timeSaved, holding, monitorOn, passOpen, cullersLive;
+        bool velocitiesFinal, sameSession, begun, ended, fullApply, hasLastRender, particlesOn = true, streamingPending, cullingSaved, cullingBefore, timeSaved, holding, monitorOn, passOpen, cullersLive;
+        bool touched, sceneGone, keepFree, freeBefore, freePose, freeKept, snapshotTaken, finalWrite, profile, dry;
         double t, req, lastRenderT, dur, realBase;
-        float timeBefore = 1f, gmBefore = 1f;
+        float timeBefore = 1f, gmBefore = 1f, freeFov;
+        Vector3 freePos;
+        Quaternion freeRot = Quaternion.identity;
+        string endReason = "", dryOver = "";
+        int loadCountAtBegin, endFrame = -1, appliedFrame = -1, restoreFailures, evalSample = int.MinValue, visSample = int.MinValue, dynamicCount;
+        readonly List<string> unresolvedNames = new List<string>();
         int idMismatch, frames, timeLeaks, pendingFrames, resolvedCount, unresolved, unresolvedSpawned, unresolvedStatic, ambiguous, destroyed, visConflicts, promoted, missingTex, missingMat, ropeErrors, particleErrors, quietDisabled, passIndex = -1;
         int monSignals, monSounds, monSoundsExcluded, monFsm, monFinished, monCullerSets, monSubscenes, camToggles, monLogged;
         readonly List<object> monHits = new List<object>();
@@ -181,7 +202,7 @@ namespace InsideDev
         Activation[] activeBy;
         bool[] cullerVis = new bool[0];
         int[] xfIds = new int[0], parA, stack;
-        bool[] selfA, aboveA, nodeA;
+        bool[] selfA, aboveA, nodeA, aliveA, recSelfA;
         sbyte[] aih;
         Dictionary<string, List<Transform>> rootsByName, byPath;
         FieldInfo[] fogFields = new FieldInfo[0];
@@ -206,6 +227,29 @@ namespace InsideDev
         public int sampleCount { get { return rec != null ? rec.sampleCount : 0; } }
 
         public double T { get { return req; } set { req = value; if (!active) t = value; } }
+
+        // The replay time the scene shows: T is latched in preUpdate (or by ApplyNow), AppliedFrame is the frame of the last
+        // preCull apply or ApplyNow (-1 = nothing applied yet).
+        public double AppliedT { get { return t; } }
+
+        public int AppliedFrame { get { return appliedFrame; } }
+
+        // "" while loaded or active; after End: "end", "level load" (a load replaced the scene: nothing recorded was written
+        // back), "begin failed" or "not begun". EndFrame is the Time.frameCount of End (-1 before).
+        public string EndReason { get { return endReason; } }
+
+        public int EndFrame { get { return endFrame; } }
+
+        public bool EndedByLoad { get { return sceneGone; } }
+
+        // Restore steps of End that threw (each is also a warning in the End report).
+        public int RestoreFailures { get { return restoreFailures; } }
+
+        // Set before Begin by a caller whose user may already fly the free camera (srec load): End then leaves the free camera
+        // on and puts it back at its pose from before Begin instead of handing the view to the game camera.
+        internal bool KeepFreeCamera { get { return keepFree; } set { keepFree = value; } }
+
+        internal bool SameSession { get { return sameSession; } }
 
         public double SampleTime(int i)
         {
@@ -262,7 +306,11 @@ namespace InsideDev
 
         // ------------------------------------------------------------------ load and resolve (2.4.1)
 
-        public static SceneReplayer Load(string recordDir, PlaySpec spec, SpecReport report)
+        public static SceneReplayer Load(string recordDir, PlaySpec spec, SpecReport report) { return Load(recordDir, spec, report, false); }
+
+        // dry: read and resolve only (DryText / DryJson describe the result); no baseline file, play.maxUnresolved is
+        // reported instead of refused, Begin must not follow.
+        internal static SceneReplayer Load(string recordDir, PlaySpec spec, SpecReport report, bool dry)
         {
             if (string.IsNullOrEmpty(recordDir)) { Err(report, "replay.source", "no recording folder"); return null; }
             if (SceneRecorder.active != null) { Err(report, "replay", "a recording is running (srec record stop / mcam stop first)"); return null; }
@@ -271,6 +319,8 @@ namespace InsideDev
             var r = new SceneReplayer();
             r.spec = spec ?? new PlaySpec();
             r.dir = recordDir;
+            r.dry = dry;
+            if (r.spec.particles == "match") Warn(report, "replay.play.particles", "match is not built: particles are extrapolated (same as extrapolate)");
             SceneTracks tr;
             try { tr = SceneTracks.Load(path, r.spec.interp, report); }
             catch (Exception e) { Err(report, "replay.source", "reading " + path + " failed: " + e.GetType().Name + ": " + e.Message); return null; }
@@ -287,18 +337,11 @@ namespace InsideDev
             r.sameSession = r.sessionRec != null;
             try { r.Resolve(report); }
             catch (Exception e) { Err(report, "replay", "resolve failed: " + e.GetType().Name + ": " + e.Message); DevLog.Error("replay resolve", e); return null; }
-            if (report != null && report.errors.Count > errorsBefore) return null;
-            if (!r.sameSession) { try { r.Baseline(); } catch (Exception e) { DevLog.Error("replay baseline", e); } }
-            Log("loaded " + recordDir + ": " + r.rec.sampleCount + " samples, " + Num(r.dur) + " s, " + r.objs.Length + " objects, " + r.resolvedCount + " resolved" +
+            if (report != null && report.errors.Count > errorsBefore) { r.ReleaseRecording(); return null; }
+            if (!r.sameSession && !dry) { try { r.Baseline(); } catch (Exception e) { DevLog.Error("replay baseline", e); } }
+            Log((dry ? "dry run of " : "loaded ") + recordDir + ": " + r.rec.sampleCount + " samples, " + Num(r.dur) + " s, " + r.objs.Length + " objects, " + r.resolvedCount + " resolved" +
                 (r.sameSession ? " (same session" + (r.idMismatch > 0 ? ", " + r.idMismatch + " instance id mismatches re-resolved by path" : "") + ")" : " (fresh session)") + ", unresolved dynamic " + r.unresolved + ", static " + r.unresolvedStatic + ", spawned " + r.unresolvedSpawned + ", ambiguous " + r.ambiguous);
             return r;
-        }
-
-        static bool SameDir(string a, string b)
-        {
-            if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return false;
-            string fa = Full(a), fb = Full(b);
-            return string.Equals(fa, fb, StringComparison.OrdinalIgnoreCase) || string.Equals(Full(Path.Combine(a, ReplayConst.RecordFolder)), fb, StringComparison.OrdinalIgnoreCase);
         }
 
         static string Full(string p)
@@ -405,6 +448,7 @@ namespace InsideDev
                 }
                 if (c != null) { x.comp = c; x.t = c.transform; x.go = c.gameObject; x.resolved = true; resolvedCount++; }
             }
+            var animated = new Dictionary<int, bool>();
             foreach (var x in xfObjs)
             {
                 if (x.t == null) continue;
@@ -414,8 +458,7 @@ namespace InsideDev
                 bool seenLive = false;
                 try { seenLive = x.go.activeInHierarchy; } catch { }
                 x.seen = seenLive || sameSession;
-                for (var a = x.t; a != null && !x.animated; a = a.parent)
-                    if (a.GetComponent<Animation>() != null || a.GetComponent<Animator>() != null || a.GetComponent<Actor>() != null) x.animated = true;
+                x.animated = AnimatedAbove(x.t, animated);
             }
             var bad = new List<string>();
             int dynamic = 0;
@@ -428,19 +471,43 @@ namespace InsideDev
                 if (x.keys > 1) { unresolved++; bad.Add(x.id + " " + KindName(x.kind) + " " + x.o.path + (x.ambiguous ? " (ambiguous)" : "")); }
                 else unresolvedStatic++;
             }
-            foreach (var s in bad) DevLog.Write("[replay] unresolved: " + s);
-            for (int i = 0; i < bad.Count && i < 50; i++) Warn(report, "replay.resolve", "unresolved " + bad[i]);
-            if (bad.Count > 50) Warn(report, "replay.resolve", (bad.Count - 50) + " more unresolved objects (log.txt / insidedev.log)");
-            if (unresolvedSpawned > 0) Note(report, "replay.resolve", unresolvedSpawned + " spawned objects not in this session (not counted against play.maxUnresolved)");
+            dynamicCount = dynamic;
+            for (int i = 0; i < bad.Count && i < 20; i++) unresolvedNames.Add(bad[i]);
+            if (!dry)
+            {
+                foreach (var s in bad) DevLog.Write("[replay] unresolved: " + s);
+                for (int i = 0; i < bad.Count && i < 50; i++) Warn(report, "replay.resolve", "unresolved " + bad[i]);
+                if (bad.Count > 50) Warn(report, "replay.resolve", (bad.Count - 50) + " more unresolved objects (log.txt / insidedev.log)");
+                if (unresolvedSpawned > 0) Note(report, "replay.resolve", unresolvedSpawned + " spawned objects not in this session (not counted against play.maxUnresolved)");
+            }
             double frac = dynamic > 0 ? unresolved / (double)dynamic : 0.0;
             if (frac > spec.maxUnresolved)
-                Err(report, "replay.play.maxUnresolved", unresolved + " of " + dynamic + " dynamic objects unresolved or ambiguous (" + Num(frac * 100.0) + " % > " + Num(spec.maxUnresolved * 100.0) + " %)");
+            {
+                string over = unresolved + " of " + dynamic + " dynamic objects unresolved or ambiguous (" + Num(frac * 100.0) + " % > " + Num(spec.maxUnresolved * 100.0) + " %)";
+                if (dry) dryOver = over;
+                else Err(report, "replay.play.maxUnresolved", over);
+            }
             int count = xfObjs.Count;
             xfIds = new int[count];
             for (int i = 0; i < count; i++) xfIds[i] = xfObjs[i].id;
-            parA = new int[n]; selfA = new bool[n]; aboveA = new bool[n]; nodeA = new bool[n]; aih = new sbyte[n]; stack = new int[Math.Max(16, n)];
+            parA = new int[n]; selfA = new bool[n]; aboveA = new bool[n]; nodeA = new bool[n]; aliveA = new bool[n]; recSelfA = new bool[n]; aih = new sbyte[n]; stack = new int[Math.Max(16, n)];
             for (int i = 0; i < n; i++) { parA[i] = -1; nodeA[i] = objs[i].xf; }
             activeBy = new Activation[n];
+            rootsByName = null;
+            byPath = null;
+        }
+
+        // An Animation, Animator or Actor on the transform or an ancestor; one answer per transform, shared by its subtree.
+        static bool AnimatedAbove(Transform tr, Dictionary<int, bool> cache)
+        {
+            if (tr == null) return false;
+            int id = tr.GetInstanceID();
+            bool r;
+            if (cache.TryGetValue(id, out r)) return r;
+            r = tr.GetComponent<Animation>() != null || tr.GetComponent<Animator>() != null || tr.GetComponent<Actor>() != null;
+            if (!r) r = AnimatedAbove(tr.parent, cache);
+            cache[id] = r;
+            return r;
         }
 
         static void SplitComponentPath(string path, out string owner, out string typeName, out int index)
@@ -685,7 +752,9 @@ namespace InsideDev
             rows.Sort((a, b) => b.Key.CompareTo(a.Key));
             var sb = new StringBuilder("score\tchannel\tlive\trecorded\tpath\n");
             foreach (var r in rows) sb.Append(Num(r.Key)).Append('\t').Append(r.Value).Append('\n');
-            string folder = !string.IsNullOrEmpty(baselineDir) ? baselineDir : Path.GetDirectoryName(Full(dir));
+            string full = Full(dir);
+            bool inTake = string.Equals(Path.GetFileName(full), ReplayConst.RecordFolder, StringComparison.OrdinalIgnoreCase);
+            string folder = !string.IsNullOrEmpty(baselineDir) ? baselineDir : inTake ? Path.GetDirectoryName(full) : full;
             string file = Path.Combine(folder ?? dir, ReplayConst.BaselineFile);
             try { File.WriteAllText(file, sb.ToString()); } catch (Exception e) { DevLog.Error("replay baseline write " + file, e); }
             Log("fresh-session baseline: " + rows.Count + " differences against sample 0 -> " + file);
@@ -700,7 +769,11 @@ namespace InsideDev
             if (ended) throw new InvalidOperationException("SceneReplayer: this replay has ended");
             if (objs == null) throw new InvalidOperationException("SceneReplayer: not loaded");
             if (current != null && current != this && current.active) throw new InvalidOperationException("another replay is active (" + current.dir + "): end it first");
+            if (dry) throw new InvalidOperationException("SceneReplayer: a dry-run load cannot begin");
+            if (RplXLoad.Loading()) { Err(report, "replay.begin", "a level load is running: begin again when it has finished (the scene would be replaced under the replay)"); return; }
             cullersLive = spec.cullers == "live";
+            loadCountAtBegin = RplXLoad.Count();
+            touched = true;
             Step(report, "time", FreezeTime);
             Step(report, "camera", TakeCamera);
             Step(report, "streaming", () => FreezeStreaming(handover, report));
@@ -767,9 +840,24 @@ namespace InsideDev
 
         void TakeCamera()
         {
-            if (CameraControl.free) return;
+            freeBefore = CameraControl.free;
+            if (freeBefore)
+            {
+                var c = CameraControl.Current;
+                if (c != null) { freePos = c.transform.position; freeRot = c.transform.rotation; freeFov = c.fieldOfView; freePose = true; }
+                return;
+            }
             CameraControl.SetFree(true);
-            cameraTaken = CameraControl.free;
+        }
+
+        // A load started or finished since Begin: the scene this replay drives is being replaced.
+        bool LoadSeen() { return RplXLoad.Seen(loadCountAtBegin); }
+
+        void EndForLoad()
+        {
+            var rep = new SpecReport();
+            try { End(rep); }
+            catch (Exception e) { DevLog.Error("replay end on level load", e); }
         }
 
         static SubsceneCuller FindSubscene(string name)
@@ -1109,7 +1197,7 @@ namespace InsideDev
                     if (r == null) continue;
                     var smr = r as SkinnedMeshRenderer;
                     if (smr != null) { var bones = smr.bones; if (bones != null) foreach (var b in bones) if (b != null) skinned.Add(b.GetInstanceID()); }
-                    int slots = Math.Max(x.o.materialSlots, 0);
+                    int slots = Math.Max(x.o.materialSlots, tracks != null ? Math.Max(0, tracks.SharedSlots(x.id)) : 0);
                     rends.Add(new Rend { x = x, r = r, cullers = Chain(x.owner), multi = x.keys > 1 || !sameSession, slots = slots, applied = new int[slots] });
                 }
                 else if (x.kind == SrecConst.KindLight)
@@ -1192,10 +1280,12 @@ namespace InsideDev
                 for (int i = 0; i < m.tx.Length; i++) if (m.tx[i] != null) { m.ts[i] = m.mi.GetTextureValue(m.tx[i]); if (m.ts[i] != null) SeedTexture(m.ts[i]); }
             }
             foreach (var p in probes) p.snap = p.p.overridePosition;
+            snapshotTaken = true;
         }
 
         void ArmMonitor()
         {
+            EventMonitor.Want(5f);
             evSeen = EventMonitor.total;
             foreach (var w in fsms) { try { w.state = w.f.ActiveStateName; w.finished = w.f.Fsm != null && w.f.Fsm.Finished; } catch { } }
             foreach (var x in camWatch) x.lastActive = x.go != null && x.go.activeSelf;
@@ -1277,7 +1367,7 @@ namespace InsideDev
                 sb.Append(' ').Append(names[i]).Append(' ').Append((phaseN[i] > 0 ? phaseMs[i] / phaseN[i] : 0).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture)).Append(" ms avg / ").Append(phaseMax[i].ToString("0.0", System.Globalization.CultureInfo.InvariantCulture)).Append(" max (").Append(phaseN[i]).Append(')');
             string[] sub = { "interpolate", "unity set", "parent fix", "ropes", "particles", "shader" };
             sb.Append("; writes ").Append(writesDone).Append(", skipped unchanged ").Append(writesSkipped).Append(" (always written: ").Append(movers).Append(" moved by game code)").Append(", xf threads ").Append(xfPool != null ? xfPool.Workers + 1 : 1);
-            sb.Append("; per frame:");
+            sb.Append(profile ? "; per frame:" : "; per frame (per-object timing runs in passes only):");
             int n = Math.Max(1, phaseN[1]);
             for (int i = 0; i < sub.Length; i++) sb.Append(' ').Append(sub[i]).Append(' ').Append((subTicks[i] * 1000.0 / System.Diagnostics.Stopwatch.Frequency / n).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture)).Append(" ms");
             return sb.ToString();
@@ -1292,6 +1382,7 @@ namespace InsideDev
 
         void PreUpdateBody()
         {
+            if (LoadSeen()) { EndForLoad(); return; }
             t = req;
             ReforceTime();
             if (CameraControl.free) CameraControl.Apply();
@@ -1312,6 +1403,7 @@ namespace InsideDev
 
         void LateWriteBody()
         {
+            if (LoadSeen()) { EndForLoad(); return; }
             ReforceTime();
             bool full = fullApply;
             var list = full ? allList : everyList;
@@ -1329,7 +1421,7 @@ namespace InsideDev
             ApplyParticles();
             subTicks[3] += c1 - c0;
             subTicks[4] += System.Diagnostics.Stopwatch.GetTimestamp() - c1;
-            ApplyVisibility();
+            ApplyVisibility(true);
             ApplyMeshes();
         }
 
@@ -1344,7 +1436,7 @@ namespace InsideDev
         {
             bool full = fullApply;
             CullerVisibility();
-            ApplyVisibility();
+            ApplyVisibility(false);
             Readback();
             ApplyMaterials(full);
             ApplyShader(full);
@@ -1357,12 +1449,14 @@ namespace InsideDev
             hasLastRender = true;
             fullApply = false;
             frames++;
+            appliedFrame = Time.frameCount;
         }
 
         public void ApplyNow(double time)
         {
             t = req = time;
             if (!active) return;
+            if (LoadSeen()) { EndForLoad(); return; }
             try
             {
                 EvalActive();
@@ -1372,38 +1466,48 @@ namespace InsideDev
                 foreach (var x in fullApply ? allList : everyList) WriteOne(x, fullApply);
                 DrawRopes();
                 for (int i = 0; i < cullerVis.Length; i++) cullerVis[i] = true;
-                ApplyVisibility();
+                ApplyVisibility(false);
                 ApplyMaterials(fullApply);
                 ApplyShader(fullApply);
                 ApplyLights(fullApply);
                 ApplyFog();
                 ApplySharedMats(fullApply);
                 ApplyMeshes();
+                appliedFrame = Time.frameCount;
             }
             catch (Exception e) { DevLog.Error("replay ApplyNow", e); }
         }
 
+        // The recorded part (alive, active flag, parent) changes only with the sample index, so it is read from the tracks
+        // once per sample; the live part (camera-driven objects, parents outside the recording) is read every time.
         void EvalActive()
         {
             double tt = t;
+            int k = tracks.SampleAt(tt);
+            bool fresh = k != evalSample;
+            evalSample = k;
             for (int i = 0; i < xfObjs.Count; i++)
             {
                 var x = xfObjs[i];
                 int id = x.id;
-                bool alive = tracks.Alive(id, tt);
-                bool self;
-                if (!alive) self = false;
-                else if (x.camDriven) self = x.go == null || x.go.activeSelf;
-                else self = (tracks.Flags(id, tt) & SrecConst.FlActive) != 0;
-                selfA[id] = self;
-                int p = tracks.ParentAt(id, tt);
-                parA[id] = p;
+                if (fresh)
+                {
+                    bool alive = tracks.Alive(id, tt);
+                    aliveA[id] = alive;
+                    recSelfA[id] = alive && !x.camDriven && (tracks.Flags(id, tt) & SrecConst.FlActive) != 0;
+                    parA[id] = tracks.ParentAt(id, tt);
+                }
+                selfA[id] = x.camDriven ? aliveA[id] && (x.go == null || x.go.activeSelf) : recSelfA[id];
+                int p = parA[id];
                 if (p < 0 || p >= nodeA.Length || !nodeA[p]) aboveA[id] = x.t != null && (x.t.parent == null || x.t.parent.gameObject.activeInHierarchy);
             }
             Calc.ResolveActive(xfIds, xfIds.Length, parA, nodeA, selfA, aboveA, aih, stack);
         }
 
         bool RecActive(int id) { return id >= 0 && id < aih.Length && aih[id] == 1; }
+
+        // A component whose owner transform is not in the object table follows the live object.
+        bool OwnerActive(int owner) { return owner < 0 || RecActive(owner); }
 
         string ModeFor(Obj x)
         {
@@ -1533,20 +1637,20 @@ namespace InsideDev
             var tr = x.t;
             if (tr == null) { destroyed++; return false; }
             Vector3 p, s; Quaternion q;
-            long c1;
+            bool timed = profile;
+            long c1 = 0;
             if (pre >= 0)
             {
                 if (!preOk[pre]) return false;
                 p = preP[pre]; q = preQ[pre]; s = preS[pre];
-                c1 = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (timed) c1 = System.Diagnostics.Stopwatch.GetTimestamp();
             }
             else
             {
                 if (x.spawned && !tracks.Alive(x.id, t)) return false;
-                long c0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                long c0 = timed ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 bool got = tracks.Xf(x.id, t, out p, out q, out s);
-                c1 = System.Diagnostics.Stopwatch.GetTimestamp();
-                subTicks[0] += c1 - c0;
+                if (timed) { c1 = System.Diagnostics.Stopwatch.GetTimestamp(); subTicks[0] += c1 - c0; }
                 if (!got) return false;
             }
             bool world = !x.local;
@@ -1561,20 +1665,20 @@ namespace InsideDev
                     world = true;
                 }
             }
-            long c2 = System.Diagnostics.Stopwatch.GetTimestamp();
-            subTicks[2] += c2 - c1;
+            long c2 = 0;
+            if (timed) { c2 = System.Diagnostics.Stopwatch.GetTimestamp(); subTicks[2] += c2 - c1; }
             if (!full && was && !x.mover && !x.scaleVariant && x.wl == !world && Same(x.wp, p) && Same(x.wq, q) && !tr.hasChanged)
             {
                 x.written = true;
                 writesSkipped++;
-                subTicks[1] += System.Diagnostics.Stopwatch.GetTimestamp() - c2;
+                if (timed) subTicks[1] += System.Diagnostics.Stopwatch.GetTimestamp() - c2;
                 return true;
             }
             if (world) tr.SetPositionRotation(p, q); else tr.SetLocalPositionRotation(p, q);
             if ((x.scaleVariant || full || x.every) && (s.x != 0f || s.y != 0f || s.z != 0f) && tr.localScale != s) tr.localScale = s;
-            tr.hasChanged = false;
+            if (!finalWrite) tr.hasChanged = false;
             writesDone++;
-            subTicks[1] += System.Diagnostics.Stopwatch.GetTimestamp() - c2;
+            if (timed) subTicks[1] += System.Diagnostics.Stopwatch.GetTimestamp() - c2;
             x.wp = p; x.wq = q; x.wl = !world; x.written = true;
             return true;
         }
@@ -1729,14 +1833,22 @@ namespace InsideDev
             else for (int i = 0; i < cullerVis.Length; i++) cullerVis[i] = true;
         }
 
-        void ApplyVisibility()
+        // The recorded part of a renderer's or light's visibility (alive, enabled flag) changes only with the sample index
+        // and is cached per item. The lateWrite call (late) touches only items whose wanted state differs from the one
+        // applied last; the preCull call reads every item back, so a change made by game code is still found and undone.
+        void ApplyVisibility(bool late)
         {
             double tt = t;
+            int k = tracks.SampleAt(tt);
+            bool fresh = k != visSample;
+            visSample = k;
             foreach (var r in rends)
             {
                 if (r.r == null) continue;
                 var x = r.x;
-                bool vis = tracks.Alive(x.id, tt) && (tracks.Flags(x.id, tt) & SrecConst.FlRenderer) != 0 && RecActive(x.owner) && Calc.ChainVisible(r.cullers, cullerVis);
+                if (fresh) r.rec = tracks.Alive(x.id, tt) && (tracks.Flags(x.id, tt) & SrecConst.FlRenderer) != 0;
+                bool vis = r.rec && OwnerActive(x.owner) && Calc.ChainVisible(r.cullers, cullerVis);
+                if (late && vis == r.last) continue;
                 bool cur = r.r.enabled;
                 if (cur != r.last) visConflicts++;
                 if (cur != vis) r.r.enabled = vis;
@@ -1746,9 +1858,14 @@ namespace InsideDev
             {
                 if (l.l == null) continue;
                 var x = l.x;
-                SrecLight v;
-                bool on = tracks.Light(x.id, tt, out v) ? v.enabled : (tracks.Flags(x.id, tt) & SrecConst.FlLight) != 0;
-                bool vis = on && tracks.Alive(x.id, tt) && RecActive(x.owner) && Calc.ChainVisible(l.cullers, cullerVis);
+                if (fresh)
+                {
+                    SrecLight v;
+                    bool on = tracks.Light(x.id, tt, out v) ? v.enabled : (tracks.Flags(x.id, tt) & SrecConst.FlLight) != 0;
+                    l.rec = on && tracks.Alive(x.id, tt);
+                }
+                bool vis = l.rec && OwnerActive(x.owner) && Calc.ChainVisible(l.cullers, cullerVis);
+                if (late && vis == l.last) continue;
                 bool cur = l.l.enabled;
                 if (cur != l.last) visConflicts++;
                 if (cur != vis) l.l.enabled = vis;
@@ -1986,6 +2103,7 @@ namespace InsideDev
                 if (name != ms.applied) { ms.applied = name; ms.want = MeshNamed(name, ms); }
                 if (ms.want != null && ms.smr.sharedMesh != ms.want) ms.smr.sharedMesh = ms.want;
             }
+            allMeshes = null;
         }
 
         // A keyed name (records from R3p: name|vertexCount|instanceId) resolves to the mesh the recorder kept at the swap (this
@@ -2034,6 +2152,7 @@ namespace InsideDev
 
         void MonitorTick()
         {
+            EventMonitor.Want(5f);
             long tot = EventMonitor.total;
             long fresh = tot - evSeen;
             evSeen = tot;
@@ -2077,6 +2196,7 @@ namespace InsideDev
             RestoreSnapshot();
             fullApply = true;
             hasLastRender = false;
+            profile = true;
             passIndex++;
             for (int i = 0; i < 3; i++) { phaseMs[i] = 0; phaseMax[i] = 0; phaseN[i] = 0; }
             for (int i = 0; i < subTicks.Length; i++) subTicks[i] = 0;
@@ -2196,60 +2316,105 @@ namespace InsideDev
             if (xfPool != null) { xfPool.Dispose(); xfPool = null; }
             if (ended) return;
             ended = true;
-            if (!begun)
+            endFrame = Time.frameCount;
+            if (!begun && !touched)
             {
+                endReason = "not begun";
                 if (current == this) current = null;
                 if (ReplayHub.source == this) ReplayHub.source = null;
+                Restore(report, "recording file", ReleaseRecording);
                 return;
             }
+            bool complete = begun;
+            int loadsNow = RplXLoad.Count();
+            sceneGone = LoadSeen();
+            endReason = sceneGone ? "level load" : complete ? "end" : "begin failed";
+            bool poses = complete && !sceneGone;
             SceneHooks.preUpdate -= onPreUpdate;
             SceneHooks.lateWrite -= onLateWrite;
             SceneHooks.preCullMain -= onPreCull;
             begun = false;
-            Restore(report, "camera", RestoreCamera);
-            Restore(report, "final sample", FinalSample);
-            Restore(report, "rigidbodies", RestoreBodies);
+            if (sceneGone)
+                Warn(report, "replay.end", "a level load replaced the scene (load count " + loadCountAtBegin + " -> " + loadsNow + (RplXLoad.Loading() ? ", loading now" : "") +
+                     "): no recorded pose or final sample is written, flags on surviving objects are put back, the time scale goes back to the game");
+            else if (!complete) Warn(report, "replay.end", "Begin did not finish: what it had set up is put back, no final sample is written");
+            Restore(report, "camera", () => RestoreCamera(poses));
+            if (poses) Restore(report, "final sample", FinalSample);
+            Restore(report, "rigidbodies", () => RestoreBodies(poses));
             Restore(report, "particles", () => { foreach (var p in parts) if (p.recorded && p.ps != null && particlesOn && p.wasPlaying && !p.wasPaused) p.ps.Play(false); });
             Restore(report, "probes", () => { foreach (var p in probes) if (p.p != null) { p.p.overridePosition = p.overrideBefore; p.p.useOverridePosition = p.useBefore; } });
             Restore(report, "neutralize", RestoreNeutral);
             Restore(report, "activations", UndoActivations);
-            Restore(report, "renderers", () =>
-            {
-                foreach (var r in rends) if (r.r != null && r.r.enabled != r.begin) r.r.enabled = r.begin;
-                foreach (var l in lites) if (l.l != null && l.l.enabled != l.begin.enabled) l.l.enabled = l.begin.enabled;
-            });
+            Restore(report, "renderers", RestoreRenderers);
             Restore(report, "monitor", DisarmMonitor);
             Restore(report, "cullers", RestoreCullers);
             Restore(report, "streaming", RestoreStreaming);
-            bool reload = spec.restore == "reload" && header.subscene >= 0 && header.savepoint >= 0;
+            bool reload = poses && spec.restore == "reload" && header.subscene >= 0 && header.savepoint >= 0;
             Restore(report, "time", () =>
             {
                 if (!timeSaved) return;
-                if (reload) MultiCamFreeze.Restore(timeBefore > 0f ? timeBefore : 1f, timeBefore > 0f ? timeBefore : 1f, false, "replay end");
+                if (sceneGone) Note(report, "replay.end.time", RplXLoad.TimeToGame());
+                else if (reload) MultiCamFreeze.Restore(timeBefore > 0f ? timeBefore : 1f, timeBefore > 0f ? timeBefore : 1f, false, "replay end");
                 else MultiCamFreeze.Restore(timeBefore, gmBefore, false, "replay end: frozen before the replay");
             });
             SceneHooks.Release();
             Restore(report, "recording file", ReleaseRecording);
             if (current == this) current = null;
             if (ReplayHub.source == this) ReplayHub.source = null;
-            Log("end: conflicts " + conflicts + " (visibility " + visConflicts + "), readback errors " + readbackErrors + ", promoted " + promoted + ", activations " + activations +
+            Log("end (" + endReason + "): conflicts " + conflicts + " (visibility " + visConflicts + "), readback errors " + readbackErrors + ", promoted " + promoted + ", activations " + activations +
                 ", never activated " + never.Count + ", monitor " + MonitorText() + ", time leaks " + timeLeaks + ", rope errors " + ropeErrors + ", particle errors " + particleErrors +
-                ", missing textures " + missingTex + ", materials " + missingMat + ", destroyed writes " + destroyed);
+                ", missing textures " + missingTex + ", materials " + missingMat + ", destroyed writes " + destroyed + ", restore steps failed " + restoreFailures);
             if (reload) Restore(report, "reload", () => { Log("restore reload: savepoint " + header.subscene + " " + header.savepoint); G.LoadSavepoint(header.subscene, header.savepoint); });
         }
 
         void Restore(SpecReport report, string what, Action a)
         {
             try { a(); }
-            catch (Exception e) { Warn(report, "replay.end." + what, e.GetType().Name + ": " + e.Message); DevLog.Error("replay end " + what, e); }
+            catch (Exception e) { restoreFailures++; Warn(report, "replay.end." + what, e.GetType().Name + ": " + e.Message); DevLog.Error("replay end " + what, e); }
         }
 
-        void RestoreCamera()
+        // What End left behind, for the reply of the caller: the scene state, the rigidbody velocities, the camera and the
+        // time scale.
+        internal string EndFacts()
         {
-            bool ok = tracks.Virtual(dur, virt);
+            if (!ended) return "";
+            if (endReason == "not begun") return "nothing was changed";
+            if (sceneGone) return "a level load replaced the scene: no recorded state was written back, the time scale went back to the load";
+            if (endReason == "begin failed") return "Begin did not finish: its changes are put back, no final sample was written";
+            bool reload = spec.restore == "reload" && header.subscene >= 0 && header.savepoint >= 0;
+            string ts;
+            try { ts = Num(Time.timeScale); } catch { ts = "?"; }
+            return "scene restored to the recording's final sample (" + (bodies.Count > 0 ? (velocitiesFinal ? "rigidbody velocities kept, " : "rigidbody velocities zeroed, ") : "") +
+                   (freeKept ? "free camera kept" : "game camera at the recorded final pose") + ", timeScale " + ts +
+                   (reload ? ", savepoint " + header.subscene + " " + header.savepoint + " reloading" : timeBefore == 0f ? ", frozen as before the replay: ts 1 resumes" : "") + ")";
+        }
+
+        void RestoreRenderers()
+        {
+            if (!snapshotTaken) return;
+            bool dynamicShadows = spec.shadows == "dynamic";
+            foreach (var r in rends) if (r.r != null && r.r.enabled != r.begin) r.r.enabled = r.begin;
+            foreach (var l in lites)
+            {
+                if (l.l == null) continue;
+                if (l.l.enabled != l.begin.enabled) l.l.enabled = l.begin.enabled;
+                if (dynamicShadows && l.begin.stat && !l.l.useStaticShadows) { l.l.useStaticShadows = true; l.l.staticShadowsDirty = true; }
+            }
+        }
+
+        void RestoreCamera(bool poses)
+        {
+            if (keepFree && freeBefore && CameraControl.free)
+            {
+                if (poses && freePose) CameraControl.Set(freePos, freeRot, freeFov);
+                freeKept = true;
+                Log("free camera kept" + (poses && freePose ? " and put back at its pose from before the replay" : ""));
+                return;
+            }
+            bool ok = poses && tracks.Virtual(dur, virt);
             var cam = RenderHost.WorldCam();
             if (CameraControl.free) CameraControl.SetFree(false);
-            cameraTaken = false;
+            if (!poses) { Log("game camera released (" + (sceneGone ? "level load" : "Begin did not finish") + ": no recorded pose written)"); return; }
             if (!ok || cam == null) { Log("game camera released (no recorded final pose)"); return; }
             var p = virt.camPos;
             var q = virt.camRot;
@@ -2303,12 +2468,19 @@ namespace InsideDev
             return 0;
         }
 
+        // The last write of a replay leaves Transform.hasChanged set (finalWrite), as any other writer would: game code that
+        // polls the flag sees the final poses.
         void FinalSample()
         {
             t = req = dur;
-            EvalActive();
-            foreach (var x in allList) WriteOne(x, true);
-            DrawRopes();
+            finalWrite = true;
+            try
+            {
+                EvalActive();
+                foreach (var x in allList) WriteOne(x, true);
+                DrawRopes();
+            }
+            finally { finalWrite = false; }
             ApplyParticles();
             ApplyProbes();
             ApplyMaterials(true);
@@ -2321,17 +2493,19 @@ namespace InsideDev
 
         void ReleaseRecording()
         {
-            var m = typeof(SceneRecording).GetMethod("Release", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
-            if (m != null && rec != null) m.Invoke(rec, null);
+            if (rec != null) rec.Release();
         }
 
-        void RestoreBodies()
+        // keep: the saved velocities belong to the final poses (same session, game not advanced, final sample written);
+        // otherwise the bodies start from rest.
+        void RestoreBodies(bool poses)
         {
+            bool keep = poses && velocitiesFinal;
             foreach (var b in bodies)
             {
                 if (b.rb == null) continue;
                 b.rb.isKinematic = b.kinematic;
-                if (!b.kinematic) { b.rb.velocity = velocitiesFinal ? b.v : Vector3.zero; b.rb.angularVelocity = velocitiesFinal ? b.av : Vector3.zero; }
+                if (!b.kinematic) { b.rb.velocity = keep ? b.v : Vector3.zero; b.rb.angularVelocity = keep ? b.av : Vector3.zero; }
                 b.rb.interpolation = b.interp;
             }
         }
@@ -2379,10 +2553,16 @@ namespace InsideDev
             if (SceneHooks.cullerHolds == 0 && BoundsCullerRuntime.boundsCullers != null && BoundsCullerRuntime.boundsCullers.Count > 0) SceneHooks.RehookCullers();
         }
 
+        // A running load switches CullingActive itself (off while it swaps the subscenes, on at its end): it is left alone.
         void RestoreStreaming()
         {
             var m = SubsceneCullingManager.instance;
-            if (cullingSaved) { m.CullingActive = cullingBefore; cullingSaved = false; }
+            if (cullingSaved)
+            {
+                if (!sceneGone) m.CullingActive = cullingBefore;
+                else Log("CullingActive left to the running load");
+                cullingSaved = false;
+            }
             foreach (var c in keptOwned) if (c != null) m.RemoveAlwaysLoaded(c);
             keptOwned.Clear();
             streamingPending = false;
@@ -2474,7 +2654,138 @@ namespace InsideDev
                    (objs != null ? objs.Length : 0) + " resolved (unresolved dynamic " + unresolved + ", spawned " + unresolvedSpawned + ", ambiguous " + ambiguous + ")" +
                    (pass != null ? ", pass " + passIndex + " " + pass.camera + (passOpen ? "" : " (closed)") : "") + ", frames " + frames + ", conflicts " + conflicts + ", readback " + readbackErrors +
                    ", activations " + activations + ", never " + never.Count + ", monitor " + monitorHits + (streamingPending ? ", waiting for kept subscenes" : "") +
-                   (timeLeaks > 0 ? ", time leaks " + timeLeaks : "");
+                   (timeLeaks > 0 ? ", time leaks " + timeLeaks : "") + (begun && req != t ? ", requested T " + Num(req) + " (applies next frame)" : "") +
+                   (ended && endReason.Length > 0 && endReason != "end" ? ", ended by: " + endReason + " at frame " + endFrame : "");
+        }
+
+        // The same facts as Status for `srec status json` (numbers as numbers).
+        internal Json.Obj StatusJson()
+        {
+            var o = new Json.Obj();
+            o["state"] = ended ? "ended" : begun ? "active" : "loaded";
+            o["dir"] = dir;
+            o["T"] = req;
+            o["appliedT"] = t;
+            o["appliedFrame"] = appliedFrame;
+            o["duration"] = dur;
+            o["sample"] = rec != null ? SampleAt(t) : 0;
+            o["sampleCount"] = rec != null ? rec.sampleCount : 0;
+            o["objects"] = objs != null ? objs.Length : 0;
+            o["resolved"] = resolvedCount;
+            o["unresolved"] = unresolved;
+            o["unresolvedSpawned"] = unresolvedSpawned;
+            o["ambiguous"] = ambiguous;
+            o["sameSession"] = sameSession;
+            o["frames"] = frames;
+            o["conflicts"] = conflicts;
+            o["visibilityConflicts"] = visConflicts;
+            o["readbackErrors"] = readbackErrors;
+            o["activations"] = activations;
+            o["neverActivated"] = never.Count;
+            o["monitorHits"] = monitorHits;
+            o["timeLeaks"] = timeLeaks;
+            o["waitingForSubscenes"] = streamingPending;
+            if (pass != null) { o["pass"] = passIndex; o["passCamera"] = pass.camera; }
+            o["endReason"] = endReason;
+            o["endFrame"] = endFrame;
+            var ph = new List<object>();
+            for (int i = 0; i < 3; i++) ph.Add(phaseN[i] > 0 ? Math.Round(phaseMs[i] / phaseN[i], 3) : 0.0);
+            o["phaseMs"] = ph;
+            return o;
+        }
+
+        // The recording's events of kind "event" in time order (`srec events`, @name seeks).
+        internal List<KeyValuePair<string, double>> Events()
+        {
+            var l = new List<KeyValuePair<string, double>>();
+            if (tracks == null) return l;
+            foreach (var e in tracks.events) if (e != null && e.kind == "event") l.Add(new KeyValuePair<string, double>(e.name, e.time));
+            return l;
+        }
+
+        // Result of a dry-run load (`srec load <dir> dry`): what a real load would find. Reads the scene, changes nothing.
+        internal Json.Obj DryJson()
+        {
+            var o = new Json.Obj();
+            o["dir"] = dir;
+            o["wouldLoad"] = dryOver.Length == 0;
+            if (dryOver.Length > 0) o["refusal"] = dryOver;
+            o["duration"] = dur;
+            o["samples"] = rec != null ? rec.sampleCount : 0;
+            o["truncated"] = rec != null && rec.truncated;
+            o["objects"] = objs != null ? objs.Length : 0;
+            o["resolved"] = resolvedCount;
+            o["dynamic"] = dynamicCount;
+            o["unresolved"] = unresolved;
+            o["unresolvedStatic"] = unresolvedStatic;
+            o["unresolvedSpawned"] = unresolvedSpawned;
+            o["ambiguous"] = ambiguous;
+            o["unresolvedNames"] = new List<object>(unresolvedNames.ToArray());
+            o["session"] = sameSession ? "same" : "fresh";
+            o["recorder"] = header.recorderVersion ?? "";
+            o["created"] = header.created ?? "";
+            o["level"] = header.level ?? "";
+            o["subscene"] = header.subscene;
+            o["savepoint"] = header.savepoint;
+            int sub, sp;
+            bool here = false;
+            try { here = G.CurrentSavepoint(out sub, out sp) && sub == header.subscene && sp == header.savepoint; } catch { }
+            o["atRecordedSavepoint"] = here;
+            var kept = new List<object>();
+            if (header.keptCullers != null)
+                foreach (var name in header.keptCullers)
+                {
+                    var k = new Json.Obj();
+                    k["name"] = name;
+                    string st = "not found";
+                    try { var c = FindSubscene(name); if (c != null) st = c.IsLoaded ? "loaded" : "not loaded"; } catch { st = "unknown"; }
+                    k["state"] = st;
+                    kept.Add(k);
+                }
+            o["keptSubscenes"] = kept;
+            var evs = new List<object>();
+            foreach (var e in Events()) { var j = new Json.Obj(); j["name"] = e.Key; j["t"] = Math.Round(e.Value, 4); evs.Add(j); }
+            o["events"] = evs;
+            string audio = "";
+            try
+            {
+                string own = Path.Combine(dir, ReplayConst.AudioFile), parent = Path.Combine(Path.GetDirectoryName(Full(dir)) ?? dir, ReplayConst.AudioFile);
+                audio = File.Exists(own) ? own : File.Exists(parent) ? parent : "";
+            }
+            catch { }
+            o["audio"] = audio;
+            return o;
+        }
+
+        internal string DryText()
+        {
+            var o = DryJson();
+            var sb = new StringBuilder();
+            sb.Append(o.Bool("wouldLoad", false) ? "would load" : "would be refused (" + dryOver + ")").Append(": ").Append(Num(dur)).Append(" s, ").Append(rec != null ? rec.sampleCount : 0).Append(" samples")
+              .Append(rec != null && rec.truncated ? " (truncated)" : "").Append(", ").Append(objs != null ? objs.Length : 0).Append(" objects, ").Append(resolvedCount).Append(" resolved, unresolved dynamic ")
+              .Append(unresolved).Append(" of ").Append(dynamicCount).Append(", static ").Append(unresolvedStatic).Append(", spawned ").Append(unresolvedSpawned).Append(", ambiguous ").Append(ambiguous)
+              .Append("; ").Append(sameSession ? "same session (live references of the recorder)" : "fresh session (path resolve)");
+            sb.Append("\n  recorded by ").Append(string.IsNullOrEmpty(header.recorderVersion) ? "?" : header.recorderVersion).Append(" on ").Append(string.IsNullOrEmpty(header.created) ? "?" : header.created)
+              .Append(", level ").Append(string.IsNullOrEmpty(header.level) ? "?" : header.level).Append(", savepoint ").Append(header.subscene).Append(' ').Append(header.savepoint)
+              .Append(o.Bool("atRecordedSavepoint", false) ? " (the current one)" : " (NOT the current savepoint)");
+            var kept = o["keptSubscenes"] as List<object>;
+            if (kept != null && kept.Count > 0)
+            {
+                sb.Append("\n  kept subscenes:");
+                foreach (var x in kept) { var k = x as Json.Obj; if (k != null) sb.Append(' ').Append(k.Str("name", "")).Append(" (").Append(k.Str("state", "")).Append(')'); }
+            }
+            var evs = Events();
+            if (evs.Count > 0)
+            {
+                sb.Append("\n  events:");
+                for (int i = 0; i < evs.Count && i < 40; i++) sb.Append(' ').Append(evs[i].Key).Append('@').Append(Num(evs[i].Value));
+                if (evs.Count > 40) sb.Append(" ... ").Append(evs.Count - 40).Append(" more");
+            }
+            string audio = o.Str("audio", "");
+            sb.Append("\n  audio: ").Append(audio.Length > 0 ? audio : "none");
+            for (int i = 0; i < unresolvedNames.Count && i < 10; i++) sb.Append("\n  unresolved: ").Append(unresolvedNames[i]);
+            if (unresolved > 10) sb.Append("\n  ... ").Append(unresolved - Math.Min(10, unresolvedNames.Count)).Append(" more unresolved");
+            return sb.ToString();
         }
 
         static string KindName(byte k) { return k < KindNames.Length ? KindNames[k] : "kind" + k; }

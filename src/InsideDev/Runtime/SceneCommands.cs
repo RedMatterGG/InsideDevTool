@@ -16,25 +16,39 @@ namespace InsideDev
     // camera probe (camera_driven.tsv with the expected column of 2.3.1, merged by default into <game>/_mod/, where every later
     // record reads it); manual record start/stop through SceneRecorder with the 2.3.4 pacing and its per-frame assert, the
     // virtual channel every frame, audio markers (Update phase, mirrored as "marker" events) and the keep handover.
+    // Replies: a command that did its job keeps its first words ("srec loaded", "T ...", "playing", "paused:", "srec end:",
+    // "recording ->", "recording stopped ->"); one that could not starts with refused: / busy: / usage: / not found: /
+    // failed: / cannot. `srec end`, `srec record stop` and `srec probe stop` with nothing to stop are not failures.
+    // status, record status, list, events and load ... dry take a last word "json" (one JsonLine object).
+    // Take folders: a relative <dir> is a folder under <game>\_mod\srec (RplXTakes); `srec record start` without a folder
+    // makes take_<yyyyMMdd_HHmmss> there; `srec load last` takes the newest. Every reply names the full path.
+    // Level load: the viewer's replayer ends itself (SceneReplayer, RplXLoad) and the viewer is dropped with a note that
+    // status and the next viewer command repeat; a probe stops, a pending record handover is released, the freeze hold lets
+    // go. seek and step apply their time at once (SceneReplayer.ApplyNow), so the reply and a screenshot taken in the same
+    // frame show the same T. The host object lives only while a viewer, recording, probe or handover exists.
     public static class SceneCommands
     {
         internal const string WriteProbeFile = "write_probe.tsv";
         internal const string WriteProbeHeader = "path\tframes\tmaxPos\tmaxRotDeg\twriters";
         internal const string CameraProbeHeader = "path\tcomponents\texpected\trigid";
         internal const string NoViewer = "no recording loaded (srec load <dir>)";
-        internal const string RecordUsage = "usage: srec record start <dir> [roots=a,b] [keep=subscene,...] [spec=<file>] [clock=real|fixed:<rate>] [audio=on] [overwrite=on] [<record key>=value ...] | srec record stop [keep] | srec record status";
+        internal const string LoadUsage = "usage: srec load <dir|last> [dry] [replace] [play [speed] [loop|once]] [t=<s>|@event] [cam=game|keep] [<play key>=value ...] [json with dry]  (a relative dir is a folder under <game>\\_mod\\srec)";
+        internal const string SeekUsage = "usage: srec seek <seconds|start|end|@event[+-s]|rel <seconds>|sample:<n>|<percent>%>";
+        internal const string RecordUsage = "usage: srec record start [<dir>] [roots=a,b] [keep=subscene,...] [spec=<file>] [clock=real|fixed:<rate>] [audio=on] [overwrite=on] [<record key>=value ...] | srec record stop [keep|load] | srec record status [json]  (no dir: a new take_<date_time> under <game>\\_mod\\srec; a relative dir is a folder there)";
         internal const string EventUsage = "usage: srec event <name> [detail ...] (name: letters, digits, '_' and '.'; referenced as @name)";
         internal const string Usage =
-            "srec status | srec objects [filter] [max=n]\n" +
-            "srec load <dir> [t=<s>|@event] [cam=game|keep] [<play key>=value ...] | srec end\n" +
-            "srec play [speed] [loop] | srec pause | srec seek <s|start|end|@event[+-s]> | srec step [dt|next|back]\n" +
+            "srec status [json] | srec objects [filter] [max=n] | srec list [max=n] [json] | srec events [json]\n" +
+            "srec load <dir|last> [dry] [replace] [play [speed] [loop]] [t=<s>|@event] [cam=game|keep] [<play key>=value ...] | srec reload | srec end\n" +
+            "srec play [speed] [loop] | srec pause | srec seek <s|start|end|@event[+-s]|rel <s>|sample:<n>|<p>%> | srec step [dt|next|back]\n" +
             "srec probe [n] [eps=m] [rot=deg] [out=dir] | srec probe camera [n] [dx=m] [yaw=deg] [eps=m] [rot=deg] [out=dir] [roots=a,b] | srec probe stop | srec probe result\n" +
-            "srec record start <dir> [roots=a,b] [keep=subscene,...] [spec=<file>] [clock=real|fixed:<rate>] [audio=on] [overwrite=on] [<record key>=value ...] | srec record stop [keep] | srec record status\n" +
-            "srec event <name> [detail ...]";
+            "srec record start [<dir>] [roots=a,b] [keep=subscene,...] [spec=<file>] [clock=real|fixed:<rate>] [audio=on] [overwrite=on] [<record key>=value ...] | srec record stop [keep|load] | srec record status [json]\n" +
+            "srec event <name> [detail ...]\n" +
+            "a relative <dir> is a folder under <game>\\_mod\\srec; record start without <dir> makes take_<date_time> there";
 
         static readonly CultureInfo IC = CultureInfo.InvariantCulture;
         static readonly string[] RecordOwnKeys = { "clock", "audio", "overwrite", "spec" };
         const float KeepTimeout = 30f;
+        const int HostIdleFrames = 300;
         static readonly string[] LoadOwnKeys = { "t", "cam" };
         static readonly string[] WriteProbeOwnKeys = { "eps", "rot", "out" };
         static readonly string[] CameraProbeOwnKeys = { "dx", "yaw", "eps", "rot", "out" };
@@ -48,16 +62,18 @@ namespace InsideDev
         static ManualRecord manual;
         static ReplayHandover pending;
         static string pendingFrom = "";
+        static int pendingLoads;
         static ProbeRun probe;
-        static string lastProbe = "", lastProbeFull = "", lastRecord = "";
+        static string lastProbe = "", lastProbeFull = "", lastRecord = "", closedNote = "", handoverNote = "";
+        static List<string> lastLoad;
         static SceneCommandsHost host;
-        static int errorCount;
+        static int errorCount, idleFrames;
 
         sealed class ProbeRun
         {
             public string kind = "", phase = "", dir = "";
-            public int frame, frames, tick;
-            public bool freeze;
+            public int frame, frames, tick, loads;
+            public bool freeze, gone;
             public Action cleanup;
 
             public void Cleanup()
@@ -75,7 +91,7 @@ namespace InsideDev
             public RecordSpec spec;
             public RecordHeader header;
             public AudioCapSpec audio;
-            public bool audioOn, audioLost, hooked, paced;
+            public bool audioOn, audioLost, audioSilent, hooked, paced;
             public string dir = "", line = "";
             public readonly MultiCamContext ctx = new MultiCamContext();
             public readonly List<float> frameTimes = new List<float>(4096);
@@ -104,12 +120,17 @@ namespace InsideDev
             string sub = a.Count > 1 ? a[1].ToLowerInvariant() : "status";
             try
             {
+                RplXSetup.Register();
+                RplXSetup.KeepAlive();
                 switch (sub)
                 {
-                    case "status": return Status();
+                    case "status": return TakeJson(a, 2) ? JsonLine.Write(StatusJson()) : Status();
                     case "help": return Usage;
                     case "objects": return Objects(a);
+                    case "list": return ListTakes(a);
+                    case "events": return Events(a);
                     case "load": return Load(a);
+                    case "reload": return Reload();
                     case "end": return End();
                     case "play": return Play(a);
                     case "pause": return Pause();
@@ -120,8 +141,31 @@ namespace InsideDev
                     case "event": return PostEvent(a);
                 }
             }
-            catch (Exception e) { DevLog.Error("srec " + sub, e); return "srec " + sub + " failed: " + e.GetType().Name + ": " + e.Message; }
+            catch (Exception e) { DevLog.Error("srec " + sub, e); return "failed: srec " + sub + ": " + e.GetType().Name + ": " + e.Message; }
             return "usage:\n" + Usage;
+        }
+
+        // Removes a last word "json" (at index from or later) and says whether it was there.
+        static bool TakeJson(List<string> a, int from)
+        {
+            int last = a.Count - 1;
+            if (last < from || !string.Equals(a[last], "json", StringComparison.OrdinalIgnoreCase)) return false;
+            a.RemoveAt(last);
+            return true;
+        }
+
+        // null while a viewer is loaded, else the refusal for a command that needs one: why the last viewer went away
+        // (level load, ended outside srec) when that is known.
+        static string NeedViewer()
+        {
+            if (viewer != null) return null;
+            return "refused: " + (closedNote.Length > 0 ? closedNote + "; srec reload loads it again" : NoViewer);
+        }
+
+        static string FirstError(SpecReport r)
+        {
+            if (r == null) return "";
+            return r.errors.Count > 0 ? r.errors[0] : r.warnings.Count > 0 ? r.warnings[0] : "";
         }
 
         static string Busy()
@@ -149,11 +193,71 @@ namespace InsideDev
             else if (SceneRecorder.active != null) sb.Append("recording (mcam): ").Append(RecorderStatus(SceneRecorder.active)).Append('\n');
             if (pending != null) sb.Append("handover pending from ").Append(pendingFrom).Append(": ").Append(HandoverText(pending)).Append(" (the next srec load takes it, srec end releases it)\n");
             if (probe != null) sb.Append(ProbeLine(probe)).Append('\n');
+            bool busy = sb.Length > 0;
+            if (!busy) sb.Append("srec idle (srec help)\n");
+            if (viewer == null && closedNote.Length > 0) sb.Append("last ").Append(closedNote).Append('\n');
+            if (pending == null && handoverNote.Length > 0) sb.Append("last handover: ").Append(handoverNote).Append('\n');
             if (lastProbe.Length > 0) sb.Append("last probe: ").Append(lastProbe).Append('\n');
-            if (lastRecord.Length > 0 && manual == null) sb.Append("last deferred record start: ").Append(lastRecord).Append('\n');
-            if (sb.Length == 0) return "srec idle (srec help)";
+            if (lastRecord.Length > 0 && manual == null) sb.Append("last record: ").Append(lastRecord).Append('\n');
             if (viewer != null || manual != null || probe != null || SceneReplayer.current != null || SceneRecorder.active != null) sb.Append(HooksLine()).Append('\n');
             return sb.ToString().TrimEnd('\n');
+        }
+
+        // `srec status json`: state is the first that applies of waiting, recording, viewer, probe, replay (mcam), recording
+        // (mcam), idle. The viewer's fields are at the top level, the replayer's own counters under "replay".
+        static Json.Obj StatusJson()
+        {
+            var o = new Json.Obj();
+            var m = manual;
+            var r = viewer;
+            var p = probe;
+            o["state"] = m != null ? (m.waiting ? "waiting" : "recording") : r != null ? "viewer" : p != null ? "probe" : SceneReplayer.current != null ? "replay (mcam)" : SceneRecorder.active != null ? "recording (mcam)" : "idle";
+            o["frame"] = Time.frameCount;
+            o["timeScale"] = (double)Time.timeScale;
+            o["loading"] = RplXLoad.Loading();
+            o["frozenBy"] = r != null ? "viewer" : p != null && p.freeze ? "probe" : SceneReplayer.current != null ? "replay (mcam)" : MultiCamFreeze.holding ? "hold: " + MultiCamFreeze.reason : "";
+            if (r != null)
+            {
+                o["dir"] = viewerDir;
+                o["T"] = r.T;
+                o["appliedT"] = r.AppliedT;
+                o["appliedFrame"] = r.AppliedFrame;
+                o["duration"] = Duration(r);
+                o["sample"] = SafeSampleAt(r, r.AppliedT);
+                o["sampleCount"] = SampleCount(r);
+                o["playing"] = playing;
+                o["speed"] = speed;
+                o["loop"] = looping;
+                o["timeScaleReforced"] = freezeLeaks;
+                try { o["replay"] = r.StatusJson(); } catch (Exception e) { o["replayError"] = e.Message; }
+            }
+            else if (SceneReplayer.current != null)
+            {
+                try { o["replay"] = SceneReplayer.current.StatusJson(); } catch (Exception e) { o["replayError"] = e.Message; }
+            }
+            if (m != null) o["recording"] = RecordJson(m);
+            else if (SceneRecorder.active != null) o["recorderText"] = RecorderStatus(SceneRecorder.active);
+            if (pending != null)
+            {
+                var h = new Json.Obj();
+                h["from"] = pendingFrom;
+                h["forcedCullers"] = pending.forced != null ? pending.forced.Count : 0;
+                h["keptSubscenes"] = pending.keptLoaded != null ? pending.keptLoaded.Count : 0;
+                o["handover"] = h;
+            }
+            if (p != null)
+            {
+                var pj = new Json.Obj();
+                pj["kind"] = p.kind; pj["phase"] = p.phase; pj["frame"] = p.frame; pj["frames"] = p.frames;
+                o["probe"] = pj;
+            }
+            o["lastViewer"] = closedNote;
+            o["lastHandover"] = handoverNote;
+            o["lastProbe"] = lastProbe;
+            o["lastRecord"] = lastRecord;
+            o["takes"] = RplXTakes.Root();
+            o["tickErrors"] = errorCount;
+            return o;
         }
 
         static string HooksLine()
@@ -167,6 +271,18 @@ namespace InsideDev
             try { return r.Status(); } catch (Exception e) { return "status failed: " + e.Message; }
         }
 
+        // For the MCP server's automatic restores (RplXSetup.KeepAlive): why they must wait now, or null. Main thread.
+        internal static string RecordBusy()
+        {
+            var m = manual;
+            return m == null ? null : m.waiting ? "srec record start is waiting for its subscenes" : "srec recording " + m.dir;
+        }
+
+        internal static string ReplayBusy()
+        {
+            return viewer != null && playing ? "srec replay playing " + viewerDir : null;
+        }
+
         static string RecorderStatus(SceneRecorder r)
         {
             try { return r.Status(); } catch (Exception e) { return "status failed: " + e.Message; }
@@ -175,7 +291,7 @@ namespace InsideDev
         static string Objects(List<string> a)
         {
             var r = viewer ?? SceneReplayer.current;
-            if (r == null) return NoViewer;
+            if (r == null) return NeedViewer();
             string filter = "";
             int max = 200;
             for (int i = 2; i < a.Count; i++)
@@ -192,35 +308,117 @@ namespace InsideDev
 
         // ------------------------------------------------------------------ viewer
 
+        // Words of `srec load` after the folder: key=value pairs go to PlayArgs, the bare words are options.
+        sealed class LoadWords
+        {
+            public bool dry, replace, play, loop, json;
+            public double speed = 1.0;
+            public readonly List<string> pairs = new List<string>();
+        }
+
+        internal static bool PlayWord(string v, ref double sp, ref bool lp)
+        {
+            double x;
+            if (v == "loop") lp = true;
+            else if (v == "once") lp = false;
+            else if (double.TryParse(v.TrimEnd('x'), NumberStyles.Float, IC, out x) && x != 0.0 && Math.Abs(x) <= 100.0) sp = x;
+            else return false;
+            return true;
+        }
+
+        static string ParseLoadWords(List<string> a, int from, LoadWords w)
+        {
+            for (int i = from; i < a.Count; i++)
+            {
+                string s = a[i] ?? "";
+                if (s.IndexOf('=') > 0) { w.pairs.Add(s); continue; }
+                string v = s.ToLowerInvariant();
+                if (v == "dry") w.dry = true;
+                else if (v == "replace") w.replace = true;
+                else if (v == "play") w.play = true;
+                else if (v == "json") w.json = true;
+                else if (w.play && PlayWord(v, ref w.speed, ref w.loop)) { }
+                else return "unknown word '" + s + "'";
+            }
+            if (w.json && !w.dry) return "json belongs to dry";
+            return null;
+        }
+
+        // A relative folder is a take under <game>\_mod\srec; one that is not there but exists relative to the game's
+        // working folder (where relative paths went before) is still found.
+        static string LoadDir(string arg, out string note)
+        {
+            note = "";
+            if (Path.IsPathRooted(arg)) return Path.GetFullPath(arg);
+            string under = RplXTakes.Under(RplXTakes.Root(), arg);
+            if (RecordingDir(under) != null) return under;
+            string legacy = Path.GetFullPath(arg);
+            if (RecordingDir(legacy) == null) return under;
+            note = "found relative to the game's working folder, not under " + RplXTakes.Root();
+            return legacy;
+        }
+
         static string Load(List<string> a)
         {
-            if (a.Count < 3) return "usage: srec load <dir> [t=<s>|@event] [cam=game|keep] [<play key>=value ...]";
+            if (a.Count < 3) return LoadUsage;
+            var w = new LoadWords();
+            string bad = ParseLoadWords(a, 3, w);
+            if (bad != null) return LoadUsage + ": " + bad;
             string busy = Busy();
             if (busy != null) return busy;
-            if (viewer != null) return "a recording is loaded (" + viewerDir + "): srec end first";
-            if (manual != null) return "recording in progress: srec record stop first";
-            if (probe != null) return "a probe is running: srec probe stop first";
-            string full;
-            try { full = Path.GetFullPath(a[2]); } catch (Exception e) { return "bad dir: " + e.Message; }
+            if (manual != null) return "busy: recording in progress: srec record stop first";
+            if (!w.dry)
+            {
+                if (RplXLoad.Loading()) return "busy: the game is loading a level: srec load again when it has finished";
+                if (viewer != null && !w.replace) return "busy: a recording is loaded (" + viewerDir + "): srec end first, or add the word replace";
+                if (probe != null) return "busy: a probe is running: srec probe stop first";
+            }
+            string full, dirNote = "";
+            try
+            {
+                if (a[2].ToLowerInvariant() == "last")
+                {
+                    full = RplXTakes.Last(RplXTakes.Root());
+                    if (full == null) return "not found: no take with a " + ReplayConst.RecordFile + " under " + RplXTakes.Root();
+                }
+                else full = LoadDir(a[2], out dirNote);
+            }
+            catch (Exception e) { return "refused: bad dir '" + a[2] + "': " + e.Message; }
             string dir = RecordingDir(full);
-            if (dir == null) return "no " + ReplayConst.RecordFile + " in " + full + " or in its " + ReplayConst.RecordFolder + " folder";
+            if (dir == null) return "not found: no " + ReplayConst.RecordFile + " in " + full + " or in its " + ReplayConst.RecordFolder + " folder";
             var report = new SpecReport();
             string tArg;
             bool gameCam;
-            var spec = PlayArgs(a, 3, report, out tArg, out gameCam);
-            if (!report.ok) return "srec load refused:\n" + report.Summary(20);
+            var spec = PlayArgs(w.pairs, 0, report, out tArg, out gameCam);
+            if (!report.ok) return "refused: srec load: " + FirstError(report) + "\n" + report.Summary(20);
+            if (dirNote.Length > 0) report.Note("srec.dir", dirNote);
+            string replaced = "";
+            if (viewer != null && !w.dry) replaced = End().Split('\n')[0];
             SceneReplayer r = null;
-            try { r = SceneReplayer.Load(dir, spec, report); }
+            try { r = SceneReplayer.Load(dir, spec, report, w.dry); }
             catch (Exception e) { report.Error("srec load", e.GetType().Name + ": " + e.Message); r = null; }
-            if (r == null || !report.ok) return "srec load refused: " + dir + "\n" + report.Summary(30);
+            if (r == null || !report.ok) return "refused: srec load " + dir + ": " + FirstError(report) + (replaced.Length > 0 ? " (the recording loaded before was released)" : "") + "\n" + report.Summary(30);
+            if (w.dry)
+            {
+                string text;
+                try { text = w.json ? JsonLine.Write(r.DryJson()) : "srec load dry " + dir + ": " + r.DryText() + (report.warnings.Count > 0 ? "\n" + report.Summary(10) : ""); }
+                finally { try { r.End(null); } catch (Exception e) { Fail("dry end", e); } }
+                return text;
+            }
             var hand = pending;
+            r.KeepFreeCamera = true;
             try { r.Begin(hand, report); }
             catch (Exception e)
             {
                 report.Error("srec load", "Begin: " + e.GetType().Name + ": " + e.Message);
                 try { r.End(report); } catch (Exception e2) { report.Error("srec load", "End: " + e2.GetType().Name + ": " + e2.Message); }
                 if (hand != null) { report.Note("srec load", "record handover released (" + ReleaseHandover(hand) + ")"); pending = null; pendingFrom = ""; }
-                return "srec load failed in Begin, restored: " + dir + "\n" + report.Summary(30);
+                return "failed: srec load " + dir + ": Begin threw, restored: " + e.GetType().Name + ": " + e.Message + "\n" + report.Summary(30);
+            }
+            if (!r.active)
+            {
+                try { r.End(report); } catch (Exception e2) { report.Error("srec load", "End: " + e2.GetType().Name + ": " + e2.Message); }
+                return "refused: srec load " + dir + ": " + FirstError(report) + "\n" + report.Summary(30);
             }
             if (hand != null) { pending = null; pendingFrom = ""; }
             int beginErrors = report.errors.Count;
@@ -230,19 +428,76 @@ namespace InsideDev
             looping = false;
             speed = 1.0;
             freezeLeaks = 0;
+            closedNote = "";
+            lastLoad = new List<string>();
+            for (int i = 0; i < a.Count; i++)
+                if (i < 3 || !string.Equals(a[i], "replace", StringComparison.OrdinalIgnoreCase)) lastLoad.Add(i == 2 ? full : a[i]);
             double dur = Duration(r), t = 0.0;
             string err;
             if (tArg != null && !ParseTime(tArg, 0.0, dur, EventTimeOf(r), out t, out err)) { report.Warn("srec.t", err + "; T = 0"); t = 0.0; }
             r.T = Clamp(t, 0.0, dur);
             EnsureHost();
             string camText = ViewerCamera(r, r.T, gameCam);
+            if (w.play)
+            {
+                speed = w.speed;
+                looping = w.loop;
+                if (!looping && speed < 0.0 && r.T <= 0.0) r.T = dur;
+                playing = true;
+            }
             var sb = new StringBuilder();
             sb.Append("srec loaded ").Append(dir).Append(": ").Append(SampleCount(r)).Append(" samples, ").Append(F3(dur)).Append(" s");
             if (r.tracks != null && r.tracks.rec != null) sb.Append(", ").Append(r.tracks.rec.objects.Count).Append(" objects");
             if (hand != null) sb.Append(", record handover taken (").Append(HandoverText(hand)).Append(")");
-            sb.Append("; frozen at T ").Append(F3(r.T)).Append("; ").Append(camText).Append(" (Insert toggles, WASD/QE + right mouse fly); srec play [speed] [loop], srec end restores");
+            if (playing) sb.Append("; playing x").Append(F(speed)).Append(looping ? " loop" : "").Append(" from T ").Append(F3(r.T));
+            else sb.Append("; frozen at T ").Append(F3(r.T));
+            sb.Append("; ").Append(camText).Append(" (Insert toggles, WASD/QE + right mouse fly); srec play [speed] [loop], srec end restores");
+            if (replaced.Length > 0) sb.Append("\nreplaced the loaded recording: ").Append(replaced);
             if (beginErrors > 0) sb.Append("\nBegin reported ").Append(beginErrors).Append(" error(s): the viewer runs with those parts missing (srec end restores what was set up)");
             if (report.errors.Count + report.warnings.Count + report.notes.Count > 0) sb.Append('\n').Append(report.Summary(20));
+            return sb.ToString();
+        }
+
+        // Ends the viewer and loads the same folder again with the arguments of the last `srec load` (a re-recorded take,
+        // or a viewer that a level load closed).
+        static string Reload()
+        {
+            if (lastLoad == null) return "refused: nothing was loaded in this session (srec load <dir>)";
+            var a = new List<string>(lastLoad);
+            if (viewer != null) a.Add("replace");
+            return Load(a);
+        }
+
+        static string ListTakes(List<string> a)
+        {
+            bool json = TakeJson(a, 2);
+            int max = 30;
+            for (int i = 2; i < a.Count; i++)
+            {
+                string s = a[i];
+                if (!s.StartsWith("max=", StringComparison.OrdinalIgnoreCase) || !int.TryParse(s.Substring(4), NumberStyles.Integer, IC, out max) || max < 1) return "usage: srec list [max=n] [json]";
+            }
+            string root = RplXTakes.Root();
+            int total;
+            var takes = RplXTakes.List(root, max, out total);
+            return json ? JsonLine.Write(RplXTakes.ToJson(root, takes, total)) : RplXTakes.Text(root, takes, total);
+        }
+
+        static string Events(List<string> a)
+        {
+            bool json = TakeJson(a, 2);
+            var r = viewer ?? SceneReplayer.current;
+            if (r == null) return NeedViewer();
+            var evs = r.Events();
+            if (json)
+            {
+                var l = new List<object>();
+                foreach (var e in evs) { var j = new Json.Obj(); j["name"] = e.Key; j["t"] = Math.Round(e.Value, 4); l.Add(j); }
+                return JsonLine.Obj("dir", viewer != null ? viewerDir : "", "duration", Duration(r), "events", l);
+            }
+            var sb = new StringBuilder();
+            sb.Append("events ").Append(evs.Count).Append(" (srec seek @name[+-s]), duration ").Append(F3(Duration(r))).Append(" s");
+            foreach (var e in evs) sb.Append("\n  ").Append(F3(e.Value)).Append("  ").Append(e.Key);
             return sb.ToString();
         }
 
@@ -263,16 +518,25 @@ namespace InsideDev
             return CameraControl.free ? "free camera at the current pose" : "no gameplay camera";
         }
 
+        // The first line tells what End left behind: a clean end keeps the words "released, scene restored" and names the
+        // state the scene is in; a restore step that failed makes the reply a failure.
         static string End()
         {
-            if (probe != null) StopProbe("srec end");
+            string pre = "";
+            if (probe != null)
+            {
+                StopProbe("srec end");
+                pre = "probe stopped (" + lastProbe + "); ";
+            }
             if (viewer == null)
             {
-                if (pending == null) return NoViewer;
+                string was = closedNote;
+                closedNote = "";
+                if (pending == null) return pre + (was.Length > 0 ? "no recording loaded (" + was + ")" : NoViewer);
                 string rel = ReleaseHandover(pending);
                 pending = null;
                 pendingFrom = "";
-                return "no recording loaded; released the pending record handover (" + rel + ")";
+                return pre + "no recording loaded; released the pending record handover (" + rel + ")";
             }
             var r = viewer;
             string dir = viewerDir;
@@ -280,28 +544,28 @@ namespace InsideDev
             viewer = null;
             viewerDir = "";
             var report = new SpecReport();
+            bool threw = false;
             try { r.End(report); }
-            catch (Exception e) { report.Error("srec end", e.GetType().Name + ": " + e.Message); }
-            return "srec end: " + dir + " released, scene restored" + (report.errors.Count + report.warnings.Count + report.notes.Count > 0 ? "\n" + report.Summary(30) : "");
+            catch (Exception e) { threw = true; report.Error("srec end", e.GetType().Name + ": " + e.Message); }
+            string facts;
+            try { facts = r.EndFacts(); } catch { facts = ""; }
+            int failed = r.RestoreFailures + (threw ? 1 : 0);
+            string tail = report.errors.Count + report.warnings.Count + report.notes.Count > 0 ? "\n" + report.Summary(30) : "";
+            if (failed > 0) return "failed: srec end " + dir + ": released, but " + failed + " restore step(s) failed (" + FirstError(report) + "); " + facts + tail;
+            return pre + "srec end: " + dir + " released, " + facts + tail;
         }
 
         static string Play(List<string> a)
         {
-            if (viewer == null) return NoViewer;
-            if (probe != null && probe.kind == "camera") return "camera probe running: srec probe stop first";
+            string need = NeedViewer();
+            if (need != null) return need;
+            if (probe != null && probe.kind == "camera") return "busy: camera probe running: srec probe stop first";
             if (a.Count > 2)
             {
                 double sp = speed;
                 bool lp = false;
                 for (int i = 2; i < a.Count; i++)
-                {
-                    string v = a[i].ToLowerInvariant();
-                    double x;
-                    if (v == "loop") lp = true;
-                    else if (v == "once") lp = false;
-                    else if (double.TryParse(v.TrimEnd('x'), NumberStyles.Float, IC, out x) && x != 0.0 && Math.Abs(x) <= 100.0) sp = x;
-                    else return "usage: srec play [speed (non-zero, |speed| <= 100)] [loop|once]";
-                }
+                    if (!PlayWord(a[i].ToLowerInvariant(), ref sp, ref lp)) return "usage: srec play [speed (non-zero, |speed| <= 100)] [loop|once]";
                 speed = sp;
                 looping = lp;
             }
@@ -314,32 +578,48 @@ namespace InsideDev
 
         static string Pause()
         {
-            if (viewer == null) return NoViewer;
+            string need = NeedViewer();
+            if (need != null) return need;
             playing = false;
             return "paused: " + ViewerLine();
         }
 
+        // Sets T and applies it in this frame, so the reply and a screenshot of the same frame show the same time. null
+        // while the viewer lives, else the refusal (a level load was seen by the apply and closed the viewer).
+        static string ApplyAt(double t)
+        {
+            var r = viewer;
+            r.T = Clamp(t, 0.0, Duration(r));
+            try { r.ApplyNow(r.T); } catch (Exception e) { Fail("apply", e); }
+            if (r.active) return null;
+            Orphans();
+            return NeedViewer();
+        }
+
         static string Seek(List<string> a)
         {
-            if (viewer == null) return NoViewer;
-            if (a.Count < 3) return "usage: srec seek <seconds|start|end|@event[+-s]>";
+            string need = NeedViewer();
+            if (need != null) return need;
+            if (a.Count < 3) return SeekUsage;
             double dur = Duration(viewer), t;
             string err;
-            if (!ParseTime(a[2], viewer.T, dur, EventTimeOf(viewer), out t, out err)) return err;
-            viewer.T = Clamp(t, 0.0, dur);
-            return ViewerLine();
+            var r = viewer;
+            if (!ParseSeek(a, 2, r.T, dur, SampleCount(r), i => SafeSampleTime(r, i), EventTimeOf(r), out t, out err))
+                return err.StartsWith("event ", StringComparison.Ordinal) ? "not found: " + err + " (srec events lists them)" : SeekUsage + ": " + err;
+            return ApplyAt(t) ?? ViewerLine();
         }
 
         static string Step(List<string> a)
         {
-            if (viewer == null) return NoViewer;
-            playing = false;
+            string need = NeedViewer();
+            if (need != null) return need;
+            if (a.Count > 3) return "usage: srec step [dt seconds | next | back]";
             double dur = Duration(viewer), t = viewer.T;
             string v = a.Count > 2 ? a[2].ToLowerInvariant() : "next";
             if (v == "next" || v == "back" || v == "prev")
             {
                 int n = SampleCount(viewer);
-                if (n <= 0) return "the recording has no samples";
+                if (n <= 0) return "refused: the recording has no samples";
                 int at = SafeSampleAt(viewer, t);
                 int i = StepSample(at, SafeSampleTime(viewer, at), t, v != "next", n);
                 t = SafeSampleTime(viewer, i);
@@ -347,13 +627,15 @@ namespace InsideDev
             else
             {
                 double dt;
-                if (!double.TryParse(v, NumberStyles.Float, IC, out dt)) return "usage: srec step [dt seconds | next | back]";
+                if (!double.TryParse(v, NumberStyles.Float, IC, out dt) || double.IsNaN(dt) || double.IsInfinity(dt)) return "usage: srec step [dt seconds | next | back]";
                 t += dt;
             }
-            viewer.T = Clamp(t, 0.0, dur);
-            return ViewerLine();
+            playing = false;
+            return ApplyAt(t) ?? ViewerLine();
         }
 
+        // "T <requested> / <duration> s  sample i/n  paused|playing ...  applied T <t> frame <f>": applied is the time the
+        // scene shows now and the frame it was applied in (while playing it trails the requested T by one frame).
         static string ViewerLine()
         {
             var r = viewer;
@@ -361,7 +643,8 @@ namespace InsideDev
             double t = r.T;
             int n = SampleCount(r);
             return "T " + F3(t) + " / " + F3(Duration(r)) + " s  sample " + (n > 0 ? SafeSampleAt(r, t).ToString(IC) : "-") + "/" + n + "  " +
-                   (playing ? "playing x" + F(speed) + (looping ? " loop" : "") : "paused");
+                   (playing ? "playing x" + F(speed) + (looping ? " loop" : "") : "paused") +
+                   (r.AppliedFrame >= 0 ? "  applied T " + F3(r.AppliedT) + " frame " + r.AppliedFrame.ToString(IC) : "  not applied yet");
         }
 
         static void ViewerTick()
@@ -375,6 +658,7 @@ namespace InsideDev
 
         static void HoldFreeze()
         {
+            if (RplXLoad.Loading()) return;
             float gm = 0f;
             try { gm = GameManager.TimeScale; } catch { gm = 0f; }
             if (Time.timeScale == 0f && gm == 0f) return;
@@ -446,40 +730,63 @@ namespace InsideDev
             {
                 case "start": return RecordStart(a);
                 case "stop":
-                    if (manual == null) return SceneRecorder.active != null ? "the active recording belongs to mcam (mcam stop)" : "not recording";
-                    return RecordStop(a.Count > 3 && a[3].ToLowerInvariant() == "keep", "srec record stop");
+                    string how = a.Count > 3 ? a[3].ToLowerInvariant() : "";
+                    if (a.Count > 4 || (how != "" && how != "keep" && how != "load")) return "usage: srec record stop [keep|load] (nothing was stopped; keep hands the record preparation to the next srec load, load also loads the take)";
+                    if (manual == null) return SceneRecorder.active != null ? "busy: the active recording belongs to mcam (mcam stop)" : "not recording";
+                    if (how != "load" || manual.waiting) return RecordStop(how == "keep", "srec record stop");
+                    string take = manual.dir;
+                    string stopped = RecordStop(true, "srec record stop load");
+                    if (stopped.StartsWith("failed:", StringComparison.Ordinal)) return stopped;
+                    string loaded = Load(new List<string> { "srec", "load", take });
+                    return loaded.StartsWith("srec loaded", StringComparison.Ordinal) ? loaded + "\n" + stopped : loaded + "\nthe recording itself was stopped: " + stopped;
                 case "status":
+                    bool json = TakeJson(a, 3);
+                    if (json) return JsonLine.Write(manual != null ? RecordJson(manual) : RecordIdleJson());
                     if (manual != null) return RecordLine(manual);
-                    return SceneRecorder.active != null ? "recording (mcam): " + RecorderStatus(SceneRecorder.active) : "not recording";
+                    if (SceneRecorder.active != null) return "recording (mcam): " + RecorderStatus(SceneRecorder.active);
+                    return "not recording" + (lastRecord.Length > 0 ? "; last record: " + lastRecord : "");
             }
             return RecordUsage;
         }
 
+        // A word is key=value when the part before the first '=' is a plain key; a folder with '=' in its name still works
+        // when it has a drive or a separator before it.
+        static bool IsPair(string s)
+        {
+            int eq = s != null ? s.IndexOf('=') : -1;
+            if (eq <= 0) return false;
+            for (int i = 0; i < eq; i++) if (!char.IsLetterOrDigit(s[i]) && s[i] != '_' && s[i] != '.') return false;
+            return true;
+        }
+
         static string RecordStart(List<string> a)
         {
-            if (a.Count < 4) return RecordUsage;
+            if (a.Count < 3) return RecordUsage;
             string busy = Busy();
             if (busy != null) return busy;
-            if (manual != null) return "already recording -> " + manual.dir + " (srec record stop first)";
-            if (viewer != null) return "a recording is loaded in the viewer: srec end first";
-            if (probe != null) return "a probe is running: srec probe stop first";
-            if (MultiCamHide.Active) { MultiCamHide.Restore(); DevLog.Write("[srec] an mcam hide / backfaces set was still applied: restored before the record scan"); }
+            if (manual != null) return "busy: already recording -> " + manual.dir + " (srec record stop first)";
+            if (viewer != null) return "busy: a recording is loaded in the viewer: srec end first";
+            if (probe != null) return "busy: a probe is running: srec probe stop first";
+            bool named = a.Count > 3 && !IsPair(a[3]);
+            int from = named ? 4 : 3;
             string dir;
-            try { dir = Path.GetFullPath(a[3]); } catch (Exception e) { return "bad dir: " + e.Message; }
+            try { dir = named ? RplXTakes.Under(RplXTakes.Root(), a[3]) : RplXTakes.NewTake(RplXTakes.Root(), DateTime.Now, p => Directory.Exists(p) || File.Exists(p)); }
+            catch (Exception e) { return "refused: bad dir '" + (named ? a[3] : "") + "': " + e.Message; }
+            if (MultiCamHide.Active) { MultiCamHide.Restore(); DevLog.Write("[srec] an mcam hide / backfaces set was still applied: restored before the record scan"); }
             var report = new SpecReport();
             MultiCamPlan plan = null;
             RecordSpec baseSpec = null;
-            string specPath = OwnArg(a, 4, "spec");
+            string specPath = OwnArg(a, from, "spec");
             if (specPath != null)
             {
                 plan = LoadSpec(specPath, report);
                 if (plan != null && plan.spec != null && plan.spec.replay != null && plan.spec.replay.record != null) baseSpec = plan.spec.replay.record;
             }
             bool audioOn, overwrite;
-            var spec = RecordArgsOn(baseSpec ?? new RecordSpec(), a, 4, report, out audioOn, out overwrite);
+            var spec = RecordArgsOn(baseSpec ?? new RecordSpec(), a, from, report, out audioOn, out overwrite);
             if (File.Exists(Path.Combine(dir, ReplayConst.RecordFile)) && !overwrite) report.Error("srec.dir", dir + " already holds a recording (use a new folder or overwrite=on)");
             var keep = KeepCullers(spec, report);
-            if (!report.ok) return "srec record start refused:\n" + report.Summary(20);
+            if (!report.ok) return "refused: srec record start: " + FirstError(report) + "\n" + report.Summary(20);
             AudioCapSpec aspec = null;
             if (audioOn)
             {
@@ -487,8 +794,9 @@ namespace InsideDev
                 aspec.capture = "record";
                 string why;
                 try { why = AudioCapture.Preflight(aspec); } catch (Exception e) { why = e.GetType().Name + ": " + e.Message; }
-                if (why != null) return "srec record start refused: audio preflight: " + why;
+                if (why != null) return "refused: srec record start: audio preflight: " + why;
             }
+            lastRecord = "";
             var m = new ManualRecord();
             m.spec = spec;
             m.dir = dir;
@@ -512,7 +820,7 @@ namespace InsideDev
             EnsureHost();
             return "srec record start: waiting for " + m.keep.Count + " kept subscene(s) to load and activate (up to " + KeepTimeout.ToString("0", IC) + " s): " +
                    string.Join(", ", m.keptNames.ToArray()) + "; the recording starts " + (Settles(m) ? m.spec.settleFrames + " frame(s) after that (record.settleFrames, late-awake content)" : "then") +
-                   " (srec record status shows it, srec record stop cancels)" +
+                   " (srec record status shows it, srec record stop cancels); folder " + m.dir +
                    (report.warnings.Count + report.notes.Count > 0 ? "\n" + report.Summary(20) : "");
         }
 
@@ -549,7 +857,7 @@ namespace InsideDev
             if (fail != null)
             {
                 Abandon(m, report);
-                return "srec record start " + fail + ", restored:\n" + report.Summary(20);
+                return (fail.StartsWith("refused", StringComparison.Ordinal) ? "refused: " : "failed: ") + "srec record start " + fail + ", restored: " + FirstError(report) + "\n" + report.Summary(20);
             }
             manual = m;
             try { m.rec.Event("srec", "record start", m.line); } catch (Exception e) { report.Warn("srec.event", e.Message); }
@@ -561,7 +869,7 @@ namespace InsideDev
               .Append(" (display ").Append(m.refresh).Append(" Hz), roots ").Append(string.Join(",", spec.roots.ToArray()));
             if (m.keptNames.Count > 0) sb.Append(", kept ").Append(string.Join(",", m.keptNames.ToArray()));
             if (m.events != null) sb.Append(", ").Append(m.plan.spec.events.Count).Append(" spec event(s) armed");
-            sb.Append(m.audioOn ? ", audio capture on" : ", no audio").Append("; srec event <name> marks a moment, srec record stop [keep] ends it");
+            sb.Append(m.audioOn ? ", audio capture on" + (m.audioSilent ? " (SILENT: the capture level is 0)" : "") : ", no audio").Append("; srec event <name> marks a moment, srec record stop [keep|load] ends it");
             if (report.warnings.Count + report.notes.Count > 0) sb.Append('\n').Append(report.Summary(20));
             return sb.ToString();
         }
@@ -652,7 +960,7 @@ namespace InsideDev
             if (!ready) report.Warn("srec.keep", (m.keep.Count - KeepReadyCount(m)) + " of " + m.keep.Count + " kept subscene(s) not loaded and active after " + KeepTimeout.ToString("0", IC) + " s: they join the recording when they load");
             else if (m.settled >= 0) report.Note("srec.settle", "sample 0 " + m.settled + " frame(s) after the kept subscenes were loaded and active (record.settleFrames " + m.spec.settleFrames + ")");
             string res = RecordBegin(m, report);
-            lastRecord = res.Split('\n')[0];
+            lastRecord = res.StartsWith("recording -> ", StringComparison.Ordinal) ? "" : res;
             DevLog.Write("[srec] record start after the kept subscenes: " + res);
         }
 
@@ -712,11 +1020,11 @@ namespace InsideDev
         {
             if (a.Count < 3) return EventUsage;
             string name = a[2];
-            if (!SceneRecorder.EventName(name)) return "bad event name '" + name + "': " + EventUsage.Substring(7);
+            if (!SceneRecorder.EventName(name)) return "usage: bad event name '" + name + "': " + EventUsage.Substring(7);
             string detail = a.Count > 3 ? string.Join(" ", a.GetRange(3, a.Count - 3).ToArray()) : "srec event";
             var r = SceneRecorder.active;
             int sample = r != null ? r.samples : -1;
-            if (!SceneRecorder.PostEvent(name, detail)) return "no active recording: event '" + name + "' not stored (srec record start or mcam record first)";
+            if (!SceneRecorder.PostEvent(name, detail)) return "refused: no active recording: event '" + name + "' not stored (srec record start or mcam record first)";
             string owner = manual != null && manual.rec == r ? "manual recording " + manual.dir : "mcam recording";
             return "event '" + name + "' stored with sample " + sample + " of the " + owner;
         }
@@ -728,10 +1036,12 @@ namespace InsideDev
             {
                 AudioCapture.Ensure();
                 AudioCapture.clockBase = m.header.t0Real;
+                AudioCapture.gameBase = m.header.t0;
                 started = AudioCapture.Start(m.audio, m.dir, report);
             }
             catch (Exception e) { report.Error("audio", e.GetType().Name + ": " + e.Message); started = false; }
             if (!started) return "refused by the audio capture";
+            m.audioSilent = AudioCapture.SilentNow;
             try
             {
                 AudioCapture.Marker("s0", 0, 0.0, 0);
@@ -773,7 +1083,8 @@ namespace InsideDev
             {
                 m.waiting = false;
                 ReleaseKept(m);
-                return "srec record start cancelled (" + why + "): it was waiting for " + (m.keep.Count - KeepReadyCount(m)) + " of " + m.keep.Count + " kept subscene(s)";
+                lastRecord = "srec record start cancelled (" + why + "): it was waiting for " + (m.keep.Count - KeepReadyCount(m)) + " of " + m.keep.Count + " kept subscene(s)";
+                return lastRecord;
             }
             var report = new SpecReport();
             if (m.audioOn) AudioOff(why, report);
@@ -802,9 +1113,56 @@ namespace InsideDev
             catch (Exception e) { report.Error("srec record stop", (keep ? "HandOver: " : "Restore: ") + e.GetType().Name + ": " + e.Message); hand = "restore failed"; }
             ReleaseKept(m);
             RestorePacing(m);
-            return "recording stopped -> " + m.dir + ": " + m.rec.samples + " samples, " + m.rec.objects + " objects, " + (m.rec.bytes / 1048576.0).ToString("0.0", IC) + " MB, " +
-                   seconds.ToString("0.00", IC) + " s, pacing changes " + m.changes + (m.audioLost ? ", audio window closed early" : "") + "; " + hand +
-                   (report.errors.Count + report.warnings.Count + report.notes.Count > 0 ? "\n" + report.Summary(20) : "");
+            if (pending != null && keep) { pendingLoads = RplXLoad.Count(); handoverNote = ""; }
+            string head = report.errors.Count > 0 ? "failed: recording stopped with " + report.errors.Count + " error(s) (" + report.errors[0] + ") -> " : "recording stopped -> ";
+            string line = head + m.dir + ": " + m.rec.samples + " samples, " + m.rec.objects + " objects, " + (m.rec.bytes / 1048576.0).ToString("0.0", IC) + " MB, " +
+                   seconds.ToString("0.00", IC) + " s, pacing changes " + m.changes +
+                   (m.audioOn ? (m.audioLost ? ", audio window closed early" : m.audioSilent ? ", audio captured at level 0 (silent)" : ", audio captured") + " (acap result shows the WAV check once it is finalized)" : "") + "; " + hand;
+            lastRecord = line;
+            return line + (report.errors.Count + report.warnings.Count + report.notes.Count > 0 ? "\n" + report.Summary(20) : "");
+        }
+
+        // The recorder stops sampling for good when its writer fails or 30 samples in a row had errors (Failed). A clean early
+        // stop (limit, disk space, level load) is handled by Orphans.
+        static bool RecorderFailed(ManualRecord m, out string why)
+        {
+            why = m.rec.Failed ? m.rec.StopReason : null;
+            return why != null;
+        }
+
+        static Json.Obj RecordJson(ManualRecord m)
+        {
+            var o = new Json.Obj();
+            o["state"] = m.waiting ? "waiting" : "recording";
+            o["dir"] = m.dir;
+            if (m.waiting)
+            {
+                o["keptReady"] = KeepReadyCount(m);
+                o["kept"] = m.keep.Count;
+                o["secondsLeft"] = Math.Round(Math.Max(0f, m.waitUntil - Time.realtimeSinceStartup), 1);
+                return o;
+            }
+            o["samples"] = m.rec.samples;
+            o["objects"] = m.rec.objects;
+            o["bytes"] = m.rec.bytes;
+            o["seconds"] = Math.Round(m.header != null ? Time.timeDbl - m.header.t0 : 0.0, 3);
+            o["fps"] = Math.Round(RecentFps(m.frameTimes), 1);
+            o["driftMs"] = Math.Round(m.driftMs, 2);
+            o["pacingChanges"] = m.changes;
+            o["audio"] = m.audioOn ? (m.audioLost ? "closed" : m.audioSilent ? "silent" : "on") : "off";
+            o["specEventsFired"] = m.events != null ? m.eventRows : 0;
+            o["recorder"] = Json.Parse(m.rec.StatusJson());
+            return o;
+        }
+
+        static Json.Obj RecordIdleJson()
+        {
+            var o = new Json.Obj();
+            o["state"] = SceneRecorder.active != null ? "recording (mcam)" : "idle";
+            if (SceneRecorder.active != null) o["recorder"] = Json.Parse(SceneRecorder.ActiveStatusJson());
+            o["lastRecord"] = lastRecord;
+            o["failed"] = lastRecord.StartsWith("failed:", StringComparison.Ordinal) || lastRecord.StartsWith("refused:", StringComparison.Ordinal) || lastRecord.StartsWith("cannot ", StringComparison.Ordinal);
+            return o;
         }
 
         static string RecordLine(ManualRecord m)
@@ -854,6 +1212,14 @@ namespace InsideDev
         static void RecordTick(ManualRecord m)
         {
             if (m.rec == null) return;
+            string failed;
+            if (RecorderFailed(m, out failed))
+            {
+                string stop = RecordStop(false, "recorder failed: " + failed);
+                if (!lastRecord.StartsWith("failed:", StringComparison.Ordinal)) lastRecord = "failed: " + failed + "; " + lastRecord;
+                DevLog.Write("ERROR [srec] the recorder failed, the manual recording was stopped: " + stop);
+                return;
+            }
             m.frames++;
             if (m.frames > 1) m.frameTimes.Add(Time.unscaledDeltaTime);
             if (Time.captureFramerate != m.wantCapture || QualitySettings.vSyncCount != m.wantVsync || Application.targetFrameRate != m.wantTarget)
@@ -1005,8 +1371,9 @@ namespace InsideDev
             if (v == "result") return lastProbeFull.Length > 0 ? lastProbeFull : "no probe result yet";
             string busy = Busy();
             if (busy != null) return busy;
-            if (probe != null) return "a probe is running (" + ProbeLine(probe) + "): srec probe stop first";
-            if (manual != null) return "recording in progress: srec record stop first";
+            if (probe != null) return "busy: a probe is running (" + ProbeLine(probe) + "): srec probe stop first";
+            if (manual != null) return "busy: recording in progress: srec record stop first";
+            if (RplXLoad.Loading()) return "busy: the game is loading a level: srec probe again when it has finished";
             if (v == "camera") return CameraProbeStart(a);
             int n = 60, from = 2;
             if (v.Length > 0 && v.IndexOf('=') < 0)
@@ -1014,7 +1381,7 @@ namespace InsideDev
                 if (!int.TryParse(v, NumberStyles.Integer, IC, out n) || n < 1 || n > 10000) return "usage: srec probe [n] [eps=m] [rot=deg] [out=dir] | srec probe camera [n] ...";
                 from = 3;
             }
-            if (viewer == null) return "srec probe needs a loaded recording (srec load <dir>): it compares the replayed transforms at lateWrite with the last component OnPreCull";
+            if (viewer == null) return "refused: srec probe needs a loaded recording (srec load <dir>): it compares the replayed transforms at lateWrite with the last component OnPreCull" + (closedNote.Length > 0 ? " (" + closedNote + ")" : "");
             return WriteProbeStart(a, from, n);
         }
 
@@ -1031,11 +1398,11 @@ namespace InsideDev
             foreach (var k in extra.order) report.Error("srec.probe", "unknown key '" + k + "' (eps, rot, out)");
             float eps = OwnFloat(own, "eps", 1e-5f, report), rot = OwnFloat(own, "rot", 1e-3f, report);
             string outDir = OwnDir(own, viewerDir, report);
-            if (!report.ok) return "srec probe refused:\n" + report.Summary(10);
+            if (!report.ok) return "refused: srec probe: " + FirstError(report) + "\n" + report.Summary(10);
             var cam = RenderHost.WorldCam();
-            if (cam == null) return "no gameplay camera";
+            if (cam == null) return "refused: no gameplay camera";
             var rec = viewer.tracks != null ? viewer.tracks.rec : null;
-            if (rec == null) return "the replayer has no object table";
+            if (rec == null) return "refused: the replayer has no object table";
             var list = new List<Transform>();
             for (int id = 0; id < rec.objects.Count; id++)
             {
@@ -1046,13 +1413,14 @@ namespace InsideDev
                 try { t = viewer.Resolved(id) as Transform; } catch { t = null; }
                 if (t != null) list.Add(t);
             }
-            if (list.Count == 0) return "no resolved transform in the recording";
+            if (list.Count == 0) return "refused: no resolved transform in the recording";
             var p = new ProbeRun();
             p.kind = "write";
             p.phase = "starting";
             p.frames = n;
             p.dir = outDir;
             p.tick = Time.frameCount;
+            p.loads = RplXLoad.Count();
             probe = p;
             EnsureHost();
             host.StartCoroutine(WriteProbe(p, list, cam, eps, rot));
@@ -1175,13 +1543,14 @@ namespace InsideDev
             var report = new SpecReport();
             var own = new Dictionary<string, string>();
             var o = KeyValues(a, from, typeof(RecordSpec), CameraProbeOwnKeys, own, report);
+            RefuseUnknown(o, typeof(RecordSpec), CameraProbeOwnKeys, report);
             var spec = new RecordSpec();
             SpecBind.Fill(spec, o, "srec", report);
             float dx = OwnFloat(own, "dx", 1.5f, report), yaw = OwnFloat(own, "yaw", 10f, report), eps = OwnFloat(own, "eps", 1e-5f, report), rot = OwnFloat(own, "rot", 1e-3f, report);
             string outDir = OwnDir(own, ModDir(), report);
-            if (!report.ok) return "srec probe camera refused:\n" + report.Summary(10);
+            if (!report.ok) return "refused: srec probe camera: " + FirstError(report) + "\n" + report.Summary(10);
             var cam = RenderHost.WorldCam();
-            if (cam == null) return "no gameplay camera";
+            if (cam == null) return "refused: no gameplay camera";
             var p = new ProbeRun();
             p.kind = "camera";
             p.phase = "starting";
@@ -1189,6 +1558,7 @@ namespace InsideDev
             p.dir = outDir;
             p.freeze = viewer == null;
             p.tick = Time.frameCount;
+            p.loads = RplXLoad.Count();
             probe = p;
             EnsureHost();
             host.StartCoroutine(CameraProbe(p, n, dx, yaw, eps, rot, spec, report));
@@ -1209,7 +1579,11 @@ namespace InsideDev
             playing = false;
             p.cleanup = () =>
             {
-                if (wasFree) CameraControl.Set(aP, aR, fov);
+                if (p.gone)
+                {
+                    if (!wasFree) CameraControl.EndCapture();
+                }
+                else if (wasFree) CameraControl.Set(aP, aR, fov);
                 else
                 {
                     CameraControl.EndCapture();
@@ -1219,8 +1593,12 @@ namespace InsideDev
                 CameraControl.quiet = wasQuiet;
                 if (p.freeze)
                 {
-                    try { GameManager.TimeScale = gmBefore; } catch { }
-                    Time.timeScale = tsBefore;
+                    if (p.gone) DevLog.Write("[srec] probe: " + RplXLoad.TimeToGame());
+                    else
+                    {
+                        try { GameManager.TimeScale = gmBefore; } catch { }
+                        Time.timeScale = tsBefore;
+                    }
                 }
                 playing = wasPlaying && viewer != null;
             };
@@ -1356,7 +1734,7 @@ namespace InsideDev
             {
                 Directory.CreateDirectory(p.dir);
                 string[] old = File.Exists(file) ? File.ReadAllLines(file) : new string[0];
-                File.WriteAllText(file, MergeCameraDriven(old, scanned, rows, out kept));
+                SafeFile.WriteAllText(file, MergeCameraDriven(old, scanned, rows, out kept), true);
                 written = file + (kept > 0 ? " (" + kept + " row(s) of other transforms kept)" : "");
             }
             catch (Exception e) { written = "not written (" + e.Message + ")"; }
@@ -1497,6 +1875,7 @@ namespace InsideDev
 
         static void EnsureHost()
         {
+            idleFrames = 0;
             if (host != null) return;
             var go = new GameObject("InsideDev SceneCommands");
             UObj.DontDestroyOnLoad(go);
@@ -1527,12 +1906,43 @@ namespace InsideDev
         static void PhaseTick()
         {
             try { Orphans(); } catch (Exception e) { Fail("orphans", e); }
+            try { LevelLoad(); } catch (Exception e) { Fail("level load", e); }
             try { if (viewer != null || (probe != null && probe.freeze)) HoldFreeze(); } catch (Exception e) { Fail("freeze", e); }
             var m = manual;
             if (m != null && m.waiting) { try { WaitTick(m); } catch (Exception e) { Fail("record wait", e); manual = null; ReleaseKept(m); } }
             else if (m != null) { try { RecordTick(m); } catch (Exception e) { Fail("record tick", e); } }
             var p = probe;
             if (p != null && Time.frameCount - p.tick > 300) StopProbe("stalled (no progress for 300 frames)");
+            if (viewer != null || manual != null || probe != null || pending != null) idleFrames = 0;
+            else if (++idleFrames > HostIdleFrames) DropHost();
+        }
+
+        // A probe and a pending record handover do not survive a level load: the probe stops without writing its saved
+        // camera pose or time scale into the load, the handover's cullers and kept subscenes go back to the game.
+        static void LevelLoad()
+        {
+            var p = probe;
+            if (p != null && RplXLoad.Seen(p.loads))
+            {
+                p.gone = true;
+                StopProbe("level load at frame " + Time.frameCount + " (nothing of the probe was written back)");
+            }
+            if (pending != null && RplXLoad.Seen(pendingLoads))
+            {
+                handoverNote = "released by a level load at frame " + Time.frameCount + " (" + ReleaseHandover(pending) + ")";
+                pending = null;
+                pendingFrom = "";
+                DevLog.Write("[srec] record handover " + handoverNote);
+            }
+        }
+
+        // Nothing to drive: the host and its two per-frame coroutines go away until the next load, record or probe.
+        static void DropHost()
+        {
+            var h = host;
+            host = null;
+            idleFrames = 0;
+            if (h != null) UObj.Destroy(h.gameObject);
         }
 
         static void Orphans()
@@ -1540,12 +1950,14 @@ namespace InsideDev
             var r = viewer;
             if (r != null && !r.active)
             {
-                if (probe != null) StopProbe("the replay ended outside srec");
+                bool load = r.EndedByLoad;
+                if (probe != null) { probe.gone = load; StopProbe(load ? "level load" : "the replay ended outside srec"); }
                 viewer = null;
                 viewerDir = "";
                 playing = false;
-                lastProbe = "viewer closed: the replay was ended outside srec (scene restored by its End)";
-                DevLog.Write("[srec] " + lastProbe);
+                closedNote = load ? "viewer closed: level load at frame " + r.EndFrame + " (scene state not restored, the load replaced it)"
+                                  : "viewer closed: the replay was ended outside srec at frame " + r.EndFrame + " (" + r.EndFacts() + ")";
+                DevLog.Write("[srec] " + closedNote);
             }
             var m = manual;
             if (m != null && m.rec != null && SceneRecorder.active != m.rec)
@@ -1553,6 +1965,32 @@ namespace InsideDev
                 string s = RecordStop(false, "recorder ended outside srec");
                 DevLog.Write("[srec] " + s);
             }
+            else if (m != null && !m.waiting && m.rec != null && m.rec.Stopped && !m.rec.Failed)
+            {
+                // a limit, low disk space or a level load ended the sampling; a failure is RecordTick's (lastRecord "failed: ...")
+                string why = "recording ended early: " + m.rec.StopReason;
+                string s = RecordStop(false, why);
+                lastRecord = why + " | " + s.Split('\n')[0];
+                DevLog.Write("[srec] " + why + "; " + s);
+            }
+        }
+
+        // Quick, read-only rows for the doctor command.
+        internal static List<Doctor.Row> DoctorRows()
+        {
+            var rows = new List<Doctor.Row>();
+            string root = RplXTakes.Root();
+            rows.Add(new Doctor.Row("srec viewer", "take folder", Doctor.Info, root + (Directory.Exists(root) ? "" : " (made by the first srec record start)")));
+            var r = viewer;
+            if (r != null)
+                rows.Add(new Doctor.Row("srec viewer", "viewer", Doctor.Info, "loaded: " + viewerDir + ", the game is frozen by it (Time.timeScale " + Time.timeScale.ToString("0.###", IC) + ")", "srec end"));
+            else if (closedNote.Length > 0) rows.Add(new Doctor.Row("srec viewer", "viewer", Doctor.Info, closedNote, "srec reload"));
+            else rows.Add(new Doctor.Row("srec viewer", "viewer", Doctor.Ok, "nothing loaded"));
+            if (manual != null) rows.Add(new Doctor.Row("srec viewer", "recording", Doctor.Info, manual.waiting ? "waiting to record " + manual.dir : "recording " + manual.dir, "srec record stop"));
+            else if (lastRecord.StartsWith("failed:", StringComparison.Ordinal)) rows.Add(new Doctor.Row("srec viewer", "recording", Doctor.Warn, lastRecord.Split('\n')[0], "srec record start again; the log names the failed sample"));
+            if (pending != null) rows.Add(new Doctor.Row("srec viewer", "record handover", Doctor.Warn, "pending from " + pendingFrom + ": " + HandoverText(pending) + " stay forced / loaded", "srec load (takes it) or srec end (releases it)"));
+            if (errorCount > 0) rows.Add(new Doctor.Row("srec viewer", "frame phases", Doctor.Warn, errorCount + " error(s) in the srec frame phases since the game started (log)"));
+            return rows;
         }
 
         internal static void HostGone(SceneCommandsHost h)
@@ -1591,6 +2029,25 @@ namespace InsideDev
                 o[k] = f != null ? ArgValue(f.FieldType, v) : v;
             }
             return o;
+        }
+
+        // A key that is neither one of the command's own keys nor a field of the spec node is an error that names the valid
+        // ones (a typo must not run the command with a default); the key is taken out so it is reported once.
+        internal static void RefuseUnknown(Json.Obj o, Type node, string[] ownKeys, SpecReport report)
+        {
+            List<string> bad = null;
+            foreach (var k in o.order) if (SpecBind.Field(node, k) == null) (bad ?? (bad = new List<string>())).Add(k);
+            if (bad == null) return;
+            var valid = new List<string>();
+            if (ownKeys != null) valid.AddRange(ownKeys);
+            foreach (var f in SpecBind.Fields(node)) if (!valid.Contains(f.Name)) valid.Add(f.Name);
+            string list = string.Join(", ", valid.ToArray());
+            foreach (var k in bad)
+            {
+                o.Remove(k);
+                o.order.Remove(k);
+                report.Error("srec." + k, "unknown argument '" + k + "' (valid: " + list + ")");
+            }
         }
 
         internal static object ArgValue(Type t, string v)
@@ -1661,6 +2118,7 @@ namespace InsideDev
             }
             if (own.TryGetValue("audio", out v) && !TryBool(v, out audioOn)) report.Error("srec.audio", "on or off expected, got '" + v + "'");
             if (own.TryGetValue("overwrite", out v) && !TryBool(v, out overwrite)) report.Error("srec.overwrite", "on or off expected, got '" + v + "'");
+            RefuseUnknown(o, typeof(RecordSpec), RecordOwnKeys, report);
             if (spec == null) spec = new RecordSpec();
             SpecBind.Fill(spec, o, "srec", report);
             LintRecord(spec, audioOn, report);
@@ -1681,6 +2139,9 @@ namespace InsideDev
             if (s.Has("res")) r.Warn("srec.res", "ignored: a manual record keeps the current resolution");
             if (s.Has("captureGame") && s.captureGame) r.Warn("srec.captureGame", "ignored: game frames are grabbed by mcam record only");
             if (s.keepSpawned) r.Warn("srec.keepSpawned", "P2, not built");
+            if (s.post) r.Warn("srec.post", "not built: post-processing values are not recorded");
+            if (s.maxMB < 0 || s.maxSeconds < 0f || s.minFreeMB < 0) r.Error("srec", "maxMB, maxSeconds and minFreeMB must not be negative");
+            if (Array.IndexOf(ReplayConst.OnLoads, s.onLoad) < 0) r.Error("srec.onLoad", "continue or stop expected");
             if (s.rescanEvery < 1) r.Error("srec.rescanEvery", "must be at least 1");
             if (s.posEps <= 0f || s.rotEps <= 0f || s.cut <= 0f) r.Error("srec", "posEps, rotEps and cut must be positive");
         }
@@ -1700,12 +2161,14 @@ namespace InsideDev
                 else if (v != "game") report.Error("srec.cam", "game or keep expected, got '" + v + "'");
             }
             var spec = new PlaySpec();
-            SpecBind.Fill(spec, o, "srec", report);
             var root = new Json.Obj();
             var rp = new Json.Obj();
             rp["play"] = o;
             root["replay"] = rp;
+            int errorsBefore = report.errors.Count;
             ReplayConst.CheckRemoved(root, report);
+            if (report.errors.Count == errorsBefore) RefuseUnknown(o, typeof(PlaySpec), LoadOwnKeys, report);
+            SpecBind.Fill(spec, o, "srec", report);
             Allowed(report, "look", spec.look, ReplayConst.Looks);
             Allowed(report, "order", spec.order, ReplayConst.Orders);
             Allowed(report, "interp", spec.interp, ReplayConst.Interps);
@@ -1797,6 +2260,38 @@ namespace InsideDev
                 return true;
             }
             if (!double.TryParse(s, NumberStyles.Float, IC, out t) || double.IsNaN(t) || double.IsInfinity(t)) { t = now; error = "seconds, start, end or @event[+-s] expected, got '" + s + "'"; return false; }
+            return true;
+        }
+
+        // The forms of `srec seek`: words[from] alone is a ParseTime form, "sample:<n>" (the time of that sample) or "<p>%"
+        // of the duration; "rel <seconds>" moves from now. Anything left over is an error.
+        internal static bool ParseSeek(List<string> words, int from, double now, double duration, int sampleCount, Func<int, double> sampleTime, Func<string, double> eventTime, out double t, out string error)
+        {
+            t = now;
+            error = null;
+            if (words == null || from >= words.Count || string.IsNullOrEmpty(words[from])) { error = "time expected"; return false; }
+            string s = words[from], v = s.ToLowerInvariant();
+            int used = 1;
+            double x;
+            if (v == "rel")
+            {
+                if (from + 1 >= words.Count || !double.TryParse(words[from + 1], NumberStyles.Float, IC, out x) || double.IsNaN(x) || double.IsInfinity(x)) { error = "rel needs seconds (rel -0.5)"; return false; }
+                t = now + x;
+                used = 2;
+            }
+            else if (v.StartsWith("sample:", StringComparison.Ordinal))
+            {
+                int n;
+                if (!int.TryParse(v.Substring(7), NumberStyles.Integer, IC, out n) || n < 0 || n >= sampleCount || sampleTime == null) { error = "sample:<n> needs 0.." + (sampleCount - 1) + ", got '" + s + "'"; return false; }
+                t = sampleTime(n);
+            }
+            else if (v.Length > 1 && v[v.Length - 1] == '%')
+            {
+                if (!double.TryParse(v.Substring(0, v.Length - 1), NumberStyles.Float, IC, out x) || double.IsNaN(x) || x < 0.0 || x > 100.0) { error = "a percentage 0..100 expected, got '" + s + "'"; return false; }
+                t = duration * x / 100.0;
+            }
+            else if (!ParseTime(s, now, duration, eventTime, out t, out error)) return false;
+            if (from + used < words.Count) { t = now; error = "unexpected '" + words[from + used] + "'"; return false; }
             return true;
         }
 

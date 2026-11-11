@@ -8,8 +8,8 @@ using UnityEngine;
 
 namespace InsideDev
 {
-    // Replay mode REC_B (docs/REPLAY_DESIGN.md 4.2): scene.srec writer (pooled blocks, writer thread, bounded queue
-    // of 64, per-block CRC) and reader (crash-prefix recovery, footer cross-check, particle frames on demand).
+    // Replay mode REC_B (docs/REPLAY_DESIGN.md 4.2): scene.srec writer (pooled blocks, writer thread, queue bounded by
+    // 600 blocks or 96 MB, per-block CRC) and reader (crash-prefix recovery, footer cross-check, particle frames on demand).
     // Contract (frozen public shapes; REC_B adds private/internal members only):
     // - REC_A (SceneRecorder) writes through SrecWriter: constructor (preamble + SRHD), Objects once (OBJT), then per
     //   sample BeginSample, the typed entries, EndSample; Close at the end (INDX + SEND, joins the thread). Entries of one
@@ -49,8 +49,15 @@ namespace InsideDev
     //   object's current parent id; Light fills only the fields in mask (cookie -1 otherwise); Material passes texture -1
     //   for non-texture kinds; SharedMat material and Light cookie are string ids, -1 = none. SrecObject prop lists stay
     //   as in OBJT/OBJA: MatProp additions reach sinks only through MatProp.
+    // - SRHD holds the RecordHeader fields in declaration order. Fields are only ever appended: a reader stops at the end of
+    //   the payload (an older file, the missing trailing fields keep their defaults) and ignores bytes after the last field
+    //   it knows (a newer file); a header.version above SrecConst.ContentVersion is reported as a warning.
+    // - Index limits (SrecConst.MaxMatProps, MaxMatSlots, MaxRenderFields, MaxStringGap): the writer drops an entry at or
+    //   above them and sets `error`, the reader treats one as a damaged block (the prefix before it is kept).
     // Internal helpers for PLAY: SrecReader.ReadParticles(rec, obj, sample, ParticleSystem.Particle[]) (same result codes),
     // SceneRecording.Release() closes the particle file handle, SrecWriter.queued = blocks waiting for the thread.
+    // Writer failure: once a write or flush fails (disk full, file gone) or the thread ends without Close, writeFailed is
+    // true, `error` holds the first message and later blocks are dropped; the recorder polls it every sample.
     public sealed class SrecObject
     {
         public int id, parentId = -1, depth, instanceId;
@@ -304,27 +311,46 @@ namespace InsideDev
         public void Strs(List<string> dst) { dst.Clear(); int n = Count(1); for (int i = 0; i < n; i++) dst.Add(Str()); }
     }
 
+    // CRC-32 (IEEE, as zlib.crc32), eight bytes per step (slicing by 8): Table[s * 256 + b] is the CRC of byte b followed
+    // by s zero bytes.
     internal static class SrecCrc
     {
         static readonly uint[] Table = Make();
 
         static uint[] Make()
         {
-            var t = new uint[256];
+            var t = new uint[8 * 256];
             for (uint i = 0; i < 256; i++)
             {
                 uint c = i;
                 for (int k = 0; k < 8; k++) c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
                 t[i] = c;
             }
+            for (int i = 0; i < 256; i++)
+            {
+                uint c = t[i];
+                for (int s = 1; s < 8; s++) { c = t[c & 0xFF] ^ (c >> 8); t[s * 256 + i] = c; }
+            }
             return t;
         }
 
-        public static uint Compute(byte[] d, int off, int n)
+        public static unsafe uint Compute(byte[] d, int off, int n)
         {
             uint c = 0xFFFFFFFFu;
-            var t = Table;
-            for (int i = off, e = off + n; i < e; i++) c = t[(c ^ d[i]) & 0xFF] ^ (c >> 8);
+            if (n <= 0) return ~c;
+            if (d == null || off < 0 || off > d.Length - n) throw new ArgumentOutOfRangeException("n", "CRC range " + off + "+" + n + " outside the buffer");
+            fixed (uint* t = Table)
+            fixed (byte* start = d)
+            {
+                byte* p = start + off;
+                for (; n >= 8; n -= 8, p += 8)
+                {
+                    uint a = c ^ (uint)(p[0] | p[1] << 8 | p[2] << 16 | p[3] << 24);
+                    c = t[7 * 256 + (a & 0xFF)] ^ t[6 * 256 + ((a >> 8) & 0xFF)] ^ t[5 * 256 + ((a >> 16) & 0xFF)] ^ t[4 * 256 + (a >> 24)]
+                      ^ t[3 * 256 + p[4]] ^ t[2 * 256 + p[5]] ^ t[256 + p[6]] ^ t[p[7]];
+                }
+                for (; n > 0; n--, p++) c = t[(c ^ *p) & 0xFF] ^ (c >> 8);
+            }
             return ~c;
         }
     }
@@ -366,16 +392,26 @@ namespace InsideDev
             b.I32(h.vSyncCount); b.I32(h.targetFrameRate); b.I32(h.refreshRate);
         }
 
+        // Fields are appended over the versions and never reordered: a payload that ends between two fields is an older
+        // file (the rest keeps the RecordHeader defaults), bytes after the last field read here are a newer recorder's.
+        // A payload that ends inside a field is damaged (SrecIn.Need throws).
         public static RecordHeader ReadHeader(SrecIn r)
         {
             var h = new RecordHeader();
             h.version = r.I32(); h.created = r.Str(); h.spec = r.Str(); h.level = r.Str(); h.recorderVersion = r.Str(); h.clock = r.Str();
+            if (r.pos == r.end) return h;
             h.captureFramerate = r.I32(); h.subscene = r.I32(); h.savepoint = r.I32(); h.streamVersion = r.I32(); h.screenW = r.I32(); h.screenH = r.I32();
+            if (r.pos == r.end) return h;
             h.fixedDeltaTime = r.F64(); h.t0 = r.F64(); h.t0Real = r.F64(); h.stepAtT0 = r.I64(); h.gameFov = r.F32();
+            if (r.pos == r.end) return h;
             r.Strs(h.subscenes); r.Strs(h.keptCullers); r.Strs(h.forcedCullers);
+            if (r.pos == r.end) return h;
             r.Strs(h.fogFields); r.Strs(h.postFields);
+            if (r.pos == r.end) return h;
             r.Strs(h.cameraDriven);
+            if (r.pos == r.end) return h;
             h.posEps = r.F32(); h.rotEps = r.F32(); h.cut = r.F32();
+            if (r.pos == r.end) return h;
             h.vSyncCount = r.I32(); h.targetFrameRate = r.I32(); h.refreshRate = r.I32();
             return h;
         }
@@ -449,8 +485,14 @@ namespace InsideDev
         public long bytes;
         public int samples, stalls;                                 // stalls: EndSample calls that waited for a full queue
         public string error;                                        // first writer thread failure or contract violation, null = ok
+        public volatile string writeError;                          // the write / flush failure that set writeFailed, null = none
 
-        const int QueueLimit = 64, BlockBudget = QueueLimit + 2;
+        // The queue holds what the disk has not taken yet: at most QueueLimit blocks or QueueBytes (about ten seconds of
+        // samples at 60 Hz); beyond that EndSample waits, so a dead disk stalls the game instead of exhausting memory.
+        // Blocks are allocated when first needed and PoolKeep of them stay pooled after a backlog drains.
+        const int QueueLimit = 600, BlockBudget = QueueLimit + 2, PoolKeep = 66, FirstBlocks = 4;
+        const long QueueBytes = 96L << 20;
+        const double DiskEverySeconds = 2.0;
         static readonly bool ParticleLayoutOk = SrecCodec.ParticleSize() == SrecConst.ParticleBytes;
 
         readonly FileStream file;
@@ -469,20 +511,23 @@ namespace InsideDev
         int[] frameId = new int[1 << 14], frameSample = new int[1 << 14];
         long[] frameOffset = new long[1 << 14];
         bool objectsDone, inSample, hasVirtual, closed, closing;
-        volatile bool failed;
+        volatile bool failed, loopDone;
+        readonly string folder;
+        long queuedBytes, free = -1;
         SrecStamp stamp;
 
         public SrecWriter(string path, RecordHeader h)
         {
             for (int i = 1; i < sec.Length; i++) sec[i] = new SrecBuf(i == SrecConst.SecParticles ? 1 << 16 : i == SrecConst.SecXf ? 1 << 15 : 1 << 10);
             file = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read, 1 << 20);
+            try { folder = Path.GetDirectoryName(Path.GetFullPath(path)); } catch (Exception) { folder = null; }
             var pre = new byte[8];
             SrecBuf.Put32(pre, 0, SrecConst.Magic);
             pre[4] = (byte)SrecConst.Version; pre[5] = (byte)(SrecConst.Version >> 8);
             file.Write(pre, 0, 8);
             bytes = 8;
-            for (int i = 0; i < BlockBudget; i++) pool.Push(new SrecBuf(1 << 16));
-            blocks = BlockBudget;
+            for (int i = 0; i < FirstBlocks; i++) pool.Push(new SrecBuf(1 << 16));
+            blocks = FirstBlocks;
             thread = new Thread(Loop);
             thread.IsBackground = true;
             thread.Name = "srec writer";
@@ -492,9 +537,19 @@ namespace InsideDev
             Frame(SrecConst.TagHead, head);
         }
 
-        internal int blocks, grows;                                 // pooled blocks (BlockBudget, preallocated; more only after the thread died), block buffer growths
+        internal int blocks, grows;                                 // blocks alive (pooled, queued or being filled; at most BlockBudget while the thread runs), block buffer growths
 
         internal int queued { get { lock (gate) return queue.Count; } }
+
+        internal long queuedLength { get { lock (gate) return queuedBytes; } }
+
+        // True once nothing more reaches the file: a write or flush failed (disk full, file gone) or the thread ended without
+        // Close. `error` holds the first message. Main thread.
+        public bool writeFailed { get { return failed || (loopDone && !closing); } }
+
+        // Free bytes on the record drive as the writer thread last saw them (looked up every 2 s while blocks arrive),
+        // -1 = not known (yet).
+        public long freeBytes { get { return Interlocked.Read(ref free); } }
 
         public int StringId(string s)
         {
@@ -596,7 +651,7 @@ namespace InsideDev
         public void Material(int id, byte kind, int prop, Vector4 value, int texture)
         {
             if (!Open(SrecConst.SecMaterials, id, false)) return;
-            if (kind > SrecConst.MatTexture || prop < 0) { Fail("Material: kind " + kind + " prop " + prop + " of id " + id + " invalid"); return; }
+            if (kind > SrecConst.MatTexture || prop < 0 || prop >= SrecConst.MaxMatProps) { Fail("Material: kind " + kind + " prop " + prop + " of id " + id + " invalid"); return; }
             var b = sec[SrecConst.SecMaterials];
             b.Int(id);
             b.U8(kind);
@@ -669,7 +724,7 @@ namespace InsideDev
         public void Render(int field, byte type, Vector4 value)
         {
             if (!inSample) { Fail("Render outside BeginSample/EndSample"); return; }
-            if (field < 0 || type > SrecConst.ValInt) { Fail("Render: field " + field + " type " + type + " invalid"); return; }
+            if (field < 0 || field >= SrecConst.MaxRenderFields || type > SrecConst.ValInt) { Fail("Render: field " + field + " type " + type + " invalid"); return; }
             var b = sec[SrecConst.SecRender];
             b.Int(field);
             b.U8(type);
@@ -710,7 +765,7 @@ namespace InsideDev
         public void SharedMat(int id, int slot, int material)
         {
             if (!Open(SrecConst.SecSharedMat, id, true)) return;
-            if (slot < 0) { Fail("SharedMat: slot " + slot + " of id " + id + " invalid"); return; }
+            if (slot < 0 || slot >= SrecConst.MaxMatSlots) { Fail("SharedMat: slot " + slot + " of id " + id + " invalid"); return; }
             var b = sec[SrecConst.SecSharedMat];
             Delta(SrecConst.SecSharedMat, id);
             b.Int(slot);
@@ -920,54 +975,91 @@ namespace InsideDev
             return b;
         }
 
+        bool Full(SrecBuf b) { return queue.Count >= QueueLimit || (queue.Count > 0 && queuedBytes + b.length > QueueBytes); }
+
+        void Recycle(SrecBuf b)
+        {
+            if (pool.Count < PoolKeep) pool.Push(b);
+            else blocks--;
+        }
+
         void Enqueue(SrecBuf b)
         {
             lock (gate)
             {
-                if (queue.Count >= QueueLimit && !failed)
+                if (Full(b) && !failed)
                 {
                     stalls++;
-                    while (queue.Count >= QueueLimit && !failed && thread.IsAlive) Monitor.Wait(gate, 100);
+                    while (Full(b) && !failed && thread.IsAlive) Monitor.Wait(gate, 100);
                 }
+                if (failed || loopDone) { Recycle(b); return; }
                 queue.Enqueue(b);
+                queuedBytes += b.length;
                 Monitor.PulseAll(gate);
             }
         }
 
         void Loop()
         {
-            while (true)
+            try
             {
-                SrecBuf b;
-                bool idle;
-                lock (gate)
+                long diskEvery = (long)(DiskEverySeconds * System.Diagnostics.Stopwatch.Frequency), diskAt = 0;
+                bool diskSeen = false;
+                while (true)
                 {
-                    while (queue.Count == 0 && !closing) Monitor.Wait(gate);
-                    if (queue.Count == 0) break;
-                    b = queue.Dequeue();
-                    idle = queue.Count == 0;
-                    Monitor.PulseAll(gate);
-                }
-                if (!failed)
-                {
-                    try
+                    SrecBuf b;
+                    bool idle;
+                    lock (gate)
                     {
-                        int len = b.length - 12;
-                        SrecBuf.Put32(b.data, 8 + len, SrecCrc.Compute(b.data, 8, len));
-                        file.Write(b.data, 0, b.length);
-                        if (idle) file.Flush();
+                        while (queue.Count == 0 && !closing) Monitor.Wait(gate);
+                        if (queue.Count == 0) break;
+                        b = queue.Dequeue();
+                        queuedBytes -= b.length;
+                        idle = queue.Count == 0;
+                        Monitor.PulseAll(gate);
                     }
-                    catch (Exception e) { failed = true; Fail("write failed: " + e.GetType().Name + ": " + e.Message); }
+                    if (!failed)
+                    {
+                        try
+                        {
+                            int len = b.length - 12;
+                            SrecBuf.Put32(b.data, 8 + len, SrecCrc.Compute(b.data, 8, len));
+                            file.Write(b.data, 0, b.length);
+                            if (idle) file.Flush();
+                        }
+                        catch (Exception e) { WriteFailed("write failed: " + e.GetType().Name + ": " + e.Message); }
+                    }
+                    lock (gate) { Recycle(b); Monitor.PulseAll(gate); }
+                    long now = System.Diagnostics.Stopwatch.GetTimestamp();
+                    if (!diskSeen || now - diskAt >= diskEvery)
+                    {
+                        diskSeen = true;
+                        diskAt = now;
+                        Interlocked.Exchange(ref free, SrecDisk.FreeBytes(folder));
+                    }
                 }
-                lock (gate) { pool.Push(b); Monitor.PulseAll(gate); }
+                try { file.Flush(); }
+                catch (Exception e) { WriteFailed("flush failed: " + e.GetType().Name + ": " + e.Message); }
             }
-            try { file.Flush(); }
-            catch (Exception e) { failed = true; Fail("flush failed: " + e.GetType().Name + ": " + e.Message); }
-            try { file.Close(); }
-            catch (Exception e) { Fail("close failed: " + e.GetType().Name + ": " + e.Message); }
+            catch (Exception e) { WriteFailed("writer thread: " + e.GetType().Name + ": " + e.Message); }
+            finally
+            {
+                try { file.Close(); }
+                catch (Exception e) { Fail("close failed: " + e.GetType().Name + ": " + e.Message); }
+                loopDone = true;
+                lock (gate) Monitor.PulseAll(gate);
+            }
         }
 
         void Fail(string message) { Interlocked.CompareExchange(ref error, message, null); }
+
+        // `error` keeps the first message of any kind, so the failure that stopped the file is kept on its own.
+        void WriteFailed(string message)
+        {
+            if (writeError == null) writeError = message;
+            failed = true;
+            Fail(message);
+        }
     }
 
     public sealed class SceneRecording
@@ -1161,6 +1253,7 @@ namespace InsideDev
                     uint len = SrecBuf.Get32(head, 4);
                     string name = SrecCodec.TagName(tag);
                     if (len > length - pos - 12) { stop = "incomplete " + name + " block at offset " + pos + " (" + len + " payload bytes, " + (length - pos - 12) + " left)"; break; }
+                    if (len > int.MaxValue - 16) { stop = name + " block at offset " + pos + ": length " + len + " is not valid"; decodeError = true; break; }
                     if (buf.Length < len + 4) buf = new byte[Math.Max((int)len + 4, buf.Length * 2)];
                     if (!ReadFully(fs, buf, (int)len + 4)) { stop = "read error in " + name + " block at offset " + pos; break; }
                     if (SrecCrc.Compute(buf, 0, (int)len) != SrecBuf.Get32(buf, (int)len))
@@ -1218,6 +1311,7 @@ namespace InsideDev
                     if (headerSeen) { report.Warn(path, "second SRHD at offset " + pos + " ignored"); return; }
                     rec.header = SrecCodec.ReadHeader(cur);
                     headerSeen = true;
+                    if (rec.header.version > SrecConst.ContentVersion) report.Warn(path, "content version " + rec.header.version + " is newer than this reader (" + SrecConst.ContentVersion + "): sections and header fields it does not know are skipped");
                     return;
                 case SrecConst.TagObjects:
                     if (objectsSeen || begun) throw new InvalidDataException("OBJT after the first sample or twice");
@@ -1318,6 +1412,7 @@ namespace InsideDev
             {
                 int id = cur.Int();
                 string s = cur.Str();
+                if (id < 0 || id - rec.strings.Count > SrecConst.MaxStringGap) throw new InvalidDataException("string id " + id + " is not valid (" + rec.strings.Count + " strings known)");
                 if (id < rec.strings.Count) { if (rec.strings[id] != s) report.Warn(path, "string " + id + " redefined"); continue; }
                 if (id > rec.strings.Count) report.Warn(path, "string table gap before id " + id);
                 while (rec.strings.Count < id) rec.strings.Add("");
@@ -1364,7 +1459,7 @@ namespace InsideDev
                             int id = Id(cur.Int());
                             int count = cur.Count(0);
                             if (cur.U8() != 0) throw new InvalidDataException("particle encoding of id " + id + " is not raw84");
-                            if (count > int.MaxValue / SrecConst.ParticleBytes) throw new InvalidDataException("particle count " + count);
+                            if (count < 0 || count > int.MaxValue / SrecConst.ParticleBytes) throw new InvalidDataException("particle count " + count);
                             int size = count * SrecConst.ParticleBytes;
                             cur.Need(size);
                             long data = blockPos + 8 + cur.pos;
@@ -1405,6 +1500,7 @@ namespace InsideDev
                             else if (kind == SrecConst.MatColor || kind == SrecConst.MatVector) value = cur.V4();
                             else if (kind == SrecConst.MatTexture) texture = StringRef(cur.Ref());
                             else throw new InvalidDataException("material kind " + kind + " of id " + id);
+                            if (prop < 0 || prop >= SrecConst.MaxMatProps) throw new InvalidDataException("material property index " + prop + " of id " + id);
                             Touch(id, sample);
                             if (sink != null) sink.Material(sample, id, kind, prop, value, texture);
                             break;
@@ -1456,6 +1552,7 @@ namespace InsideDev
                             else if (type == SrecConst.ValVec4) value = cur.V4();
                             else if (type == SrecConst.ValInt) value.x = cur.I32();
                             else throw new InvalidDataException("render value type " + type);
+                            if (field < 0 || field >= SrecConst.MaxRenderFields) throw new InvalidDataException("render field " + field);
                             if (sink != null) sink.Render(sample, field, type, value);
                             break;
                         }
@@ -1488,6 +1585,7 @@ namespace InsideDev
                             int id = Id(prev += cur.Int());
                             int slot = cur.Int();
                             int material = StringRef(cur.Ref());
+                            if (slot < 0 || slot >= SrecConst.MaxMatSlots) throw new InvalidDataException("shared material slot " + slot + " of id " + id);
                             Touch(id, sample);
                             if (sink != null) sink.SharedMat(sample, id, slot, material);
                             break;

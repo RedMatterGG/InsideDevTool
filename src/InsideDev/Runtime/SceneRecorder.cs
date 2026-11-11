@@ -44,7 +44,17 @@ namespace InsideDev
     // edges, WaterDust dust objects): activeSelf goes to CamActive; their Flags entries keep FlActive set.
     // Begin extends the RecordPrep of Prepare to Animations, Animators and cullers that appeared in between (subscenes
     // activated by the keep-loaded prepass), logged and counted in record.json `prep`. Scale is read every sample for
-    // 30 samples after an object's first sample and from its first scale change on (scaleVariant), else every 30th.
+    // 30 samples after an object's first sample and from its first scale change on (scaleVariant), on every wake of a
+    // dormant transform, else every 30th; a change found on such a late read is keyed as a step (pre-key with the old
+    // value at the sample before). Shared materials: slot 0 is compared every sample, the slots above it when slot 0
+    // changes and on a poll every 30th sample (Renderer.sharedMaterials allocates).
+    // One scene walk per start: the scan of Prepare is kept for the Begin or Prebuild of the same frame.
+    // Stop states (public, read by the hosts every frame): Stopped = no more samples are taken, Failed = stopped by an
+    // error (writer failure, 30 samples in a row with errors), StopKind / StopReason say why (also a
+    // record.maxMB / maxSeconds limit, record.minFreeMB, and a level load that left the record set empty for 3 s, or any
+    // level load with record.onLoad stop); the host ends the take (End) when Stopped turns true.
+    // A component whose read throws is left out from that sample on (warning with its path); the take goes on.
+    // Events posted after the last sample (the stop event of `srec record stop`) go into one closing sample at End.
     // "none" in string-id arguments (no texture, no cookie, no material) is -1. objects.tsv keys = entries of sections 1, 2,
     // 3, 4, 5, 9, 13, 14, 15 for that id (pre-keys included), as the INDX key counts of SrecFormat.cs.
     // Shader state (material round 2026-10-25, SceneShaderState.cs): globals from their script writers, shared-material
@@ -74,6 +84,7 @@ namespace InsideDev
             RestoreAnimation();
             if (handover == null) ReleaseCullers();
             if (current == this) current = null;
+            SceneRecorder.DropPrepared(this);
         }
 
         public ReplayHandover HandOver()
@@ -87,6 +98,7 @@ namespace InsideDev
                 DevLog.Write("srec: handover of " + handover.forced.Count + " forced culler(s) to the replay");
             }
             if (current == this) current = null;
+            SceneRecorder.DropPrepared(this);
             return handover;
         }
 
@@ -182,9 +194,10 @@ namespace InsideDev
         {
             public Transform t;
             public GameObject go;
-            public int parent = -1, depth;
+            public int parent = -1, depth, kids;                    // kids: child count when the walk saw it
             public string path = "", owner = "";
-            public List<int> ord, sib;
+            public List<int> ord, sib;                              // a walk root's own chains (ChainOf); null below it
+            public int ordSelf, sibSelf;                            // below a walk root: this level's entry (Chains)
             public byte kind = SrecConst.KindTransform;
             public bool spawned, forceWorld, camXf, camDriven, excludedMi;
             public Component[] comps;
@@ -219,6 +232,7 @@ namespace InsideDev
             public readonly Dictionary<int, Transform> joined = new Dictionary<int, Transform>();
             public List<string> excludePaths;
             public List<Transform> sceneAll;
+            public string[] sceneNames;
             public string zone = "";
             public bool auto, useBox;
             public Bounds box;
@@ -240,16 +254,30 @@ namespace InsideDev
             var res = new List<Transform>();
             q = (q ?? "").Trim().Trim('"');
             if (q.Length == 0) return res;
-            if (s.sceneAll == null) { try { s.sceneAll = Inspector.AllSceneTransforms(); } catch { s.sceneAll = new List<Transform>(); } }
-            bool slash = q.IndexOf('/') >= 0;
-            if (slash)
+            if (s.sceneAll == null)
             {
-                foreach (var t in s.sceneAll) if (t != null && Inspector.PathOf(t) == q) res.Add(t);
-                if (res.Count > 0) return res;
-                string suffix = "/" + q;
-                foreach (var t in s.sceneAll) if (t != null && Inspector.PathOf(t).EndsWith(suffix, StringComparison.Ordinal)) res.Add(t);
+                try { s.sceneAll = Inspector.AllSceneTransforms(); } catch { s.sceneAll = new List<Transform>(); }
+                s.sceneNames = new string[s.sceneAll.Count];
             }
-            else foreach (var t in s.sceneAll) if (t != null && t.name == q) res.Add(t);
+            var all = s.sceneAll;
+            var names = s.sceneNames;
+            bool slash = q.IndexOf('/') >= 0;
+            string suffix = "/" + q;
+            List<Transform> bySuffix = null;
+            for (int i = 0; i < all.Count; i++)
+            {
+                var t = all[i];
+                if (t == null) continue;
+                string n = names[i] ?? (names[i] = t.name);
+                if (!slash) { if (n == q) res.Add(t); continue; }
+                // a path ends with the object's own name: only an object whose name ends the query, or holds it as its
+                // own end, can match, so the path is built for those few
+                if (!q.EndsWith(n, StringComparison.Ordinal) && !n.EndsWith(q, StringComparison.Ordinal)) continue;
+                string path = Inspector.PathOf(t);
+                if (path == q) res.Add(t);
+                else if (path.EndsWith(suffix, StringComparison.Ordinal)) { if (bySuffix == null) bySuffix = new List<Transform>(); bySuffix.Add(t); }
+            }
+            if (res.Count == 0 && bySuffix != null) return bySuffix;
             return res;
         }
 
@@ -286,7 +314,21 @@ namespace InsideDev
             }
         }
 
-        sealed class Pending { public Transform t; public int parent; public string path; public int depth; public List<int> ord, sib; }
+        sealed class Pending { public Transform t; public int parent; public string path; public int depth; public List<int> ord, sib; public int ordSelf, sibSelf; }
+
+        // The ordinal and sibling chains of node i, root first: a walk root carries its own (ChainOf), every node below it
+        // adds one entry per level.
+        static void Chains(Scan s, int i, List<int> ord, List<int> sib)
+        {
+            var nodes = s.nodes;
+            int levels = 0, j = i;
+            while (nodes[j].ord == null && nodes[j].parent >= 0) { levels++; j = nodes[j].parent; }
+            if (nodes[j].ord != null) { ord.AddRange(nodes[j].ord); sib.AddRange(nodes[j].sib); }
+            int at = ord.Count;
+            for (int x = 0; x < levels; x++) { ord.Add(0); sib.Add(0); }
+            j = i;
+            for (int x = levels - 1; x >= 0; x--) { ord[at + x] = nodes[j].ordSelf; sib[at + x] = nodes[j].sibSelf; j = nodes[j].parent; }
+        }
 
         static int Walk(Scan s, Transform root, bool spawned, string owner)
         {
@@ -312,7 +354,7 @@ namespace InsideDev
                 if (t == null) continue;
                 int inst = t.GetInstanceID();
                 if (s.byInstance.ContainsKey(inst)) continue;
-                var n = new Node { t = t, go = t.gameObject, parent = e.parent, path = e.path, depth = e.depth, ord = e.ord, sib = e.sib };
+                var n = new Node { t = t, go = t.gameObject, parent = e.parent, path = e.path, depth = e.depth, ord = e.ord, sib = e.sib, ordSelf = e.ordSelf, sibSelf = e.sibSelf };
                 n.spawned = spawned || (e.parent >= 0 && s.nodes[e.parent].spawned) || (e.parent >= 0 && s.containerIds.Contains(s.nodes[e.parent].t.GetInstanceID()));
                 if (n.spawned) n.kind = SrecConst.KindSpawned;
                 if (t == root && !string.IsNullOrEmpty(owner)) n.owner = owner;
@@ -324,19 +366,19 @@ namespace InsideDev
                 counts.Clear();
                 kids.Clear();
                 int cc = t.childCount;
+                n.kids = cc;
                 for (int i = 0; i < cc; i++)
                 {
                     var c = t.GetChild(i);
                     if (c == null) continue;
+                    string cn = c.name;
                     int o;
-                    counts.TryGetValue(c.name, out o);
-                    counts[c.name] = o + 1;
-                    if (Excluded(s, c)) continue;
-                    string cp = n.path + "/" + c.name;
-                    if (s.excludePaths != null && ExcludedPath(s.excludePaths, cp, c.name)) continue;
-                    var co = new List<int>(n.ord); co.Add(o);
-                    var cs = new List<int>(n.sib); cs.Add(i);
-                    kids.Add(new Pending { t = c, parent = idx, path = cp, depth = n.depth + 1, ord = co, sib = cs });
+                    counts.TryGetValue(cn, out o);
+                    counts[cn] = o + 1;
+                    if (s.skip.Contains(c.GetInstanceID()) || cn.StartsWith("InsideDev", StringComparison.Ordinal)) continue;
+                    string cp = n.path + "/" + cn;
+                    if (s.excludePaths != null && ExcludedPath(s.excludePaths, cp, cn)) continue;
+                    kids.Add(new Pending { t = c, parent = idx, path = cp, depth = n.depth + 1, ordSelf = o, sibSelf = i });
                 }
                 for (int i = kids.Count - 1; i >= 0; i--) stack.Push(kids[i]);
             }
@@ -656,6 +698,16 @@ namespace InsideDev
 
         static Scan BuildScan(RecordSpec spec, string recordDir, SpecReport report)
         {
+            var s = ScanRoots(spec, report);
+            LoadCameraDriven(s, recordDir, report);
+            Finish(s, 0);
+            return s;
+        }
+
+        // The walk of the roots alone (objects, components, paths): all Prepare needs. LoadCameraDriven and Finish complete
+        // it into a record set scan.
+        static Scan ScanRoots(RecordSpec spec, SpecReport report)
+        {
             var s = new Scan();
             var cam = GameObject.Find("_Camera_Main");
             if (cam != null) s.skip.Add(cam.transform.root.GetInstanceID());
@@ -694,9 +746,31 @@ namespace InsideDev
                     if (s.wantNames.Contains(bn)) continue;
                     AddNamedSubscene(s, k, spec, report, "replay.record.keep");
                 }
-            LoadCameraDriven(s, recordDir, report);
-            Finish(s, 0);
             return s;
+        }
+
+        // The walk of Prepare, kept for the Construct that follows in the same frame (srec record start: Prepare then Begin;
+        // an mcam take: Prepare then Prebuild), so one start walks the scene once. Any Construct takes or drops it.
+        static Scan keptScan;
+        static RecordPrep keptFor;
+        static int keptFrame, keptStream;
+
+        static Scan TakeKeptScan(RecordSpec spec, RecordPrep prep)
+        {
+            var s = keptScan;
+            var owner = keptFor;
+            keptScan = null;
+            keptFor = null;
+            if (s == null || prep == null || owner != prep || !ReferenceEquals(prep.spec, spec) || keptFrame != Time.frameCount || keptStream != Levels.StreamVersion) return null;
+            return s;
+        }
+
+        // Lets go of what a start prepared and did not use: the kept walk and the prebuilt recorder of that prep (a take
+        // stopped between Prebuild and Begin).
+        internal static void DropPrepared(RecordPrep prep)
+        {
+            if (keptFor == prep) { keptScan = null; keptFor = null; }
+            if (pending != null && pending.prep == prep) pending = null;
         }
 
         static void LoadCameraDriven(Scan s, string recordDir, SpecReport report)
@@ -737,6 +811,7 @@ namespace InsideDev
         {
             if (report == null) report = new SpecReport();
             if (spec == null) spec = new RecordSpec();
+            RegisterDoctor();
             var s = BuildScan(spec, null, report);
             var r = new List<Transform>(s.nodes.Count);
             foreach (var n in s.nodes) if (n.t != null && (withCameraDriven || !n.camXf)) r.Add(n.t);
@@ -761,10 +836,17 @@ namespace InsideDev
                 if (planned != null) foreach (var p in planned) if (p.ok || p.fov > 0f) prep.frusta.Add(Frustum(p, aspect > 0f ? aspect : 16f / 9f));
                 if (prep.frusta.Count == 0) report.Warn("replay.record.forceCullers", "planned: no planned camera pose, no culler forced");
             }
-            var s = BuildScan(spec, null, report);
+            RegisterDoctor();
+            int errorsBefore = report.errors.Count;
+            var s = ScanRoots(spec, report);
+            if (report.errors.Count == errorsBefore) { keptScan = s; keptFor = prep; keptFrame = Time.frameCount; keptStream = Levels.StreamVersion; }
+            else { keptScan = null; keptFor = null; }
             int cullers = ApplyPrep(prep, s, report, false);
             int inactive = 0;
             foreach (var w in prep.forcedWasActive) if (!w) inactive++;
+            // forcing switched groups on: their Awake / OnEnable ran just now and may have added components or moved
+            // objects, so the walk from before is not the scene any more and Begin / Prebuild walk again
+            if (inactive > 0 && keptFor == prep) { keptScan = null; keptFor = null; }
             string msg = "record prep: " + prep.anims.Count + " Animation(s) and " + prep.animators.Count + " Animator(s) set to AlwaysAnimate, " +
                          prep.forced.Count + " of " + cullers + " culler(s) forced (" + prep.mode + "), " + inactive + " group(s) inactive before forcing" +
                          (prep.alreadyInvalid > 0 ? ", " + prep.alreadyInvalid + " already invalid" : "");
@@ -878,15 +960,15 @@ namespace InsideDev
             public float rotThr;
             public XfTrack s;
             public XfQuiet q;
-            public bool activeSelf, activeH, kinematic, kinematicKnown, camActive, camActiveSet, spawnedXf, everActive, scaleWatch;
-            public int seenAt, firstAt, kids;
+            public bool activeSelf, activeH, kinematic, kinematicKnown, camActive, camActiveSet, spawnedXf, everActive, scaleWatch, moved;
+            public int seenAt, firstAt, kids, lastKid;
             public byte reason;
         }
 
         struct RendItem
         {
             public Renderer r;
-            public int id, owner, slots;
+            public int id, owner, slots, polledAt;
             public bool enabled, dead, matSet, meshSet;
             public Material mat0;
             public Material[] mats;
@@ -907,9 +989,8 @@ namespace InsideDev
         {
             public ParticleSystem ps;
             public int id, owner, lastCount, playingZero, playingSamples;
-            public bool dead, stateSet, playing, paused, everCount;
+            public bool dead, stateSet, playing, paused, everCount, cut;
             public float rate;
-            public ParticleSystem.Particle[] buf;
         }
 
         sealed class MiItem
@@ -955,13 +1036,24 @@ namespace InsideDev
         SrecWriter writer;
         RecordPrep prep;
         string file = "";
-        bool ended, failed, particlesOk = true, dynamicsFound;
+        bool ended, stopped, failed, particlesOk = true, dynamicsFound;
         int lastFrame = -1;
         double lastGameTime = double.NegativeInfinity, lastReal;
         long lastStep;
         ushort pendingFlags;
-        int errors, consecutiveErrors, skippedFrames, sampleErrorsLogged;
-        string lastError = "";
+        int errors, consecutiveErrors, skippedFrames, sampleErrorsLogged, itemErrors, sampAt = -1;
+        string lastError = "", stopReason = "", stopKind = "", writerError = "";
+        int loadCountAtBegin = -1, writerStalls, closingSamples, loadsSeen, loadSample, xfDead;
+        Scan joinPlan;
+        bool emptyWatch, rescanNow;
+        double loadGame, emptySince = -1;
+        const double EmptySeconds = 3.0, WatchSeconds = 10.0;
+        long limitBytes, minFreeBytes;
+        double limitSeconds, endSeconds;
+        ParticleSystem.Particle[] psBuf = new ParticleSystem.Particle[0];
+        int psWant = 1;
+        const int ParticleStart = 20000, ParticleLimit = 400000, MatPollEvery = 30, ItemErrorLimit = 200, FlagDirtyMax = 32;
+        const byte FlagNone = 0xFF;
 
         XfItem[] xs = new XfItem[0]; int nx;
         RendItem[] rs = new RendItem[0]; int nr;
@@ -974,12 +1066,15 @@ namespace InsideDev
         readonly List<SubsceneNode> subsceneNodes = new List<SubsceneNode>();
         readonly List<UnityEngine.Object> refs = new List<UnityEngine.Object>();
         readonly List<SrecObject> table = new List<SrecObject>();
-        readonly Dictionary<int, int> xfByInstance = new Dictionary<int, int>();
+        Dictionary<int, int> xfByInstance = new Dictionary<int, int>();
         readonly Dictionary<int, int> texIds = new Dictionary<int, int>();
         readonly Dictionary<int, int> matIds = new Dictionary<int, int>();
         readonly Dictionary<Type, string> typeNames = new Dictionary<Type, string>();
         byte[] flagNow = new byte[0], flagLast = new byte[0];
-        bool[] flagHas = new bool[0], flagWritten = new bool[0];
+        bool[] flagHas = new bool[0];
+        readonly int[] flagDirty = new int[FlagDirtyMax];
+        int nFlagDirty;
+        bool flagWalk = true;
         int[] keyFirst = new int[0], keyLast = new int[0], keyCount = new int[0];
         int[] dels = new int[64]; int ndel;
         readonly List<SrecObject> adds = new List<SrecObject>();
@@ -1074,6 +1169,7 @@ namespace InsideDev
                 report.Warn("replay.record", "a recorder was still active; ended first");
                 active.End(report);
             }
+            RegisterDoctor();
             long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             var r = TakePrebuilt(spec, dir, report);
             if (r == null)
@@ -1087,6 +1183,11 @@ namespace InsideDev
                 var scan = r.scanned;
                 r.scanned = null;
                 r.FillHeader(scan);
+                r.loadCountAtBegin = CurrentLoadCount();
+                r.limitBytes = spec.maxMB > 0 ? (long)spec.maxMB << 20 : 0;
+                r.limitSeconds = spec.maxSeconds > 0f ? spec.maxSeconds : 0.0;
+                r.minFreeBytes = spec.minFreeMB > 0 ? (long)spec.minFreeMB << 20 : 0;
+                if (r.psBuf.Length < r.psWant) r.psBuf = new ParticleSystem.Particle[r.psWant];
                 r.writer = new SrecWriter(r.file, header);
                 r.writer.Objects(r.table);
                 r.objects = r.table.Count;
@@ -1101,7 +1202,8 @@ namespace InsideDev
                              r.nm + " MaterialInstances, " + r.npb + " probes, " + r.nrope + " ropes), " + r.camXfCount + " camera-driven transforms, " +
                              r.excludedMaterials + " excluded MaterialInstances, " + r.quietEligible + " quiet-eligible transforms, zone '" + r.zone + "', built in " + r.buildMs.ToString("0", IC) + " ms" +
                              (r.prebuildMs >= 0 ? " before sample 0 (prebuilt), Begin " + beginMs.ToString("0.#", IC) + " ms" : " in the frame of sample 0") +
-                             (r.cullersWatched > 0 ? ", " + r.cullersWatched + " subscene(s) join when they load or activate" : "");
+                             (r.cullersWatched > 0 ? ", " + r.cullersWatched + " subscene(s) join when they load or activate" : "") +
+                             (r.limitBytes > 0 ? ", ends at " + spec.maxMB.ToString(IC) + " MB" : "") + (r.limitSeconds > 0 ? ", ends at " + r.limitSeconds.ToString("0.###", IC) + " s" : "");
                 report.Note("replay.record", msg);
                 DevLog.Write("srec: begin " + r.file + ": " + msg);
                 return r;
@@ -1113,6 +1215,8 @@ namespace InsideDev
                 try { if (r.onPreCull != null) { SceneHooks.preCullMain -= r.onPreCull; SceneHooks.Release(); } } catch { }
                 try { r.UnhookStreaming(); } catch { }
                 try { if (r.writer != null) r.writer.Close(); } catch { }
+                r.ended = true;
+                r.ReleaseSampling();
                 if (active == r) active = null;
                 return null;
             }
@@ -1167,11 +1271,27 @@ namespace InsideDev
                     r.particlesOk = false;
                     r.Warn("ParticleSystem.Particle is " + size + " bytes, not " + SrecConst.ParticleBytes + ": particles are not recorded");
                 }
+                if (spec.post) r.Warn("record.post is not built: the post-processing values (D11PDPostCombined) are not recorded");
+                if (Array.IndexOf(ReplayConst.OnLoads, spec.onLoad) < 0) r.Warn("record.onLoad '" + spec.onLoad + "' is not one of " + string.Join(", ", ReplayConst.OnLoads) + ": continue is used");
+                if (spec.minFreeMB > 0)
+                {
+                    long free = SrecDisk.FreeBytes(r.dir);
+                    if (free >= 0 && free < (long)spec.minFreeMB << 20)
+                    {
+                        report.Error("replay.record.minFreeMB", "only " + (free >> 20).ToString(IC) + " MB free on the drive of " + r.dir + ", record.minFreeMB is " + spec.minFreeMB.ToString(IC) + " (free some space, or lower the key; 0 = no check)");
+                        TakeKeptScan(null, null);
+                        return null;
+                    }
+                }
                 long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
                 int errorsBefore = report.errors.Count;
-                var scan = BuildScan(spec, r.dir, report);
+                var scan = TakeKeptScan(spec, r.prep);
+                bool sameWalk = scan != null;
+                if (!sameWalk) scan = ScanRoots(spec, report);
+                LoadCameraDriven(scan, r.dir, report);
+                Finish(scan, 0);
                 if (report.errors.Count > errorsBefore) { DevLog.Write("srec: record set refused: " + report.Summary(5)); return null; }
-                if (r.prep != null && !r.prep.Released)
+                if (!sameWalk && r.prep != null && !r.prep.Released)
                 {
                     int a0 = r.prep.extendedAnims, c0 = r.prep.extendedCullers;
                     ApplyPrep(r.prep, scan, report, true);
@@ -1185,7 +1305,14 @@ namespace InsideDev
                 r.excludePaths = spec.exclude != null && spec.exclude.Count > 0 ? new List<string>(spec.exclude) : null;
                 r.camPaths = scan.camPathsAll;
                 r.PlanJoins(scan);
+                if (spec.onLoad != "stop")
+                {
+                    r.joinPlan = new Scan { zone = scan.zone, auto = scan.auto, useBox = scan.useBox, box = scan.box };
+                    r.joinPlan.wantNames.AddRange(scan.wantNames);
+                    r.joinPlan.wantZones.AddRange(scan.wantZones);
+                }
                 r.Build(scan, 0, report);
+                if (r.np > 0) r.psBuf = new ParticleSystem.Particle[r.psWant];
                 r.ShaderFindGlobal();
                 r.ShaderResolve();
                 r.ShaderBlocks();
@@ -1195,6 +1322,9 @@ namespace InsideDev
                     if (!r.xfByInstance.TryGetValue(c.GetInstanceID(), out xi)) continue;
                     var ct = new Container { t = c, xf = xi };
                     r.SnapshotChildren(ct);
+                    // the walk is older than this snapshot when it came from Prepare: a child that arrived in between is not
+                    // in the set, so the first sample compares the children itself
+                    if (sameWalk) ct.count = -1;
                     r.containers.Add(ct);
                     if (c.parent == null && c.name == "_Dynamics") r.dynamicsFound = true;
                 }
@@ -1273,10 +1403,10 @@ namespace InsideDev
             table.Add(o);
             refs.Add(live);
             int n = table.Count;
-            Grow(ref flagNow, n); Grow(ref flagLast, n); Grow(ref flagHas, n); Grow(ref flagWritten, n);
+            Grow(ref flagNow, n); Grow(ref flagLast, n); Grow(ref flagHas, n);
             Grow(ref keyFirst, n); Grow(ref keyLast, n); Grow(ref keyCount, n);
             keyFirst[o.id] = -1; keyLast[o.id] = -1; keyCount[o.id] = 0;
-            flagHas[o.id] = false; flagWritten[o.id] = false;
+            flagHas[o.id] = false; flagNow[o.id] = FlagNone; flagLast[o.id] = FlagNone;
             return o.id;
         }
 
@@ -1326,8 +1456,7 @@ namespace InsideDev
                     kind = n.kind, instanceId = n.t.GetInstanceID(), depth = n.depth, path = n.path, owner = n.owner ?? "",
                     comps = n.mask, pos = p, rot = q, scale = n.t.localScale, activeSelf = n.go.activeSelf, extent = n.extent
                 };
-                o.ordinals.AddRange(n.ord);
-                o.siblings.AddRange(n.sib);
+                Chains(s, i, o.ordinals, o.siblings);
                 o.types.AddRange(n.types);
                 byte fl = 0;
                 if (local) fl |= SrecConst.ObjLocal;
@@ -1346,7 +1475,7 @@ namespace InsideDev
                     t = n.t, go = n.go, rb = n.rb, id = id, parentIdx = n.parent >= 0 ? nodeXf[n.parent] : -1, parentId = o.parentId,
                     parentInst = n.t.parent != null ? n.t.parent.GetInstanceID() : 0, local = local, camXf = n.camXf, camDriven = n.camDriven,
                     rotThr = XfMath.RotThreshold(spec.posEps, n.extent, spec.rotEps), activeSelf = n.go.activeSelf, activeH = n.go.activeInHierarchy, seenAt = -1,
-                    spawnedXf = n.spawned, kids = n.t.childCount
+                    spawnedXf = n.spawned, kids = n.kids
                 };
                 x.s.Reset();
                 x.q.ok = quietTransforms && !mover[i];
@@ -1399,7 +1528,8 @@ namespace InsideDev
             try { max = p.maxParticles; o.maxParticles = max; o.simulationSpace = (byte)p.simulationSpace; o.randomSeed = p.randomSeed; } catch { }
             int id = NewId(o, p);
             Grow(ref ps, np + 1);
-            ps[np++] = new PsItem { ps = p, id = id, owner = xi, buf = new ParticleSystem.Particle[Math.Max(1, Math.Min(max, 20000))] };
+            ps[np++] = new PsItem { ps = p, id = id, owner = xi };
+            psWant = Math.Max(psWant, Math.Min(max, ParticleStart));
         }
 
         void AddLight(Node n, Light l, string cpath, int pid, int xi, byte fl)
@@ -1543,6 +1673,117 @@ namespace InsideDev
             return o != null ? o : null;
         }
 
+        // ------------------------------------------------------------------ stop states (read by the hosts every frame)
+
+        // True once no more samples are taken although End was not called: a failure (Failed) or a clean early end (a
+        // record.maxMB / maxSeconds limit, low disk space, a level load that emptied the record set). scene.srec is whole
+        // up to the last sample.
+        // The host that owns the take ends it (End) when it sees this.
+        public bool Stopped { get { return stopped; } }
+
+        // Stopped by an error: the writer could not write (disk full, file gone) or 30 samples in a row had errors.
+        public bool Failed { get { return failed; } }
+
+        // Why it stopped ("" while it runs) and the kind: "writer" or "errors" (both Failed), "load", "disk", "limit".
+        public string StopReason { get { return stopReason; } }
+        public string StopKind { get { return stopKind; } }
+        public string FailReason { get { return failed ? stopReason : ""; } }
+
+        // "recording" | "stopped" | "failed" | "ended"; a failed recording stays "failed" after End.
+        public string State { get { return failed ? "failed" : ended ? "ended" : stopped ? "stopped" : "recording"; } }
+
+        double Seconds() { return metaN > 0 ? mGame[metaN - 1] : endSeconds; }
+
+        // One line of JSON for `srec record status json` and agents: state, size, queue, errors and, while recording, the
+        // sample cost of the last 60 samples by channel (ms).
+        public string StatusJson()
+        {
+            var o = new Json.Obj();
+            var w = writer;
+            double t = Seconds();
+            o["state"] = State;
+            o["dir"] = dir;
+            o["seconds"] = t;
+            o["samples"] = samples;
+            o["objects"] = objects;
+            o["bytes"] = bytes;
+            int n = Math.Min(60, metaN);
+            double rate = t > 0 ? bytes / t : 0.0;
+            if (n > 1)
+            {
+                long sum = 0;
+                for (int i = metaN - n + 1; i < metaN; i++) sum += mBytes[i];
+                double span = mGame[metaN - 1] - mGame[metaN - n];
+                if (span > 0) rate = sum / span;
+            }
+            o["bytesPerSecond"] = Math.Round(rate);
+            o["queuedBlocks"] = w != null ? w.queued : 0;
+            o["queuedBytes"] = w != null ? w.queuedLength : 0L;
+            o["writerStalls"] = w != null ? w.stalls : writerStalls;
+            o["freeBytes"] = w != null ? w.freeBytes : -1L;
+            o["sampleErrors"] = errors;
+            o["leftOut"] = itemErrors;
+            o["lastError"] = lastError;
+            o["writerError"] = (w != null ? w.error : writerError) ?? "";
+            o["stopKind"] = stopKind;
+            o["stopReason"] = stopReason;
+            o["hitches"] = hitches;
+            o["skippedFrames"] = skippedFrames;
+            o["events"] = eventsLogged;
+            o["subsceneJoins"] = joinsDone;
+            o["shaderChannels"] = shChans.Count;
+            if (n > 0)
+            {
+                var cost = new Json.Obj();
+                int nc = ChannelNames.Length;
+                double sum = 0, max = 0;
+                for (int i = metaN - n; i < metaN; i++) { sum += mCost[i]; if (mCost[i] > max) max = mCost[i]; }
+                cost["samples"] = n;
+                cost["meanMs"] = Math.Round(sum / n, 4);
+                cost["maxMs"] = Math.Round(max, 4);
+                var chans = new Json.Obj();
+                for (int c = 0; c < nc; c++)
+                {
+                    double cs = 0;
+                    for (int i = metaN - n; i < metaN; i++) cs += mChan[i * nc + c];
+                    chans[ChannelNames[c]] = Math.Round(cs / n, 4);
+                }
+                cost["channelMeanMs"] = chans;
+                o["cost"] = cost;
+            }
+            return JsonLine.Write(o);
+        }
+
+        // StatusJson of the active recording, {"state":"idle"} without one.
+        public static string ActiveStatusJson()
+        {
+            var r = active;
+            return r != null ? r.StatusJson() : JsonLine.Obj("state", "idle");
+        }
+
+        static bool doctorOn;
+
+        internal static void RegisterDoctor()
+        {
+            if (doctorOn) return;
+            doctorOn = true;
+            try { Doctor.Register("srec", DoctorRows); } catch { }
+        }
+
+        internal static List<Doctor.Row> DoctorRows()
+        {
+            var rows = new List<Doctor.Row>();
+            int size = 0;
+            try { size = Marshal.SizeOf(typeof(ParticleSystem.Particle)); } catch { }
+            bool layout = size == SrecConst.ParticleBytes;
+            rows.Add(new Doctor.Row("srec", "particle layout", layout ? Doctor.Ok : Doctor.Warn, "ParticleSystem.Particle is " + size.ToString(IC) + " bytes, scene.srec stores " + SrecConst.ParticleBytes.ToString(IC), layout ? null : "particles are not recorded with this game build"));
+            var r = active;
+            if (r != null) rows.Add(new Doctor.Row("srec", "recording", r.failed ? Doctor.Fail : r.stopped ? Doctor.Warn : Doctor.Ok, r.Status() + " -> " + r.dir, r.stopped ? "end the take: srec record stop, or mcam stop" : null));
+            else rows.Add(new Doctor.Row("srec", "recording", Doctor.Info, last != null ? "idle; last: " + last.Status() + " -> " + last.dir : "idle"));
+            rows.Add(new Doctor.Row("srec", "kept recorders", Doctor.Info, sessionRecorders.Count.ToString(IC) + " ended recorder(s) kept for a replay in the same session" + (pending != null ? ", one prebuilt record set waiting for Begin" : "")));
+            return rows;
+        }
+
         public void SetVirtual(MultiCamContext ctx)
         {
             if (ended || ctx == null) return;
@@ -1565,17 +1806,21 @@ namespace InsideDev
 
         public string Status()
         {
-            if (failed) return "record failed: " + lastError;
-            var sb = new StringBuilder(ended ? "recorded " : "recording ");
-            double t = metaN > 0 ? mGame[metaN - 1] : 0;
-            sb.Append(t.ToString("0.00", IC)).Append(" s, ").Append(samples).Append(" samples, ").Append(objects).Append(" objects, ")
+            var sb = new StringBuilder(failed ? "record failed: " + stopReason + "; kept " : ended ? "recorded " : stopped ? "recording stopped (" + stopReason + "): " : "recording ");
+            int stalls = writer != null ? writer.stalls : writerStalls;
+            string werr = writer != null ? writer.error : writerError;
+            sb.Append(Seconds().ToString("0.00", IC)).Append(" s, ").Append(samples).Append(" samples, ").Append(objects).Append(" objects, ")
               .Append((bytes / 1048576.0).ToString("0.0", IC)).Append(" MB");
-            if (writer != null && writer.stalls > 0) sb.Append(", ").Append(writer.stalls).Append(" writer stalls");
+            if (stalls > 0) sb.Append(", ").Append(stalls).Append(" writer stalls");
+            int waiting = writer != null && !ended ? writer.queued : 0;
+            if (waiting > 8) sb.Append(", ").Append(waiting).Append(" blocks waiting for the disk");
             if (eventsLogged > 0) sb.Append(", ").Append(eventsLogged).Append(" events");
             if (joinsDone > 0) sb.Append(", ").Append(joinsDone).Append(" subscene joins");
             if (shChans.Count > 0) sb.Append(", ").Append(shChans.Count).Append(" shader channels");
             if (errors > 0) sb.Append(", ").Append(errors).Append(" sample errors");
-            if (writer != null && writer.error != null) sb.Append(", writer: ").Append(writer.error);
+            if (itemErrors > 0) sb.Append(", ").Append(itemErrors).Append(" component(s) left out");
+            if (!string.IsNullOrEmpty(werr) && !failed) sb.Append(", writer: ").Append(werr);
+            if (ended && !failed && stopReason.Length > 0) sb.Append(", ended early: ").Append(stopReason);
             return sb.ToString();
         }
 
@@ -1628,10 +1873,12 @@ namespace InsideDev
 
         void OnPreCull(Camera cam)
         {
-            if (ended || failed || writer == null) return;
+            if (ended || stopped || writer == null) return;
             int frame = Time.frameCount;
             if (frame == lastFrame) return;
             lastFrame = frame;
+            if (writer.writeFailed) { Stop("writer", true, "scene.srec writer: " + (writer.writeError ?? writer.error ?? "the writer thread ended")); return; }
+            if (CurrentLoadCount() != loadCountAtBegin && !LevelLoaded()) return;
             double game = Time.timeDbl - header.t0;
             if (samples > 0 && game <= lastGameTime) { skippedFrames++; pendingFlags |= SrecConst.SmplHold; return; }
             long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -1650,46 +1897,63 @@ namespace InsideDev
                 sample = k, gameTime = game, realTime = realAbs, logicStep = step, frameCount = frame,
                 fixedSteps = (ushort)Math.Min(65535L, Math.Max(0L, step - lastStep)), flags = fl
             };
-            bool begun = false;
             int xfThis = 0, partsThis = 0;
             long bytesBefore = writer.bytes;
             for (int c = 0; c < chanNow.Length; c++) chanNow[c] = 0f;
             chanT = t0;
+            try { writer.BeginSample(stamp); }
+            catch (Exception e)
+            {
+                pendingFlags |= fl;
+                StageError(k, 11, e);
+                if (++consecutiveErrors >= 30) Stop("errors", true, "30 samples in a row with errors, last: " + lastError);
+                return;
+            }
+            // Every stage runs on its own: an error in one costs that stage's entries of this sample, the others are written.
+            bool bad = false;
+            Chan(11);
+            ndel = 0;
+            nFlagDirty = 0;
+            try { WatchStreaming(k); TakeRegistered(k); WatchSpawns(k); WatchChildren(k); } catch (Exception e) { bad = true; StageError(k, 0, e); }
+            try { for (int i = 0; i < adds.Count; i++) writer.ObjAdd(adds[i]); } catch (Exception e) { bad = true; StageError(k, 0, e); }
+            adds.Clear();
+            Chan(0);
+            try { SampleXf(k, full, dt, ref xfThis); } catch (Exception e) { bad = true; StageError(k, 1, e); }
+            Chan(1);
+            try { SampleRenderers(k, full); } catch (Exception e) { bad = true; StageError(k, 2, e); }
+            Chan(2);
+            try { SampleLights(k, full); } catch (Exception e) { bad = true; StageError(k, 3, e); }
+            Chan(3);
+            try { WriteFlags(k, full); } catch (Exception e) { bad = true; flagWalk = true; StageError(k, 4, e); }
+            Chan(4);
+            try { if (particlesOk) partsThis = SampleParticles(k, full); } catch (Exception e) { bad = true; StageError(k, 5, e); }
+            Chan(5);
+            try { SampleMaterials(k, full); } catch (Exception e) { bad = true; StageError(k, 6, e); }
+            Chan(6);
+            try { SampleProbes(k, full); } catch (Exception e) { bad = true; StageError(k, 7, e); }
+            Chan(7);
+            try { SampleRopes(k, full); } catch (Exception e) { bad = true; StageError(k, 8, e); }
+            Chan(8);
+            try { if (fogOn) SampleFog(full); } catch (Exception e) { bad = true; StageError(k, 9, e); }
+            Chan(9);
+            try { SampleShader(k, full); } catch (Exception e) { bad = true; StageError(k, 12, e); }
+            Chan(12);
+            try { SampleVirtual(cam); } catch (Exception e) { bad = true; StageError(k, 10, e); }
+            Chan(10);
+            // a clean early stop is decided before the events are flushed, so its reason is a row of this, the last sample
+            if (emptyWatch) EmptyAfterLoad(game);
+            if (!stopped)
+            {
+                if (limitBytes > 0 && writer.bytes >= limitBytes) Stop("limit", false, "record.maxMB " + spec.maxMB.ToString(IC) + " reached at sample " + k.ToString(IC));
+                else if (limitSeconds > 0 && game >= limitSeconds) Stop("limit", false, "record.maxSeconds " + limitSeconds.ToString("0.###", IC) + " reached at sample " + k.ToString(IC));
+                else if (minFreeBytes > 0)
+                {
+                    long free = writer.freeBytes;
+                    if (free >= 0 && free < minFreeBytes) Stop("disk", false, "only " + (free >> 20).ToString(IC) + " MB free on the record drive (record.minFreeMB " + spec.minFreeMB.ToString(IC) + ")");
+                }
+            }
             try
             {
-                writer.BeginSample(stamp);
-                begun = true;
-                Chan(11);
-                ndel = 0;
-                WatchStreaming(k);
-                TakeRegistered(k);
-                WatchSpawns(k);
-                WatchChildren(k);
-                for (int i = 0; i < adds.Count; i++) writer.ObjAdd(adds[i]);
-                adds.Clear();
-                Chan(0);
-                SampleXf(k, full, dt, ref xfThis);
-                Chan(1);
-                SampleRenderers(k, full);
-                Chan(2);
-                SampleLights(k, full);
-                Chan(3);
-                WriteFlags(k, full);
-                Chan(4);
-                if (particlesOk) partsThis = SampleParticles(k, full);
-                Chan(5);
-                SampleMaterials(k, full);
-                Chan(6);
-                SampleProbes(k, full);
-                Chan(7);
-                SampleRopes(k, full);
-                Chan(8);
-                if (fogOn) SampleFog(full);
-                Chan(9);
-                SampleShader(k, full);
-                Chan(12);
-                SampleVirtual(cam);
-                Chan(10);
                 if (ndel > 0)
                 {
                     Array.Sort(dels, 0, ndel);
@@ -1702,26 +1966,11 @@ namespace InsideDev
                     if (evKind[i] == "event") LogEvent(evName[i], evDetail[i], k, game);
                 }
                 evKind.Clear(); evName.Clear(); evDetail.Clear();
-                consecutiveErrors = 0;
             }
-            catch (Exception e)
-            {
-                errors++;
-                consecutiveErrors++;
-                lastError = e.GetType().Name + ": " + e.Message;
-                if (sampleErrorsLogged++ < 10) DevLog.Error("srec sample " + k, e);
-            }
-            finally
-            {
-                if (begun) { try { writer.EndSample(); } catch (Exception e) { errors++; lastError = "EndSample: " + e.Message; } }
-                Chan(11);
-            }
-            if (consecutiveErrors >= 30)
-            {
-                failed = true;
-                Warn("30 consecutive sample errors, recording stopped: " + lastError);
-                return;
-            }
+            catch (Exception e) { bad = true; StageError(k, 11, e); }
+            try { writer.EndSample(); } catch (Exception e) { bad = true; StageError(k, 11, e); }
+            Chan(11);
+            consecutiveErrors = bad ? consecutiveErrors + 1 : 0;
             samples = k + 1;
             bytes = writer.bytes;
             lastGameTime = game;
@@ -1733,6 +1982,87 @@ namespace InsideDev
             double cost = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             Meta(k, frame, game, dt, real, step, stamp.fixedSteps, Time.timeScale, fl, xfThis, partsThis, writer.bytes - bytesBefore, (float)cost);
             if (k == 30) { gcAt30 = GC.CollectionCount(0); heapAt30 = GC.GetTotalMemory(false); }
+            if (consecutiveErrors >= 30) Stop("errors", true, "30 samples in a row with errors, last: " + lastError);
+        }
+
+        // GameManager counted a load (respawn, checkpoint or chapter load): the game unloads and reloads the subscenes that
+        // hold state. record.onLoad "continue" (the default): the recording goes on as it always did, destroyed objects end
+        // with ObjDel and the subscenes of the record set join again as they load; the set is watched for a while
+        // (EmptyAfterLoad). "stop": the recording ends at the load. False = stopped.
+        bool LevelLoaded()
+        {
+            if (joinPlan == null)
+            {
+                Stop("load", false, "level load at sample " + samples.ToString(IC) + " (respawn, checkpoint or chapter load), record.onLoad is stop: the recording ends here");
+                return false;
+            }
+            loadCountAtBegin = CurrentLoadCount();
+            loadsSeen++;
+            loadSample = samples;
+            loadGame = lastGameTime;
+            emptySince = -1;
+            emptyWatch = true;
+            Warn("level load at sample " + samples.ToString(IC) + ": unloaded objects end here, the subscenes of the record set join again when they are loaded");
+            return true;
+        }
+
+        // After a load the record set must still hold, or get back, a live transform. When it is empty (a load that took
+        // every recorded object and gave none back: a whole-scene reload, object roots of an unloaded subscene) the joins
+        // are planned once more over the cullers that exist now, and after EmptySeconds of record time without any live
+        // object the recording ends with the reason instead of running on empty. The watch ends when objects are back, or
+        // when the set never was empty for WatchSeconds. False = stopped.
+        bool EmptyAfterLoad(double game)
+        {
+            if (nx > xfDead)
+            {
+                if (emptySince >= 0 || game - loadGame > WatchSeconds) emptyWatch = false;
+                return true;
+            }
+            if (emptySince < 0)
+            {
+                emptySince = game;
+                PlanJoins(joinPlan);
+                streamQueue.Clear();
+                streamWhy.Clear();
+                HookStreaming();
+                rescanNow = true;
+                return true;
+            }
+            if (game - emptySince < EmptySeconds) return true;
+            Stop("load", false, "level load at sample " + loadSample.ToString(IC) + ": every recorded object was unloaded and none came back within " + EmptySeconds.ToString("0.#", IC) + " s, the recording ends here");
+            return false;
+        }
+
+        // An error of one stage of a sample (ChannelNames index): counted, the first ten logged with their stack.
+        void StageError(int k, int stage, Exception e)
+        {
+            errors++;
+            lastError = ChannelNames[stage] + ": " + e.GetType().Name + ": " + e.Message;
+            if (sampleErrorsLogged++ < 10) DevLog.Error("srec sample " + k + " (" + ChannelNames[stage] + ")", e);
+        }
+
+        // A component whose read threw (a broken MaterialInstance, a mod object): left out from this sample on, so one
+        // object cannot cost the take. False when too many did: then it is not one object, and the stage fails as a whole.
+        bool LeftOut(int id, int k, Exception e)
+        {
+            if (itemErrors >= ItemErrorLimit) return false;
+            itemErrors++;
+            errors++;
+            lastError = table[id].path + ": " + e.GetType().Name + ": " + e.Message;
+            Warn("not recorded from sample " + k + " on, reading it threw " + e.GetType().Name + " (" + e.Message + "): " + table[id].path);
+            return true;
+        }
+
+        // Ends the sampling for good (the hosts read Stopped / Failed / StopReason and end the take). The reason goes to the
+        // log, the warnings of record.json and, for a clean stop, the closing sample of scene.srec.
+        void Stop(string kind, bool failure, string reason)
+        {
+            if (stopped || ended) return;
+            stopKind = kind;
+            stopReason = reason;
+            failed = failure;
+            Warn((failure ? "recording failed: " : "recording stopped: ") + reason);
+            stopped = true;
         }
 
         void Meta(int k, int frame, double game, double dt, double real, long step, ushort fixedSteps, float scale, ushort fl, int xf, int parts, long b, float cost)
@@ -1773,12 +2103,17 @@ namespace InsideDev
                 if (x.t == null)
                 {
                     x.dead = true; x.activeH = false; Dead(x.id);
+                    xfDead++;
                     if (x.spawnedXf && (x.parentIdx < 0 || !xs[x.parentIdx].dead)) DestroyedSpawn(x.id, k);
                     continue;
                 }
                 bool first = x.seenAt < 0;
                 bool parentActive;
-                if (x.parentIdx >= 0 && x.parentIdx < i) parentActive = !xs[x.parentIdx].dead && xs[x.parentIdx].activeH;
+                if (x.parentIdx >= 0 && x.parentIdx < i)
+                {
+                    parentActive = !xs[x.parentIdx].dead && xs[x.parentIdx].activeH;
+                    if (!parentActive && !full && !first && ((k + i) % XfMath.SweepEvery) == 0) parentActive = MovedParent(ref x, i);
+                }
                 else
                 {
                     var p = x.t.parent;
@@ -1800,6 +2135,7 @@ namespace InsideDev
                     }
                     if (x.kinematicKnown && x.kinematic) bits |= SrecConst.FlKinematic;
                     flagNow[x.id] = bits;
+                    if (bits != flagLast[x.id]) FlagChanged(x.id);
                     if (x.camDriven && (!x.camActiveSet || x.camActive != x.activeSelf))
                     {
                         x.camActive = x.activeSelf;
@@ -1828,14 +2164,18 @@ namespace InsideDev
                 }
                 var tp = x.t.parent;
                 int pinst = tp != null ? tp.GetInstanceID() : 0;
-                bool parentChanged = !first && pinst != x.parentInst;
+                bool parentChanged = !first && (x.moved || pinst != x.parentInst);
                 if (parentChanged)
                 {
-                    x.parentInst = pinst;
-                    int pxi;
-                    x.parentId = pinst != 0 && xfByInstance.TryGetValue(pinst, out pxi) ? xs[pxi].id : -1;
-                    x.parentIdx = pinst != 0 && xfByInstance.TryGetValue(pinst, out pxi) ? pxi : -1;
-                    parentChanges++;
+                    if (pinst != x.parentInst)
+                    {
+                        x.parentInst = pinst;
+                        int pxi;
+                        x.parentId = pinst != 0 && xfByInstance.TryGetValue(pinst, out pxi) ? xs[pxi].id : -1;
+                        x.parentIdx = pinst != 0 && xfByInstance.TryGetValue(pinst, out pxi) ? pxi : -1;
+                        parentChanges++;
+                    }
+                    x.moved = false;
                 }
                 bool becameActive = !first && !full && x.activeH && !wasActiveH;
                 bool kinOn = x.rb != null && !first && kinKnownPrev && !kinPrev && x.kinematic;
@@ -1843,7 +2183,7 @@ namespace InsideDev
                 Vector3 pos; Quaternion rot;
                 if (x.local) x.t.GetLocalPositionRotation(out pos, out rot); else x.t.GetPositionRotation(out pos, out rot);
                 readsByReason[x.reason]++;
-                bool scaleRead = ReplayConst.ScaleDue(full || first || x.scaleVariant || becameActive || parentChanged || kinOn, x.scaleWatch, k, i, k - x.firstAt, XfMath.ScaleWarmup);
+                bool scaleRead = ReplayConst.ScaleDue(full || first || x.scaleVariant || becameActive || parentChanged || kinOn || flagged, x.scaleWatch, k, i, k - x.firstAt, XfMath.ScaleWarmup);
                 Vector3 scl = scaleRead ? x.t.localScale : x.s.prevScale;
                 if (scaleRead && !first && !x.scaleVariant && XfMath.ScaleChanged(scl, x.s.keyScale)) x.scaleVariant = true;
                 byte pre;
@@ -1876,6 +2216,33 @@ namespace InsideDev
             }
         }
 
+        // A transform under an inactive recorded parent is not read. Its own parent is looked at on the sweep, so one that
+        // was moved elsewhere (an object taken out of an inactive pool root) is found again; the new parent is taken over
+        // at once and the object's next key is a cut with the parent bit. Returns whether the new parent is active.
+        bool MovedParent(ref XfItem x, int i)
+        {
+            var lp = x.t.parent;
+            int inst = lp != null ? lp.GetInstanceID() : 0;
+            if (inst == x.parentInst) return false;
+            int pxi = -1;
+            if (inst != 0 && !xfByInstance.TryGetValue(inst, out pxi)) pxi = -1;
+            x.parentInst = inst;
+            x.parentIdx = pxi;
+            x.parentId = pxi >= 0 ? xs[pxi].id : -1;
+            x.moved = true;
+            parentChanges++;
+            if (pxi >= 0 && pxi < i) return !xs[pxi].dead && xs[pxi].activeH;
+            return lp == null || lp.gameObject.activeInHierarchy;
+        }
+
+        void FlagChanged(int id)
+        {
+            if (nFlagDirty < FlagDirtyMax) flagDirty[nFlagDirty] = id;
+            nFlagDirty++;
+        }
+
+        static bool SameColor(Color a, Color b) { return a.r.Equals(b.r) && a.g.Equals(b.g) && a.b.Equals(b.b) && a.a.Equals(b.a); }
+
         void QuietMissed(int id, int k)
         {
             quietMisses++;
@@ -1893,25 +2260,52 @@ namespace InsideDev
                 if (o.dead || r.r == null) { r.dead = true; Dead(r.id); continue; }
                 if (!(full || o.activeH || !r.matSet)) continue;
                 r.enabled = r.r.enabled;
-                flagNow[r.id] = r.enabled ? SrecConst.FlRenderer : (byte)0;
+                byte fb = r.enabled ? SrecConst.FlRenderer : (byte)0;
+                flagNow[r.id] = fb;
+                if (fb != flagLast[r.id]) FlagChanged(r.id);
                 if (r.smr != null) SampleMesh(ref r, k);
-                if (r.slots <= 0) { r.matSet = true; continue; }
+                bool first = full || !r.matSet;
+                bool poll = first || ((k + i) % MatPollEvery) == 0;
+                if (r.slots <= 0 && !poll) continue;
                 var m0 = r.r.sharedMaterial;
-                bool multiDue = r.slots > 1 && (full || !r.matSet || ((k + i) % 10) == 0);
-                if (multiDue)
+                bool changed0 = first || m0 != r.mat0;
+                // Renderer.sharedMaterials makes a new array on every call: it is read when slot 0 changed, on the poll for a
+                // renderer with several slots, and for one that had no material at the scan once it has one.
+                bool readAll;
+                if (r.slots > 1) readAll = poll || (changed0 && k - r.polledAt >= MatPollEvery);
+                else if (r.slots == 1) readAll = !first && changed0 && k - r.polledAt >= MatPollEvery;
+                else readAll = m0 != null;
+                if (readAll)
                 {
+                    r.polledAt = k;
                     Material[] cur = r.r.sharedMaterials;
-                    int n = cur != null ? Math.Min(cur.Length, r.mats.Length) : 0;
+                    int n = cur != null ? Math.Min(cur.Length, SrecConst.MaxMatSlots) : 0;
+                    int known = r.mats != null ? r.slots : 0;
+                    if (r.mats == null || n > r.mats.Length)
+                    {
+                        var grown = new Material[Math.Max(n, 1)];
+                        if (r.mats != null) Array.Copy(r.mats, grown, r.mats.Length);
+                        else if (r.slots == 1 && r.matSet) { grown[0] = r.mat0; known = 1; }
+                        r.mats = grown;
+                    }
+                    if (n > r.slots) r.slots = n;
                     for (int s = 0; s < n; s++)
                     {
-                        if (r.matSet && cur[s] == r.mats[s]) continue;
+                        if (!first && s < known && cur[s] == r.mats[s]) continue;
                         r.mats[s] = cur[s];
                         writer.SharedMat(r.id, s, MatId(cur[s]));
                         Key(r.id, k);
                     }
+                    if (n == 0 && changed0 && r.slots > 0 && (first || r.mat0 != null))
+                    {
+                        // the array became empty: slot 0 has no material any more
+                        if (r.mats != null) r.mats[0] = null;
+                        writer.SharedMat(r.id, 0, -1);
+                        Key(r.id, k);
+                    }
                     r.mat0 = n > 0 ? cur[0] : m0;
                 }
-                else if (!r.matSet || m0 != r.mat0)
+                else if (changed0 && r.slots > 0)
                 {
                     r.mat0 = m0;
                     if (r.mats != null) r.mats[0] = m0;
@@ -1926,7 +2320,8 @@ namespace InsideDev
         // detail = new mesh key, tab, previous key; ReplayConst.MeshKey = name|vertexCount|instanceId, so two meshes of one name,
         // the CEO body and the game's headless mesh "mesh", stay apart) in the sample that sees the swap; both meshes are kept by
         // key (and by name for older lookups) at the swap; SceneTracks.MeshAt and the replayer
-        // turn the rows into a step channel. Live meshes are kept by name for a same-session replay.
+        // turn the rows into a step channel. Live meshes are kept by name for a same-session replay. A swap is an event row,
+        // not a key: it does not count in objects.tsv keys (they equal the INDX key counts).
         void SampleMesh(ref RendItem r, int k)
         {
             var m = r.smr.sharedMesh;
@@ -1938,7 +2333,6 @@ namespace InsideDev
             r.mesh = m;
             meshSwaps++;
             if (evKind.Count < 10000) { evKind.Add("mesh"); evName.Add(r.id.ToString(IC)); evDetail.Add(now + "\t" + was); }
-            Key(r.id, k);
         }
 
         void KeepMesh(Mesh m)
@@ -1979,7 +2373,9 @@ namespace InsideDev
                     useStaticShadows = l.useStaticShadows, staticShadowsDirty = l.staticShadowsDirty
                 };
                 var ck = l.cookie;
-                flagNow[it.id] = v.enabled ? SrecConst.FlLight : (byte)0;
+                byte fb = v.enabled ? SrecConst.FlLight : (byte)0;
+                flagNow[it.id] = fb;
+                if (fb != flagLast[it.id]) FlagChanged(it.id);
                 byte mask = 0;
                 if (!it.set || full)
                 {
@@ -1992,7 +2388,7 @@ namespace InsideDev
                     var p = it.last;
                     if (v.enabled != p.enabled) mask |= SrecConst.LiEnabled;
                     if (v.intensity != p.intensity) mask |= SrecConst.LiIntensity;
-                    if (v.color != p.color) mask |= SrecConst.LiColor;
+                    if (!SameColor(v.color, p.color)) mask |= SrecConst.LiColor;
                     if (v.range != p.range) mask |= SrecConst.LiRange;
                     if (v.spotAngle != p.spotAngle) mask |= SrecConst.LiSpotAngle;
                     if (ck != it.cookie) { mask |= SrecConst.LiCookie; it.cookie = ck; v.cookie = TexId(ck); } else v.cookie = p.cookie;
@@ -2007,28 +2403,84 @@ namespace InsideDev
             }
         }
 
+        // Flags are written when they change. The three samplers note the ids whose value differs from the last one written
+        // (a handful per sample, each id at most once); the whole table is walked only on the full sample, when more changed
+        // than the list holds, and after a sample whose flags could not be finished.
         void WriteFlags(int k, bool full)
         {
+            int nd = nFlagDirty;
+            if (!full && !flagWalk && nd <= FlagDirtyMax)
+            {
+                // the ids come in three ascending runs (transforms, renderers, lights); the writer wants one
+                for (int a = 1; a < nd; a++)
+                {
+                    int id = flagDirty[a], b = a - 1;
+                    while (b >= 0 && flagDirty[b] > id) { flagDirty[b + 1] = flagDirty[b]; b--; }
+                    flagDirty[b + 1] = id;
+                }
+                for (int a = 0; a < nd; a++)
+                {
+                    int id = flagDirty[a];
+                    byte b = flagNow[id];
+                    if (b == flagLast[id]) continue;
+                    flagLast[id] = b;
+                    writer.Flags(id, b);
+                    Key(id, k);
+                }
+                return;
+            }
+            flagWalk = true;
             int n = table.Count;
             for (int id = 0; id < n; id++)
             {
                 if (!flagHas[id]) continue;
                 byte b = flagNow[id];
-                if (flagWritten[id] && !full && b == flagLast[id]) continue;
+                if (b == FlagNone || b == flagLast[id]) continue;
                 flagLast[id] = b;
-                flagWritten[id] = true;
                 writer.Flags(id, b);
                 Key(id, k);
             }
+            flagWalk = false;
         }
 
+        // One buffer for all systems (the writer copies a frame out before the next system is read), grown by doubling up
+        // to ParticleLimit; a system with more live particles than that is cut, with one warning.
+        void GrowParticles(int count, ref PsItem it)
+        {
+            if (psBuf.Length < ParticleLimit) psBuf = new ParticleSystem.Particle[Math.Min(ParticleLimit, Math.Max(count + 64, psBuf.Length * 2))];
+            if (count <= psBuf.Length || it.cut) return;
+            it.cut = true;
+            Warn("particle system with " + count + " live particles, its frames are cut to " + ParticleLimit + ": " + table[it.id].path);
+        }
+
+        // The samplers that call into game scripts (particles, MaterialInstance, probes, ropes, shader state) remember the
+        // item they are at (sampAt): when one throws, that item is left out for the rest of the take (LeftOut) and the
+        // loop goes on behind it.
         int SampleParticles(int k, bool full)
         {
-            int total = 0;
-            for (int i = 0; i < np; i++)
+            int total = 0, from = 0;
+            while (from < np)
+            {
+                sampAt = -1;
+                try { ParticlesFrom(from, k, full, ref total); break; }
+                catch (Exception e)
+                {
+                    int at = sampAt;
+                    if (at < from || at >= np || !LeftOut(ps[at].id, k, e)) throw;
+                    ps[at].dead = true;
+                    from = at + 1;
+                }
+            }
+            return total;
+        }
+
+        void ParticlesFrom(int from, int k, bool full, ref int total)
+        {
+            for (int i = from; i < np; i++)
             {
                 ref PsItem it = ref ps[i];
                 if (it.dead) continue;
+                sampAt = i;
                 ref XfItem o = ref xs[it.owner];
                 if (o.dead || it.ps == null) { it.dead = true; Dead(it.id); continue; }
                 if (!(full || o.activeH)) continue;
@@ -2053,12 +2505,12 @@ namespace InsideDev
                 int n = 0;
                 if (count > 0)
                 {
-                    if (count > it.buf.Length) it.buf = new ParticleSystem.Particle[Math.Min(count + 64, 400000)];
-                    n = p.GetParticles(it.buf);
+                    if (count > psBuf.Length) GrowParticles(count, ref it);
+                    n = p.GetParticles(psBuf);
                 }
                 if (n > 0 || it.lastCount > 0 || full)
                 {
-                    writer.Particles(it.id, it.buf, n);
+                    writer.Particles(it.id, psBuf, n);
                     particleFrames++;
                     particlesTotal += n;
                     total += n;
@@ -2066,15 +2518,32 @@ namespace InsideDev
                 }
                 it.lastCount = n;
             }
-            return total;
         }
 
         void SampleMaterials(int k, bool full)
         {
-            for (int i = 0; i < nm; i++)
+            int from = 0;
+            while (from < nm)
+            {
+                sampAt = -1;
+                try { MaterialsFrom(from, k, full); break; }
+                catch (Exception e)
+                {
+                    int at = sampAt;
+                    if (at < from || at >= nm || !LeftOut(ms[at].id, k, e)) throw;
+                    ms[at].excluded = true;
+                    from = at + 1;
+                }
+            }
+        }
+
+        void MaterialsFrom(int from, int k, bool full)
+        {
+            for (int i = from; i < nm; i++)
             {
                 var it = ms[i];
                 if (it.dead || it.excluded) continue;
+                sampAt = i;
                 ref XfItem o = ref xs[it.owner];
                 if (o.dead || it.mi == null) { it.dead = true; Dead(it.id); continue; }
                 if (!(full || o.activeH)) continue;
@@ -2097,7 +2566,7 @@ namespace InsideDev
                 for (int j = 0; j < lim; j++)
                 {
                     Color v = cp[j].value;
-                    if (!full && j < it.values[1] && v == it.c[j]) continue;
+                    if (!full && j < it.values[1] && SameColor(v, it.c[j])) continue;
                     it.c[j] = v;
                     writer.Material(it.id, SrecConst.MatColor, j, new Vector4(v.r, v.g, v.b, v.a), -1);
                     Key(it.id, k);
@@ -2109,7 +2578,7 @@ namespace InsideDev
                 for (int j = 0; j < lim; j++)
                 {
                     Vector4 v = vp[j].value;
-                    if (!full && j < it.values[2] && v == it.v[j]) continue;
+                    if (!full && j < it.values[2] && ShaderMirror.Same(v, it.v[j])) continue;
                     it.v[j] = v;
                     writer.Material(it.id, SrecConst.MatVector, j, v, -1);
                     Key(it.id, k);
@@ -2161,11 +2630,29 @@ namespace InsideDev
 
         void SampleProbes(int k, bool full)
         {
+            int from = 0;
+            while (from < npb)
+            {
+                sampAt = -1;
+                try { ProbesFrom(from, k, full); break; }
+                catch (Exception e)
+                {
+                    int at = sampAt;
+                    if (at < from || at >= npb || !LeftOut(pbs[at].id, k, e)) throw;
+                    pbs[at].dead = true;
+                    from = at + 1;
+                }
+            }
+        }
+
+        void ProbesFrom(int from, int k, bool full)
+        {
             float eps = spec.posEps;
-            for (int i = 0; i < npb; i++)
+            for (int i = from; i < npb; i++)
             {
                 ref ProbeItem it = ref pbs[i];
                 if (it.dead) continue;
+                sampAt = i;
                 ref XfItem o = ref xs[it.owner];
                 if (o.dead || it.p == null) { it.dead = true; Dead(it.id); continue; }
                 if (!(full || o.activeH)) continue;
@@ -2180,11 +2667,29 @@ namespace InsideDev
 
         void SampleRopes(int k, bool full)
         {
+            int from = 0;
+            while (from < nrope)
+            {
+                sampAt = -1;
+                try { RopesFrom(from, k, full); break; }
+                catch (Exception e)
+                {
+                    int at = sampAt;
+                    if (at < from || at >= nrope || !LeftOut(ropes[at].id, k, e)) throw;
+                    ropes[at].dead = true;
+                    from = at + 1;
+                }
+            }
+        }
+
+        void RopesFrom(int from, int k, bool full)
+        {
             float eps = spec.posEps;
-            for (int i = 0; i < nrope; i++)
+            for (int i = from; i < nrope; i++)
             {
                 var it = ropes[i];
                 if (it.dead) continue;
+                sampAt = i;
                 ref XfItem o = ref xs[it.owner];
                 if (o.dead || it.r == null) { it.dead = true; Dead(it.id); continue; }
                 if (!(full || o.activeH)) continue;
@@ -2214,7 +2719,7 @@ namespace InsideDev
             fogNow[19] = S(f.bloomIntensity_32); fogNow[20] = S(f.bloomSaturation); fogNow[21] = C(f.BackgroundColor);
             for (int i = 0; i < FogNames.Length; i++)
             {
-                if (fogSet && !full && fogNow[i] == fogLast[i]) continue;
+                if (fogSet && !full && ShaderMirror.Same(fogNow[i], fogLast[i])) continue;
                 fogLast[i] = fogNow[i];
                 writer.Render(i, fogType[i], fogNow[i]);
             }
@@ -2386,8 +2891,7 @@ namespace InsideDev
                     comps = n.mask, pos = p, rot = q, scale = n.t.localScale, activeSelf = n.go.activeSelf, extent = n.extent,
                     parentId = parentXf >= 0 ? xs[parentXf].id : -1
                 };
-                o.ordinals.AddRange(n.ord);
-                o.siblings.AddRange(n.sib);
+                Chains(s, i, o.ordinals, o.siblings);
                 o.types.AddRange(n.types);
                 byte fl = 0;
                 if (local) fl |= SrecConst.ObjLocal;
@@ -2406,7 +2910,7 @@ namespace InsideDev
                     t = n.t, go = n.go, rb = n.rb, id = id, parentIdx = parentXf, parentId = o.parentId,
                     parentInst = n.t.parent != null ? n.t.parent.GetInstanceID() : 0, local = local, camXf = n.camXf, camDriven = n.camDriven,
                     rotThr = XfMath.RotThreshold(spec.posEps, n.extent, spec.rotEps), activeSelf = n.go.activeSelf, activeH = n.go.activeInHierarchy, seenAt = -1,
-                    spawnedXf = n.spawned, kids = n.t.childCount
+                    spawnedXf = n.spawned, kids = n.kids
                 };
                 x.s.Reset();
                 x.q.ok = quietTransforms && !mover[i];
@@ -2510,7 +3014,7 @@ namespace InsideDev
 
         void Streamed(SubsceneCuller c, string why)
         {
-            if (ended || c == null) return;
+            if (ended || stopped || c == null) return;
             int i;
             if (!cullerIndex.TryGetValue(c.GetInstanceID(), out i) || !(cullerLoadWant[i] || cullerActWant[i]) || streamQueue.Contains(i)) return;
             streamQueue.Add(i);
@@ -2520,7 +3024,9 @@ namespace InsideDev
         void WatchStreaming(int k)
         {
             if (cullersWatched == 0) return;
-            if (k == 0 || k % Math.Max(1, spec.rescanEvery) == 0)
+            bool rescan = k == 0 || rescanNow || k % Math.Max(1, spec.rescanEvery) == 0;
+            rescanNow = false;
+            if (rescan)
                 for (int i = 0; i < cullerList.Count; i++)
                     if ((cullerLoadWant[i] || cullerActWant[i]) && cullerRoot[i] == null && !streamQueue.Contains(i)) { streamQueue.Add(i); streamWhy.Add("rescan"); }
             if (streamQueue.Count == 0) return;
@@ -2619,8 +3125,22 @@ namespace InsideDev
             var t = xs[i].t;
             if (t == null) return;
             int cc = t.childCount;
-            if (cc == xs[i].kids) return;
-            xs[i].kids = cc;
+            if (cc == xs[i].kids)
+            {
+                // the same count can hide a child that was replaced: new children are appended, so the last one tells
+                // (looked at on the staggered sweep for spawned parents, which are checked every sample)
+                if (cc == 0 || (xs[i].spawnedXf && ((k + i) % XfMath.SweepEvery) != 0)) return;
+                int lk = t.GetChild(cc - 1).GetInstanceID();
+                int was = xs[i].lastKid;
+                if (lk == was) return;
+                xs[i].lastKid = lk;
+                if (was == 0) return;
+            }
+            else
+            {
+                xs[i].kids = cc;
+                xs[i].lastKid = cc > 0 ? t.GetChild(cc - 1).GetInstanceID() : 0;
+            }
             AddNewChildren(i, k);
         }
 
@@ -2685,7 +3205,7 @@ namespace InsideDev
             if (!EventName(name)) { DevLog.Write("srec: event name '" + name + "' refused (letters, digits, '_' and '.' only)"); return false; }
             bool stored = false;
             var r = active;
-            if (r != null && !r.ended && !r.failed && r.writer != null)
+            if (r != null && !r.ended && !r.stopped && r.writer != null)
             {
                 r.Event("event", name, detail);
                 r.posts++;
@@ -2701,7 +3221,7 @@ namespace InsideDev
         public static bool Register(UnityEngine.Object target)
         {
             var r = active;
-            if (r == null || r.ended || r.failed || target == null) return false;
+            if (r == null || r.ended || r.stopped || target == null) return false;
             var t = target as Transform;
             if (t == null)
             {
@@ -2738,17 +3258,36 @@ namespace InsideDev
         public void End(SpecReport report)
         {
             if (ended) return;
-            ended = true;
             if (report == null) report = new SpecReport();
+            try { ClosingSample(); } catch (Exception e) { report.Warn("replay.record", "closing sample: " + e.GetType().Name + ": " + e.Message); }
+            ended = true;
             try { if (onPreCull != null) { SceneHooks.preCullMain -= onPreCull; SceneHooks.Release(); } }
             catch (Exception e) { report.Warn("replay.record", "SceneHooks release: " + e.Message); }
             try { UnhookStreaming(); } catch (Exception e) { report.Warn("replay.record", "subscene stream hooks release: " + e.Message); }
             if (active == this) registerQueue.Clear();
             if (destroyedSpawned > 1) Warn(destroyedSpawned + " spawned object(s) destroyed during the record (record.json destroyedSpawnedPaths)");
             if (evKind.Count > 0) Warn(evKind.Count + " event(s) after the last sample are kept in record.json only");
-            try { if (writer != null) { writer.Close(); bytes = writer.bytes; } }
+            bool writeFailed = false;
+            try
+            {
+                if (writer != null)
+                {
+                    writeFailed = writer.writeFailed;
+                    writer.Close();
+                    bytes = writer.bytes;
+                    writeFailed |= writer.writeFailed;
+                }
+            }
             catch (Exception e) { report.Error("replay.record", "scene.srec close: " + e.Message); }
-            if (writer != null && writer.error != null) report.Error("replay.record", "scene.srec writer: " + writer.error);
+            if (writer != null) { writerStalls = writer.stalls; writerError = writer.error ?? ""; }
+            if (writerError.Length > 0) report.Error("replay.record", "scene.srec writer: " + writerError);
+            if (writeFailed && !failed)
+            {
+                failed = true;
+                stopped = true;
+                stopKind = "writer";
+                stopReason = "scene.srec writer: " + (writer != null && writer.writeError != null ? writer.writeError : writerError.Length > 0 ? writerError : "the writer thread ended");
+            }
             gcEnd = GC.CollectionCount(0);
             try { if (prep != null) activatedGroups = prep.ActivatedGroups(); } catch { }
             for (int i = 0; i < np; i++)
@@ -2758,19 +3297,110 @@ namespace InsideDev
             }
             if (staleParticles.Count > 0) Warn(staleParticles.Count + " particle system(s) played with particleCount 0 for the whole record (off-screen culled? possibly stale in side cameras)");
             if (ropeFallback > 0) Warn("rope vertices read by reflection (" + ropeFallback + " reads, allocates)");
+            endSeconds = Seconds();
             try { WriteObjects(); } catch (Exception e) { report.Warn("replay.record", ReplayConst.ObjectsFile + ": " + e.Message); }
             try { WriteMeta(); } catch (Exception e) { report.Warn("replay.record", ReplayConst.RecordMetaFile + ": " + e.Message); }
             try { WriteJson(); } catch (Exception e) { report.Warn("replay.record", ReplayConst.RecordJson + ": " + e.Message); }
-            if (failed) report.Error("replay.record", "recording failed: " + lastError);
-            else if (errors > 0) report.Warn("replay.record", errors + " sample error(s), last: " + lastError);
+            if (failed) report.Error("replay.record", "recording failed: " + stopReason);
+            else
+            {
+                if (stopReason.Length > 0) report.Warn("replay.record", "recording ended early: " + stopReason);
+                if (errors > 0) report.Warn("replay.record", errors + " sample error(s), last: " + lastError);
+            }
             if (samples == 0) report.Warn("replay.record", "no sample was taken (no preCull of the world camera after Begin?)");
             if (active == this) active = null;
             last = this;
-            loadCountAtEnd = CurrentLoadCount();
-            sessionRecorders.Remove(this);
-            sessionRecorders.Add(this);
+            // The live references stay for a replay in the same session (SessionRecording), one recorder per folder. A
+            // recording that a level load ended points at destroyed objects: its references are let go.
+            int lc = CurrentLoadCount();
+            bool gone = stopKind == "load" || (joinPlan == null && loadCountAtBegin >= 0 && lc != loadCountAtBegin);
+            loadCountAtEnd = gone ? -1 : lc;
+            string own = NormDir(dir);
+            sessionRecorders.RemoveAll(r => r == null || r == this || r.loadCountAtEnd != lc || string.Equals(NormDir(r.dir), own, StringComparison.OrdinalIgnoreCase));
+            if (!gone) sessionRecorders.Add(this);
             if (sessionRecorders.Count > 16) sessionRecorders.RemoveAt(0);
-            DevLog.Write("srec: end " + Status());
+            string line = Status();
+            writer = null;
+            ReleaseSampling();
+            if (gone) { refs.Clear(); refs.TrimExcess(); meshRefs.Clear(); }
+            DevLog.Write("srec: end " + line);
+        }
+
+        // Events that came after the last sample (the stop event of the host, a marker or a post of the last frame) get one
+        // closing sample that holds only them, so they are in scene.srec where the replay looks for them. Its time is now,
+        // or the last sample's time when the game time did not advance or the sampling had stopped; its only flag is
+        // SmplHold (no game frame, no marker: nothing was captured for it). Not written for a failed recording, nor when
+        // the pending rows are only recorder warnings (they stay in record.json), so a take that ends without a host event
+        // (an mcam take, also one stopped early) keeps one sample per captured frame.
+        void ClosingSample()
+        {
+            if (evKind.Count == 0 || writer == null || samples == 0 || failed || writer.writeFailed) return;
+            bool any = false;
+            for (int i = 0; i < evKind.Count && !any; i++) any = evKind[i] != "warning";
+            if (!any) return;
+            int k = samples;
+            double game = stopped ? lastGameTime : Math.Max(lastGameTime, Time.timeDbl - header.t0);
+            double realAbs = Time.realtimeSinceStartupDbl;
+            long step = lastStep;
+            try { step = LogicManager.stepCount; } catch { }
+            int frame = Time.frameCount;
+            var stamp = new SrecStamp
+            {
+                sample = k, gameTime = game, realTime = realAbs, logicStep = step, frameCount = frame,
+                fixedSteps = (ushort)Math.Min(65535L, Math.Max(0L, step - lastStep)), flags = SrecConst.SmplHold
+            };
+            long before = writer.bytes;
+            writer.BeginSample(stamp);
+            for (int i = 0; i < evKind.Count; i++)
+            {
+                writer.Event(evKind[i], evName[i], evDetail[i]);
+                if (evKind[i] == "event") LogEvent(evName[i], evDetail[i], k, game);
+            }
+            writer.EndSample();
+            evKind.Clear(); evName.Clear(); evDetail.Clear();
+            pendingFlags = 0;
+            for (int c = 0; c < chanNow.Length; c++) chanNow[c] = 0f;
+            Meta(k, frame, game, game - lastGameTime, realAbs - header.t0Real, step, stamp.fixedSteps, Time.timeScale, stamp.flags, 0, 0, writer.bytes - before, 0f);
+            samples = k + 1;
+            bytes = writer.bytes;
+            lastGameTime = game;
+            lastStep = step;
+            closingSamples++;
+        }
+
+        // After End only Ref (refs), MeshRef, ShaderMaterial, the event log, `extra` and the counters are read. Everything
+        // the sampling used is let go, so an ended recorder that stays reachable (last, sessionRecorders) holds little.
+        void ReleaseSampling()
+        {
+            psBuf = new ParticleSystem.Particle[0];
+            xs = new XfItem[0]; nx = 0; xfDead = 0;
+            rs = new RendItem[0]; nr = 0;
+            ls = new LightItem[0]; nl = 0;
+            ps = new PsItem[0]; np = 0;
+            ms = new MiItem[0]; nm = 0;
+            pbs = new ProbeItem[0]; npb = 0;
+            ropes = new RopeItem[0]; nrope = 0;
+            flagNow = new byte[0]; flagLast = new byte[0]; flagHas = new bool[0];
+            keyFirst = new int[0]; keyLast = new int[0]; keyCount = new int[0];
+            metaN = 0;
+            mFrame = new int[0]; mXf = new int[0]; mParts = new int[0];
+            mGame = new double[0]; mDt = new double[0]; mReal = new double[0];
+            mStep = new long[0]; mBytes = new long[0];
+            mFixed = new ushort[0]; mFlags = new ushort[0];
+            mScale = new float[0]; mCost = new float[0]; mChan = new float[0];
+            childBuf = new int[0]; dels = new int[0]; ndel = 0;
+            table.Clear(); table.TrimExcess();
+            adds.Clear(); adds.TrimExcess();
+            containers.Clear(); subsceneNodes.Clear();
+            xfByInstance = new Dictionary<int, int>();
+            texIds.Clear(); matIds.Clear(); typeNames.Clear();
+            cullerList.Clear(); cullerIndex.Clear();
+            cullerLoadWant = new bool[0]; cullerActWant = new bool[0]; cullerRoot = new Transform[0];
+            streamQueue.Clear(); streamWhy.Clear(); skipIds.Clear();
+            spawnedXfs.Clear(); spawnedXfs.TrimExcess();
+            evKind.Clear(); evName.Clear(); evDetail.Clear();
+            scanned = null; camPaths = null; excludePaths = null; prep = null; joinPlan = null;
+            ShaderRelease();
         }
 
         static string Tsv(string s) { return (s ?? "").Replace('\t', ' ').Replace('\n', ' ').Replace('\r', ' '); }
@@ -2839,7 +3469,7 @@ namespace InsideDev
                   .Append(CompText(o.comps)).Append('\t').Append(keyFirst[o.id].ToString(IC)).Append('\t').Append(keyLast[o.id].ToString(IC)).Append('\t')
                   .Append(keyCount[o.id].ToString(IC)).Append('\t').Append(FlagText(fl)).Append('\n');
             }
-            File.WriteAllText(Path.Combine(dir, ReplayConst.ObjectsFile), sb.ToString());
+            SafeFile.WriteAllText(Path.Combine(dir, ReplayConst.ObjectsFile), sb.ToString());
         }
 
         void WriteMeta()
@@ -2853,7 +3483,7 @@ namespace InsideDev
                   .Append(mFixed[i].ToString(IC)).Append(',').Append(mScale[i].ToString("0.####", IC)).Append(',').Append(mFlags[i].ToString(IC)).Append(',')
                   .Append(mXf[i].ToString(IC)).Append(',').Append(mParts[i].ToString(IC)).Append(',').Append(mBytes[i].ToString(IC)).Append('\n');
             }
-            File.WriteAllText(Path.Combine(dir, ReplayConst.RecordMetaFile), sb.ToString());
+            SafeFile.WriteAllText(Path.Combine(dir, ReplayConst.RecordMetaFile), sb.ToString());
         }
 
         static double Pct(float[] a, int n, double q)
@@ -2970,8 +3600,13 @@ namespace InsideDev
             o["sampleErrors"] = errors;
             if (lastError.Length > 0) o["lastSampleError"] = lastError;
             o["failed"] = failed;
-            o["writerStalls"] = writer != null ? writer.stalls : 0;
-            o["writerError"] = writer != null && writer.error != null ? writer.error : "";
+            o["stopKind"] = stopKind;
+            o["stopReason"] = stopReason;
+            o["leftOut"] = itemErrors;
+            o["closingSamples"] = closingSamples;
+            o["levelLoads"] = loadsSeen;
+            o["writerStalls"] = writerStalls;
+            o["writerError"] = writerError;
             o["particles"] = particlesOk;
             o["forcedCullers"] = Strs(header.forcedCullers);
             o["activatedGroups"] = Strs(activatedGroups);
@@ -3011,7 +3646,7 @@ namespace InsideDev
             o["warnings"] = Strs(warnings);
             o["header"] = HeaderJson(header);
             foreach (var key in extra.order) o[key] = extra[key];
-            File.WriteAllText(Path.Combine(dir, ReplayConst.RecordJson), Json.Write(o));
+            SafeFile.WriteAllText(Path.Combine(dir, ReplayConst.RecordJson), Json.Write(o));
         }
     }
 #endif
@@ -3257,7 +3892,9 @@ namespace InsideDev
                 {
                     if ((bits & SrecConst.XfPos) != 0 && s.posAt < k - 1) preBits |= SrecConst.XfPos;
                     if ((bits & SrecConst.XfRot) != 0 && s.rotAt < k - 1) preBits |= SrecConst.XfRot;
-                    if ((bits & SrecConst.XfScale) != 0 && s.scaleAt < k - 1 && s.prevScaleAt == k - 1) preBits |= SrecConst.XfScale;
+                    // scale keys are exact, so a scale that differs on a late read (the object was not read at k - 1) was
+                    // believed constant until now: the pre-key makes it a step here instead of a ramp since the last key
+                    if ((bits & SrecConst.XfScale) != 0 && s.scaleAt < k - 1 && (s.prevScaleAt == k - 1 || !Same(scale, s.keyScale))) preBits |= SrecConst.XfScale;
                 }
                 return bits;
             }

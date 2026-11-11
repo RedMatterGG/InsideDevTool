@@ -404,18 +404,67 @@ namespace InsideDev
                 c.ch = writer.ShaderDef(c.scope, target, c.type, c.name);
                 if (c.ch < 0) c.dead = true;
             }
-            for (int i = 0; i < shSources.Count; i++)
+            // The writers and the value reads call into game scripts and materials: one that throws is left out for the rest
+            // of the take (sampAt names it), the others go on.
+            int from = 0;
+            while (from < shSources.Count)
+            {
+                sampAt = -1;
+                try { ShaderSourcesFrom(from); break; }
+                catch (Exception e)
+                {
+                    int at = sampAt;
+                    if (at < from || at >= shSources.Count || itemErrors >= ItemErrorLimit) throw;
+                    var s = shSources[at];
+                    string who = s.probe != null ? "ColorBlendProbe" : s.grass != null ? "Player2GrassShader" : "Player2PlantShader";
+                    s.probe = null; s.grass = null; s.plant = null;
+                    itemErrors++;
+                    errors++;
+                    lastError = "shader state writer " + who + ": " + e.GetType().Name + ": " + e.Message;
+                    Warn("shader state: a " + who + " writer is not read from sample " + k + " on, it threw " + e.GetType().Name + " (" + e.Message + ")");
+                    from = at + 1;
+                }
+            }
+            from = 0;
+            while (from < n)
+            {
+                sampAt = -1;
+                try { ShaderValuesFrom(from, n, k, full); break; }
+                catch (Exception e)
+                {
+                    int at = sampAt;
+                    if (at < from || at >= n || itemErrors >= ItemErrorLimit) throw;
+                    var c = shChans[at];
+                    c.dead = true;
+                    itemErrors++;
+                    errors++;
+                    lastError = "shader channel " + c.name + ": " + e.GetType().Name + ": " + e.Message;
+                    Warn("shader state: channel " + c.name + " (" + c.source + ") is not recorded from sample " + k + " on, reading it threw " + e.GetType().Name + " (" + e.Message + ")");
+                    from = at + 1;
+                }
+            }
+        }
+
+        void ShaderSourcesFrom(int from)
+        {
+            for (int i = from; i < shSources.Count; i++)
             {
                 var s = shSources[i];
+                sampAt = i;
                 if (s.probe != null) ShaderProbe(s);
                 else if (s.grass != null) ShaderGrass(s);
                 else if (s.plant != null) ShaderPlant(s);
             }
+        }
+
+        void ShaderValuesFrom(int from, int n, int k, bool full)
+        {
             int lastRend = -1;
-            for (int i = 0; i < n; i++)
+            for (int i = from; i < n; i++)
             {
                 var c = shChans[i];
                 if (c.dead || c.ch < 0) continue;
+                sampAt = i;
                 Vector4 v;
                 if (c.scope == SrecConst.ShGlobal)
                 {
@@ -451,6 +500,18 @@ namespace InsideDev
                 writer.ShaderVal(c.ch, v);
                 shKeys++;
             }
+        }
+
+        // End: the channels stay (ShaderMaterial serves a replay in the same session), what only the sampling used goes.
+        void ShaderRelease()
+        {
+            shSources.Clear();
+            shPending.Clear();
+            shRend.Clear();
+            shWriters.Clear();
+            shIndex.Clear();
+            shSpecBlocks.Clear();
+            shBlock = null;
         }
 
         Json.Obj ShaderJson()
@@ -614,6 +675,10 @@ namespace InsideDev
             subTicks[5] += System.Diagnostics.Stopwatch.GetTimestamp() - c0;
         }
 
+        // Property blocks get back only what the replay wrote: `begin` of a property the block did not hold is 0 (a block
+        // returns 0 for it), and writing that into a block the replay never touched would override the material's own
+        // value, or give a renderer without a block one. Unity 5.0 cannot take a property out of a block again, so a
+        // channel that was applied keeps its begin value there.
         void RestoreShader()
         {
             foreach (var it in shMats)
@@ -627,19 +692,21 @@ namespace InsideDev
             {
                 var r = shBlocks[i].r;
                 int j = i;
-                while (j < shBlocks.Count && (object)shBlocks[j].r == (object)r) j++;
-                if (r != null)
+                bool any = false;
+                for (; j < shBlocks.Count && (object)shBlocks[j].r == (object)r; j++) any |= shBlocks[j].applied;
+                if (any && r != null)
                 {
                     r.GetPropertyBlock(shBlock);
                     for (int k = i; k < j; k++)
                     {
                         var it = shBlocks[k];
-                        it.applied = false;
+                        if (!it.applied) continue;
                         if (it.c.type == SrecConst.ValFloat) shBlock.SetFloat(it.prop, it.begin.x);
                         else shBlock.SetVector(it.prop, it.begin);
                     }
                     r.SetPropertyBlock(shBlock);
                 }
+                for (int k = i; k < j; k++) shBlocks[k].applied = false;
                 i = j;
             }
         }
