@@ -36,8 +36,8 @@ in the game: no recording, no camera change.
 
 | Feature | Starts with | Stops with | Saved between game sessions |
 |---|---|---|---|
-| Scene recorder | `srec record start <dir>` | `srec record stop [keep]`, game quit | nothing (only the take folder) |
-| Recording viewer | `srec load <dir>` | `srec end`, game quit | nothing |
+| Scene recorder | `srec record start [<dir>]` | `srec record stop [keep\|load]`, game quit, its own limits (`maxMB`, `maxSeconds`, `minFreeMB`, `onLoad=stop`, a full disk) | nothing (only the take folder) |
+| Recording viewer | `srec load <dir\|last>` | `srec end`, game quit | nothing |
 | Write-order probe | `srec probe [n]` (viewer loaded) | runs n frames, or `srec probe stop` | `write_probe.tsv` in the recording folder |
 | Camera probe | `srec probe camera [n]` | runs about 2n + 5 frames, or `srec probe stop` | `<game>\_mod\camera_driven.tsv` (read by every later recording) |
 | Free camera | `cam pose ...`, `cam fov`, `cam roll`, Insert key | `cam off`, Insert key | no |
@@ -52,13 +52,22 @@ in the game: no recording, no camera change.
 
 - File bridge: write `<game>\_mod\cmd\in_<anything>.txt` with one command per line (optionally `<id>|<command>`, id at
   most 11 characters); the reply is appended to `<game>\_mod\cmd\out.txt` between `>>> <id>` and `<<< <id>`.
-- MCP: the `command` tool of `InsideDev.Mcp.dll` runs any bridge command and returns its reply.
-- The in-game console (the backtick key) does not run them: it answers "unknown command".
+- MCP: the `command` tool of `InsideDev.Mcp.dll` runs any bridge command and returns its reply; `POST /cmd` and
+  `tools\inside_ctl.py` send one command line.
+- The in-game console (the backtick key): since 0.11.0 it hands every word it does not know itself to the bridge and
+  prints the reply, so `srec`, `cam`, `hud`, `clean`, `gamma` and `seed` work there too (0.10.0 answered "unknown
+  command").
 
 Tokens are separated by spaces. Double quotes group words (`"C:\path with spaces\take1"`) and are removed; a value can
 therefore never contain a double quote, so keys that take a JSON object (`box`, `activateList`) cannot be given on the
-command line (use a spec file with `spec=` for `box`). Give folders as absolute paths: a relative folder is resolved
-against the game process's working folder (which folder that is when the game starts from Steam is unverified in game).
+command line (use a spec file with `spec=` for `box`). Folders: since 0.11.0 a relative `srec` folder (`srec record
+start`, `srec load`) is a folder under `<game>\_mod\srec\`, and `srec record start` without a folder makes
+`<game>\_mod\srec\take_<yyyyMMdd_HHmmss>` (`_2`, `_3` ... when two fall into one second). Absolute paths work as before.
+Every reply prints the full path.
+
+Failure replies start with an error word (changed in 0.11.0, first words of failure replies only): `refused:`, `busy:`,
+`not found:`, `usage:`, `failed:`. A script can tell success from failure by the first word. An unknown `key=value`
+is an error, for example `srec.intrep: unknown argument 'intrep' (valid: t, cam, look, order, interp, ...)`.
 
 ---
 
@@ -69,7 +78,10 @@ against the game process's working folder (which folder that is when the game st
 ```
 load 7 0
 state                                         repeat until the "savepoint:" line shows the savepoint you loaded
-srec record start C:\path\to\takes\take1      the recording starts in this frame
+                                              (from outside: python tools\inside_ctl.py snapshot, or
+                                              python tools\inside_ctl.py wait savepoint 7 0)
+srec record start C:\path\to\takes\take1      the recording starts in this frame (without a folder:
+                                              <game>\_mod\srec\take_<date>_<time>)
                                               ... play the scene ...
 srec event landing                            optional: mark a moment (use it later as @landing)
 srec record status                            t, fps, drift, samples, objects, MB
@@ -86,7 +98,9 @@ srec end                                      releases the viewer; the scene sta
 ```
 
 `srec record stop` without `keep` is also fine before `srec load`; `keep` only avoids streaming and culling changes between
-the end of the record and the viewer (4.4). Use the Insert key, WASD and the right mouse button to fly while the viewer is
+the end of the record and the viewer (4.4). `srec record stop load` does both steps at once (stop with keep, then load
+the take), `srec load last` loads the newest take under `<game>\_mod\srec\`, and `srec reload` ends the viewer and loads
+the same folder again with the same words. Use the Insert key, WASD and the right mouse button to fly while the viewer is
 loaded (section 7).
 
 ### 3.2 A take driven through MCP
@@ -104,8 +118,11 @@ srec record stop
 - `spec=` takes `replay.record` of that spec as the defaults and arms its `events`, so `@event` times exist in the
   recording. Keys given on the command line win.
 - `clock=fixed:60` gives one sample per logic step when the agent drives the game in step mode (section 6).
-- Keep calling tools during the take: the MCP server restores the game after `mcp.idle_restore_s` (default 600 s) without a
-  tool call (section 9).
+- The MCP server restores the game after `mcp.idle_restore_s` (default 600 s) without a tool call (section 9). Since
+  0.11.0 a running `srec record` (and a waiting start) holds that restore off, but held agent input is still the agent's
+  business: keep calling tools during the take.
+- Film it with a live camera instead: Play's `grec` records the game's own frames during the same run, and its
+  `<file>.times.csv` puts srec events and the WAV on the video's timeline ([PLAY.md](PLAY.md) section 4.6.1).
 - Film it from many cameras afterwards with `mcam replay` and `replay.source` set to the take folder, in the same game
   session: [MULTICAM.md](MULTICAM.md), "Replay mode".
 
@@ -125,13 +142,16 @@ python -I tools/srec_tool.py report C:\path\to\takes\take1 --check "OfficeDudeE 
 
 | Command | Short description |
 |---|---|
-| `srec status` | Viewer, recording, pending handover, probe and hook state. "srec idle (srec help)" when nothing is active. |
+| `srec status [json]` | Viewer, recording, pending handover, probe and hook state. "srec idle (srec help)" when nothing is active. |
 | `srec objects [filter] [max=n]` | Object table of the loaded recording. |
-| `srec record start <dir> [key=value ...]` | Start a manual recording into `<dir>`. |
-| `srec record stop [keep]` | Stop it (or cancel the wait for kept subscenes). |
-| `srec record status` | State of the manual recording, or "not recording". |
+| `srec list [max=n] [json]` | New: the takes under `<game>\_mod\srec`, newest first (name, date, samples, seconds, MB, audio). Example: `srec list max=5`. |
+| `srec events [json]` | New: the events of the loaded recording with their times. |
+| `srec record start [<dir>] [key=value ...]` | Start a manual recording into `<dir>` (default a new take folder, section 2). |
+| `srec record stop [keep\|load]` | Stop it (or cancel the wait for kept subscenes); `load` = stop with keep, then `srec load` of that take. |
+| `srec record status [json]` | State of the manual recording, or "not recording". |
 | `srec event <name> [detail ...]` | Store a timed event in the active recording. |
-| `srec load <dir> [t=...] [cam=game\|keep] [key=value ...]` | Load a recording into the viewer and freeze the scene. |
+| `srec load <dir\|last> [dry] [replace] [play [speed] [loop\|once]] [t=...] [cam=game\|keep] [key=value ...] [json with dry]` | Load a recording into the viewer and freeze the scene. |
+| `srec reload` | New: `srec end` and `srec load` of the last loaded folder with the same words. |
 | `srec play [speed] [loop\|once]` / `srec pause` | Play the viewer / stop playing. |
 | `srec seek <time>` / `srec step [next\|back\|<dt>]` | Move the viewer's replay time T. |
 | `srec end` | Close the viewer (or release a pending record handover). |
@@ -144,8 +164,17 @@ python -I tools/srec_tool.py report C:\path\to\takes\take1 --check "OfficeDudeE 
 Prints, when present: `viewer <dir>  T <t> / <duration> s  sample <i>/<n>  paused|playing x<speed> [loop]` and a line with
 the replayer state (resolved and unresolved objects, conflicts, activations); `recording <dir> ...` with game time, fps of
 the last 60 frames, clock drift in ms, pacing changes, audio state and spec events fired; `handover pending from <dir>`;
-the running probe and the last probe summary; the last deferred record start (a start that waited for kept subscenes);
-the hook line (`hooks: lateFrame ...`). During an mcam replay or record it shows `replay (mcam)` or `recording (mcam)`.
+the running probe and the last probe summary; the hook line (`hooks: lateFrame ...`). During an mcam replay or record it
+shows `replay (mcam)` or `recording (mcam)`. With nothing active the first line is always `srec idle (srec help)`,
+followed by `last viewer closed: ...`, `last handover: ...`, `last probe: ...` and `last record: ...` lines (0.10.0
+printed only the first of them, and called the last one `last deferred record start:`). The T line of `status`, `seek`,
+`step` and `pause` reads `T 1.500 / 12.000 s  sample 90/720  paused  applied T 1.500 frame 48211`; it may end with
+`, requested T x (applies next frame)` or `, ended by: level load at frame N`.
+
+`srec status json` (new) is one line: `{"state", "frame", "timeScale", "loading", "frozenBy", "dir", "T", "appliedT",
+"appliedFrame", "duration", "sample", "sampleCount", "playing", "speed", "loop", "replay":{..}, "recording":{..},
+"handover":{..}, "probe":{..}, "lastViewer", "lastHandover", "lastProbe", "lastRecord", "takes", "tickErrors"}` with
+`state` = `waiting`, `recording`, `viewer`, `probe`, `replay (mcam)`, `recording (mcam)` or `idle`.
 
 ### 4.2 `srec objects [filter] [max=n]`
 
@@ -165,9 +194,12 @@ Needs a loaded viewer or a running mcam replay. Prints a tab-separated table, at
 
 `filter` matches a kind name exactly or any part of the path (case-insensitive); several words are joined with spaces.
 
-### 4.3 `srec record start <dir> [key=value ...]`
+### 4.3 `srec record start [<dir>] [key=value ...]`
 
-Starts a manual recording into `<dir>` (created if missing). The files go directly into `<dir>` (section 5).
+Starts a manual recording into `<dir>` (created if missing). The files go directly into `<dir>` (section 5). Changed in
+0.11.0: `<dir>` is optional (a new `<game>\_mod\srec\take_<yyyyMMdd_HHmmss>`), and a relative `<dir>` is a folder under
+`<game>\_mod\srec\`. Example: `srec record start audio=on` answers `recording -> <game>\_mod\srec\take_<yyyyMMdd_HHmmss>
+clock real, ...`.
 
 Own keys:
 
@@ -175,7 +207,7 @@ Own keys:
 |---|---|---|---|
 | `clock` | `real` | `real`, `fixed:60`, `fixed:120`, `fixed:240` | Sample clock (section 6). |
 | `audio` | `off` | `on`, `off` (also `true/false`, `1/0`, `yes/no`) | Capture the game sound into the take ([AUDIO.md](AUDIO.md)). Refused when the audio preflight fails. Needs `clock` `real` or `fixed:60`. |
-| `overwrite` | `off` | `on`, `off` | Allow a `<dir>` that already holds `scene.srec`. Without it the start is refused. |
+| `overwrite` | `off` | `on`, `off` | Allow a `<dir>` that already holds `scene.srec`. Without it the start is refused: `refused: srec record start: ... already holds a recording (use a new folder or overwrite=on)`. |
 | `spec` | none | path to a MultiCam spec | Use its `replay.record` block as the defaults and arm its `events` (polled every frame; the first fire of each name is stored as an event). A spec with errors refuses the start. |
 
 Record keys (any field of the spec's `replay.record` block; command-line values win over `spec=`). Lists are comma
@@ -204,11 +236,17 @@ separated; booleans take `on/off`, `true/false`, `1/0`, `yes/no`.
 | `forceCullers` | `zone` | `zone`: force every bounds culler group of the record set active during the record, so objects the game camera cannot see still move; `list` (only `cullers`); `none`; `planned` does nothing in a manual record (warning). |
 | `cullers` | none | Culler names or paths for `forceCullers=list`. |
 | `rescanEvery` | 60 | Samples between polls for joining subscenes and new children (at least 1). |
-| `res`, `captureGame`, `captureEvery` | | Ignored by a manual record (warning): used by `mcam record` only. |
+| `res`, `captureGame`, `captureEvery` | | Ignored by a manual record: used by `mcam record` only. `res` and `captureGame=on` give a warning; `captureEvery` and `captureGame=off` are accepted silently. |
 | `rate` | 60 | Same as the rate part of `clock=fixed:<rate>` (60, 120 or 240). |
 | `checks` | none | Not used by the recorder. `tools/srec_tool.py report` reads checks from a spec file or `--check`. |
+| `maxMB` | 0 | New: the sampling ends when `scene.srec` reaches this size in MB; 0 = no limit. Example: `srec record start D:\takes\t1 maxMB=2048`. |
+| `maxSeconds` | 0 | New: the sampling ends at this record time in seconds; 0 = no limit. Example: `maxSeconds=30`. |
+| `minFreeMB` | 256 | New: a start is refused, and a running recording ends, when the drive of the record folder has less free space; 0 = no check. Start refusal: `replay.record.minFreeMB: only 180 MB free on the drive of <dir>, record.minFreeMB is 256 (free some space, or lower the key; 0 = no check)`. |
+| `onLoad` | `continue` | New: what a level load (respawn, checkpoint, chapter) does to a running recording. `continue` (the 0.10.0 behaviour): the take goes on, reloaded subscenes join again (warning `level load at sample N: unloaded objects end here, the subscenes of the record set join again when they are loaded`); it ends only when no recorded object is alive and none comes back within 3 s of record time. `stop`: the sampling ends at the load. Example: `onLoad=stop`. |
 
-Unknown keys are reported. `posEps`, `rotEps` and `cut` must be positive.
+Unknown keys are an error (`srec.<key>: unknown argument '<key>' (valid: ...)`). `posEps`, `rotEps` and `cut` must be
+positive; negative `maxMB`, `maxSeconds` or `minFreeMB` and an `onLoad` other than `continue` / `stop` are errors; `post`
+gives a warning.
 
 What the start does, in this order:
 - Releases a pending handover of an earlier `srec record stop keep`.
@@ -220,15 +258,29 @@ What the start does, in this order:
 
 Refused when: an mcam run, session, replay or recording is active; a manual recording is already running; the viewer is
 loaded; a probe is running; `<dir>` already holds `scene.srec` without `overwrite=on`; a `keep` name is not a subscene; a
-key is invalid; the audio preflight fails. A timeScale other than 1 at the start gives a warning (game time runs at that
-rate while recording).
+key is invalid; the audio preflight fails; the drive has less than `minFreeMB` free; `roots=auto` finds no active subscene
+(`roots: auto: no active subscene of the savepoint`, seen in a test 20 m away from the checkpoint). The reply then starts
+with `refused:` or `busy:`. A timeScale other than 1 at the start gives a warning (game time runs at that rate while
+recording). A start that waits for kept subscenes ends its reply with `; folder <full path>`.
 
-### 4.4 `srec record stop [keep]`, `srec record status`
+### 4.4 `srec record stop [keep|load]`, `srec record status [json]`
 
 `stop` ends the recording: closes the audio capture (volume put back first), stores `srec / record stop`, writes
 `objects.tsv`, `record_meta.csv` and `record.json`, restores the frame pacing and the Animation culling, and replies
-`recording stopped -> <dir>: <n> samples, <n> objects, <MB> MB, <s> s, pacing changes <n>; ...`. While the start is still
-waiting for kept subscenes, `stop` cancels it.
+`recording stopped -> <dir>: <n> samples, <n> objects, <MB> MB, <s> s, pacing changes <n>, audio captured (acap result
+shows the WAV check once it is finalized); record preparation restored`, or `failed: recording stopped with 1 error(s)
+(<error>) -> <dir>: ...`. While the start is still waiting for kept subscenes, `stop` cancels it. Any word other than
+`keep` or `load` answers `usage: ...` and nothing is stopped (0.10.0 stopped anyway).
+
+A recording can also end by itself (new in 0.11.0): a writer error (`scene.srec writer: write failed: IOException: ...`,
+for example a full disk), 30 samples in a row with errors, a limit (`record.maxMB 2048 reached at sample N`,
+`record.maxSeconds 30 reached at sample N`, `only 180 MB free on the record drive (record.minFreeMB 256)`) or a level
+load (`onLoad`). The sampling then stops at once, the file stays readable, and `srec status` says `recording stopped
+(<reason>): ...` or `record failed: <reason>; kept 12.00 s, 720 samples, ...`. A clean early stop (a limit, a load)
+is finished by itself: the files are written as by `srec record stop`, and `last record:` reads `recording ended early:
+<reason> | <stop line>`. A failed recording keeps its `failed:` state (shown by `doctor` and `srec record status json`)
+until `srec record stop`.
+record.json gets `stopKind` (`writer`, `errors`, `load`, `disk`, `limit`) and `stopReason`.
 
 - Without `keep`: the forced culler groups are released and the kept subscenes unpinned.
 - With `keep`: the forced cullers and kept subscenes stay as they are and are handed to the next `srec load` in this game
@@ -236,9 +288,18 @@ waiting for kept subscenes, `stop` cancels it.
   the next `srec record start`, releases a pending handover.
 
 `status` prints the manual recording line (as in `srec status`), "waiting to record ..." with the kept subscenes ready and
-the seconds left, "recording (mcam): ..." for an mcam record, or "not recording".
+the seconds left, "recording (mcam): ..." for an mcam record, or "not recording". `srec record status json` is one line:
+`{"state":"recording","dir":..,"samples":..,"objects":..,"bytes":..,"seconds":..,"fps":..,"driftMs":..,
+"pacingChanges":..,"audio":"on|off|closed|silent","specEventsFired":..,"stalledFrames":..,"recorder":{...}}` or
+`{"state":"idle","lastRecord":"..","failed":false}`. `recorder` is the recorder's own state: `state` (`recording`,
+`stopped`, `failed`, `ended`), `dir`, `seconds`, `samples`, `objects`, `bytes`, `bytesPerSecond`, `queuedBlocks`,
+`queuedBytes`, `writerStalls`, `freeBytes` (-1 = not known), `sampleErrors`, `leftOut`, `lastError`, `writerError`,
+`stopKind`, `stopReason`, `hitches`, `skippedFrames`, `events`, `subsceneJoins`, `shaderChannels` and, while it records,
+`cost` {samples, meanMs, maxMs, channelMeanMs}. Use it to watch a long take: `freeBytes`, `bytesPerSecond` and
+`stopReason` tell when and why it ends.
 
 A manual recording also ends when the game quits (stopped without keep) and when its recorder is ended by something else.
+Measured (TEST_RESULTS 0.11.0): `srec record start` 174 ms, `stop` 169 ms (0.10.0: 307 / 329 ms).
 
 ### 4.5 `srec event <name> [detail ...]`
 
@@ -250,9 +311,16 @@ outside `_Dynamics` while recording is added with `InsideDev.SceneRecorder.Regis
 
 ### 4.6 Viewer: `srec load`, `play`, `pause`, `seek`, `step`, `end`
 
-`srec load <dir> [t=<time>] [cam=game|keep] [key=value ...]`
+`srec load <dir|last> [dry] [replace] [play [speed] [loop|once]] [t=<time>] [cam=game|keep] [key=value ...] [json]`
 
-- `<dir>`: a folder with `scene.srec`, or a take folder with `record\scene.srec`.
+- `<dir>`: a folder with `scene.srec`, or a take folder with `record\scene.srec`; a relative folder is under
+  `<game>\_mod\srec\`; `last` = the newest take there (a folder literally named `last` needs a path).
+- `dry` (new): reads and resolves the recording and reports what a load would do, without loading; `dry json` gives it
+  as JSON. Example: `srec load last dry json`.
+- `replace` (new): a loaded viewer is ended first (without it: `busy: a recording is loaded (<dir>): srec end first, or
+  add the word replace`).
+- `play [speed] [loop|once]` (new): start playing right after the load; the reply then says `; playing x1 from T 0.000`
+  instead of `; frozen at T 0.000`. Example: `srec load take_<date>_<time> play 0.5 loop`.
 - `t=`: start time (time syntax below), default 0.
 - `cam=game` (default): the free camera is put at the recorded game camera pose at T. `cam=keep`: the free camera stays
   where it is (it is switched on if it was off).
@@ -270,19 +338,24 @@ outside `_Dynamics` while recording is added with `InsideDev.SceneRecorder.Regis
 | `restore` | `final` | `final`, `reload` | What `srec end` leaves (below). |
 
 What `load` does: reads and resolves the recording (in the game session that recorded it, with no level load since, it
-uses the recorded live objects; otherwise it resolves every object by path and writes `replay_baseline.tsv` next to the
-recording folder: columns score, channel, live, recorded, path, the differences against sample 0), freezes game time
+uses the recorded live objects; otherwise it resolves every object by path and writes `replay_baseline.tsv`, since 0.11.0
+inside the take folder of a manual take (next to the recording folder only for `<take>\record`): columns score, channel,
+live, recorded, path, the differences against sample 0), freezes game time
 (timeScale 0, re-forced every frame; `srec status` shows "timeScale re-forced Nx" when something else wrote it), takes the
 free camera, freezes streaming and culling, keeps the subscenes the recording kept, freezes rigidbodies, disables the
 game's own movers of recorded objects, and from then on writes the recorded state for time T every frame. A pending
 record handover is taken over. Reply: `srec loaded <dir>: <n> samples, <s> s, <n> objects; frozen at T ...; free camera at
 the recorded game camera ...` plus warnings (for example unresolved objects).
 
-Refused when: an mcam run owns the scene; a viewer is already loaded; a manual recording or a probe runs; no
-`scene.srec`; a key is invalid; more than `maxUnresolved` of the moving objects cannot be found.
+Refused when: an mcam run owns the scene; a viewer is already loaded (unless `replace`); a manual recording or a probe
+runs; the game is loading a level; no `scene.srec`; a key is invalid; more than `maxUnresolved` of the moving objects
+cannot be found. The reply then starts with `refused: srec load <dir>: <first error>`, `not found: no scene.srec in
+...`, `busy: ...` or `failed: srec load <dir>: Begin threw, restored: ...`.
 
-Time syntax (`t=`, `seek`): seconds (`2.5`), `start`, `end`, `@<event>`, `@<event>+<s>`, `@<event>-<s>`. Times are clamped
-to the recording. An event that never fired is an error ("event '<name>' did not fire in the recording").
+Time syntax (`t=`, `seek`): seconds (`2.5`), `start`, `end`, `@<event>`, `@<event>+<s>`, `@<event>-<s>`, and since
+0.11.0 `rel <s>` (relative to T: `srec seek rel -0.5`), `sample:<n>` and `<p>%` (`srec seek 50%`); `+0.5` is still the
+absolute time 0.5. Times are clamped to the recording. An event that never fired is an error (`not found: event '<name>'
+did not fire in the recording (srec events lists them)`).
 
 | Command | Effect |
 |---|---|
@@ -296,7 +369,11 @@ What `srec end` leaves: the scene at the recording's last sample (not where it w
 recorded final pose (with the camera script's state), rigidbodies unfrozen (velocities of the last sample when the game
 has not run since the record, else zero), culling and streaming released, game time scale as it was before `load` (if the
 game was running it continues from the last sample; FSM timers and sleep states are not restored). With `restore=reload`
-the recorded savepoint is loaded again after the end.
+the recorded savepoint is loaded again after the end. Reply: `srec end: <dir> released, scene restored to the recording's
+final sample (rigidbody velocities zeroed, game camera at the recorded final pose, timeScale 1)`, `... released, a level
+load replaced the scene: ...`, or `failed: srec end <dir>: released, but 1 restore step(s) failed (...)`. A level load
+while the viewer is loaded ends the viewer (since 0.11.0 without freezing the game; the log says `[replay] end (level
+load): ...`).
 
 Keys while the viewer is loaded: Insert toggles the free camera, WASD or arrow keys move, E / Page Up up, Q / Page Down
 down, hold the right mouse button to look, the mouse wheel changes the fly speed, Shift x4, Ctrl x0.25 (section 7).
@@ -334,7 +411,9 @@ A probe stops by itself after 300 frames without progress. `srec end` and a game
 - `srec load`, `srec record start` and `srec probe` are refused while MultiCam runs (`busy: an mcam run owns the scene`,
   `an mcam session is active`, `a replay owned by mcam is active`, `a recording owned by mcam is active`).
 - During an mcam capture, record or replay the game refuses outside commands except `srec status|objects|event`, `acap
-  status`, `mcam status|stop|abort|check|list|pose|schema|help`, `state`, `game_state`, `ping` and `audio`.
+  status`, `mcam status|stop|abort|check|list|pose|schema|help`, `state`, `game_state`, `ping`, `audio`, and since 0.11.0
+  `doctor`, `background [status]` and `cfg [list|get]`. Type `acap status` in full: a bare `acap` gets the busy answer
+  (a bare `srec` passes as `srec status`).
 - A manual recording or the viewer does not block other commands. Commands still cost frame time (section 9).
 
 ---
@@ -348,13 +427,25 @@ A manual recording writes into `<dir>`:
 | `scene.srec` | The binary recording. |
 | `objects.tsv` | Object table, written at stop: `id kind path owner comps first last keys flags`. kind = transform, boyBone, clothBone, particles, light, material, probe, spawned, rope, renderer; owner e.g. `boy:bone:<name>`, `huddle:cloth:<i>`, `spawned:_Dynamics`, `subscene:<name>`; comps = Rigidbody, Animation, Animator, ParticleSystem, Light, Renderer, SkinnedMeshRenderer, MaterialInstance, D11VelocityBufferTag, ColorBlendProbe, LineRenderer, Actor, Collider; first/last = first and last sample with a key; flags = camDriven, scaleVariant, excludedMaterial, spawned, local, camXf, seenActive. |
 | `record_meta.csv` | One row per sample: `sample, frame_count, game_time, dt, real_time, logic_step, fixed_steps, time_scale, flags, xf_keys, particles, bytes`. game_time and real_time are seconds since sample 0; flags: 1 audio marker, 2 hitch, 4 hold (the game time stood still before this sample), 8 game frame grabbed. |
-| `record.json` | Header (level, savepoint, screen, pacing values, subscenes, kept and forced cullers), counts (`samples`, `objects`, `objectsByKind`, `bytes`, `duration`, `realDuration`), costs (`sampleCost`, `recordSetBuildMs`, `gc`, `hitches`, `skippedFrames`), spawned and deleted objects, `subsceneJoins`, `eventTimes`, `eventsPosted`, `meshSwaps`, `shaderState`, `staleParticles`, `warnings`. A manual record adds `source` ("srec record"), `command`, `pacing` {frames, frameMeanMs, frameP99Ms, within15to18_5ms, hitches, clock, captureFramerate, vSyncCount, targetFrameRate, refreshRate, changes, driftMsEnd, driftMsMax}, `keptSubscenes`, `settle`, `spec` and `specEvents` (with `spec=`), `audio` {capture, closedEarly}. |
+| `record.json` | Header (level, savepoint, screen, pacing values, subscenes, kept and forced cullers), counts (`samples`, `objects`, `objectsByKind`, `bytes`, `duration`, `realDuration`), costs (`sampleCost`, `recordSetBuildMs`, `gc`, `hitches`, `skippedFrames`), spawned and deleted objects, `subsceneJoins`, `eventTimes`, `eventsPosted`, `meshSwaps`, `shaderState`, `staleParticles`, `warnings`. A manual record adds `source` ("srec record"), `command`, `pacing` {frames, frameMeanMs, frameP99Ms, within15to18_5ms, hitches, clock, captureFramerate, vSyncCount, targetFrameRate, refreshRate, changes, driftMsEnd, driftMsMax}, `keptSubscenes`, `settle`, `spec` and `specEvents` (with `spec=`), `audio` {capture, closedEarly}. New in 0.11.0: `stopKind`, `stopReason`, `leftOut` (components left out after they threw), `closingSamples` (0 or 1), `levelLoads` (loads the recording went through). |
 | `audio.wav`, `audio_sync.csv`, `audio_capture.json` | With `audio=on` ([AUDIO.md](AUDIO.md) section 6). |
 | `write_probe.tsv` | `srec probe` output (default folder). |
 | `record_report.json`, `record_report.txt` | Written by `tools/srec_tool.py report`. |
 
 `mcam record` and `mcam take` write the same files into `<out>\record\` plus `events.csv`, `rig.csv`, `tracks.csv`,
 `spec.json` and `game\` frames: [MULTICAM.md](MULTICAM.md).
+
+`objects.tsv`, `record_meta.csv` and `record.json` are written through `<file>.tmp` and then replaced, so a crash never
+leaves half a file. `<take>\audio.wav.part` exists only while the WAV is copied to another drive.
+
+What a reader of 0.11.0 recordings must know (the byte layout is unchanged: preamble version 1, content version 2):
+- The last `SMPL` block may be a closing sample that holds only the events section (stamp flag 4, hold), with a game time
+  equal to or above the sample before it; the sample count, `INDX`, `SEND` and `record_meta.csv` include it, and
+  `record_meta.csv` has one more row (xf_keys 0, particles 0, flags bit 4).
+- The `SRHD` header payload may end at a field group boundary (the rest takes defaults); bytes after `refreshRate` are
+  ignored, and a header version above 2 is a warning, not an error.
+- A scale pre-key may precede a scale key although the object's previous scale key is many samples back: hold a scale
+  across a gap up to the sample before the next key.
 
 `scene.srec` in short (little endian; the exact layout is the header comment of `src/InsideDev/Runtime/SrecFormat.cs`): an
 8-byte preamble (`ISRC`, framing version 1, flags), then blocks `u32 tag, u32 length, payload, u32 CRC-32`: `SRHD` header,
@@ -387,6 +478,11 @@ of the mcam record pass.
   slower than 60 fps; record.json `pacing.driftMsMax` shows by how much.
 - Something that changes captureFramerate, vSyncCount or targetFrameRate during a recording is overruled the next frame
   and counted in "pacing changes" (record.json `pacing.changes`).
+- Lining a recording up with a grec video or an acap WAV: srec game times are `Time.timeDbl - header.t0` and real times
+  `realtimeSinceStartupDbl - header.t0Real` (both absolute values are in the header, `srec_tool.py info`); grec's
+  `<file>.times.csv` and acap's `audio_capture.json` (`clockBase`, `gameBase`) use the same clocks. Add `t0` to an srec
+  time to get the absolute game time, then subtract grec's `game_time_start` for the video time. Per clock mode
+  (`real`, `fixed:<rate>`, the agent's step mode): [PLAY.md](PLAY.md) section 4.6.1.
 
 ---
 
@@ -401,6 +497,9 @@ All are bridge commands and none is saved.
 | `cam fov <deg>` | clamped to 5-140 | Free camera field of view (switches the free camera on). |
 | `cam roll <deg>` | | Free camera roll (switches the free camera on). |
 | `cam json [name]` | name default `cam1` | Prints the current camera (free or game) as a MultiCam camera object: `{"name": ..., "mode": "static", "pos": [x, y, z], "yaw": ..., "pitch": ..., "roll": ..., "fov": ...}`. |
+| `cam status [json]` | | New: the `cam` line; `json` = one line with `ok`, `free`, `pos`, `yaw`, `pitch`, `roll`, `fov`, `near`, `zoom`, `gameFov`, `speed`, `moving`, `captureLock`, `hotkeys`. |
+| `cam look <target> [dist] [yaw] [pitch] [fov] [seconds] [point=<name>] [size=<share>]` | yaw 0, pitch 8, the current fov, dist so that the subject fills `size` (0.4) of the frame height | New: frames `boy`, `huddle`, `main`, `game`, `gameaim`, `probe` or an object (MultiCam target syntax) with the free camera. Reply `cam -> (x, y, z) yaw Y pitch P fov F  looking at <resolved> from D m` or `not found: <why>`. |
+| `cam back` | | New: back to the pose before the last `cam pose` / `cam look`. |
 | `cam off` | | Free camera off; the game camera resumes from where it is. Prints the camera. |
 | `hud [on\|off]` | no argument toggles | Editor HUD bar on or off. |
 | `clean [on\|off]` | no argument toggles | `on`: remembers and switches off the editor panel, HUD, trigger, solid, savepoint, label and hidden overlays, pick mode, the transform gizmo, the selection overlay and the render diagnostics board. `off`: puts them back. Refused to switch off while an mcam session holds clean frames. editor.cfg is not written. |
@@ -413,7 +512,9 @@ Related bridge commands: `freecam [on|off]` (no argument toggles), `zoom <factor
 Free camera keys (not while a text field has focus or during a capture): Insert toggles it, WASD or arrow keys move, E /
 Page Up up, Q / Page Down down, hold the right mouse button over the game view to look, the mouse wheel changes the speed
 (0.5-100 m/s, default 6), Shift x4, Ctrl x0.25, + / - zoom, 0 resets the zoom. While the free camera is on the boy gets no
-input.
+input. Since 0.11.0 these are settings in `<game>\_mod\editor.cfg` (listed by `cfg`): `cam.hotkeys` (`always` default,
+`panel` = only while the editor panel is open, `off`) for Insert, `+`, `-` and `0`; `cam.speed` (6; the wheel stores it,
+so it survives a restart); `cam.lookSensitivity` (0.25 degrees per pixel); `cam.invertY` (0).
 
 ---
 
@@ -428,13 +529,18 @@ or touch the game. Paths are arguments; there are no built-in folders.
 
 | Command | Options | Output | Exit codes |
 |---|---|---|---|
-| `info PATH` | `--json` | Header, sample count and duration, frame interval statistics, hitches, holds, markers, objects by kind, keys, particles, shader channels, per-section sizes, problems and warnings. | 0, 2 (unreadable or missing) |
-| `verify PATH` | `--strict` (a truncated recording fails), `--size` (fail when the size is outside 0.5-2x the size estimate), `--json` | `OK` or `FAIL` with problems: block CRCs, sample and id order, added and deleted objects, string references, footer, `record_meta.csv` and `objects.tsv` row counts. A crash prefix passes without `--strict`. | 0 ok, 1 problems, 2 unreadable |
-| `objects PATH [FILTER]` | `--kind K` (kind name or number) | Object table as TSV to stdout: `id kind path owner comps first last keys flags parent depth added deleted types`. FILTER matches part of the path or owner. | 0, 2 |
-| `export PATH WHAT` | `--out CSV` (default stdout) | WHAT = an object id: every key of that object (`sample, game_time, channel, bits, px..pz, qx..qw, sx..sz, parent, value`); `virtual`: the recorded game camera, boy and huddle per sample; `stamps`: the sample stamps; `events`: `sample, game_time, kind, name, detail`. | 0, 2 (bad id or WHAT) |
+| `info PATH` | `--json`, `--fast` (new: a quick read) | Header, sample count and duration, frame interval statistics, hitches, holds, markers, objects by kind, keys, particles, shader channels, per-section sizes, problems and warnings. A line `content version N ...` appears only for a newer or older file or unknown blocks; `--json` adds `contentVersion`, `toolContentVersion`, `newer`, `headerExtraBytes`, `headerMissing`, `unknownBlocks`, `unknownSections`. | 0, 2 (unreadable or missing) |
+| `verify PATH` | `--strict` (a truncated recording fails, and since 0.11.0 a content version above 2), `--size` (fail when the size is outside 0.5-2x the size estimate), `--json` | `OK` or `FAIL` with problems: block CRCs, sample and id order, added and deleted objects, string references, footer, `record_meta.csv` and `objects.tsv` row counts. A crash prefix passes without `--strict`. | 0 ok, 1 problems, 2 unreadable |
+| `objects PATH [FILTER]` | `--kind K` (kind name or number), `--json` (new) | Object table as TSV to stdout: `id kind path owner comps first last keys flags parent depth added deleted types`. FILTER matches part of the path or owner. `--json` = `{"file", "objects":[{id, kind, path, owner, comps, first, last, keys, flags, parent, depth, added, deleted, types, ordinals, siblings, extent}]}`. | 0, 2 |
+| `export PATH WHAT` | `--out CSV` (default stdout) | WHAT = an object id, and since 0.11.0 also a path, a path suffix or a name: every key of that object (`sample, game_time, channel, bits, px..pz, qx..qw, sx..sz, parent, value`); `virtual`: the recorded game camera, boy and huddle per sample; `stamps`: the sample stamps; `events`: `sample, game_time, kind, name, detail`; new `render` (`sample, game_time, field, name, type, x, y, z, w`) and `shader[:<id \| name \| scope:name>]` (`sample, game_time, channel, scope, target, name, type, x, y, z, w`). Example: `srec_tool.py export <take> shader:_PDHuddleToon`. | 0, 2 (bad id or WHAT) |
 | `dump PATH` | `--out JSON` | Every decoded entry in file order (for tests). | 0, 2 |
 | `report PATH` | `--spec SPEC`, `--check "<query> [@<from>..<to>]"` (repeatable), `--out JSON`, `--strict` | Every recorded event, the spec's events (fired or missing, sample, time, delta to `expect`), and content checks. Writes `record_report.json` and `.txt` next to the recording (or `--out`). | 0, 1 (a check failed; with `--strict` also an unfired spec event), 2 (bad check or unreadable) |
 | `synth OUT_DIR` | `--samples N` (240), `--rate R` (60), `--seed S` (1), `--jitter J` (0), `--hitch`, `--truth`, `--no-sidecars`, `--no-shader`, `--name` (`scene.srec`) | A synthetic recording with every section, plus objects.tsv, record_meta.csv, events.csv, record.json (and truth.json), for testing readers. | 0, 2 |
+
+The reader follows the 0.11.0 rule of the game: unknown blocks and sections are skipped with one warning each, a header
+may end after a field group (an older file: defaults) or hold more bytes (a newer file), and values beyond the writer's
+limits (string id gap over 65536, material property index 4096 or more, shared-material slot 1024 or more, render field 4096 or
+more) mark a damaged block. Exit codes of all tools: 0 ok, 1 the result is bad, 2 input or usage error, 3 refused.
 
 Report spec lookup: `--spec`, else the `spec` path in record.json, else `spec.json` in the recording folder or its parent.
 Checks come from the spec's `replay.record.checks` plus every `--check`. A check query is `#<subscene>`, an object path, a
@@ -450,17 +556,25 @@ path suffix or a name; it passes when a match was active at some sample. With a 
   `bg on` was sent (Application.runInBackground). A paused game records nothing (the next sample carries the hold flag).
   What an audio capture writes while the game is paused is unverified in game.
 - **Load races.** A recording started during a level load records the wrong or a half-loaded scene. After `load <sub> <sp>`,
-  poll `state` until its `savepoint:` line names the requested savepoint and streaming settled, and use `keep=` for
-  subscenes that must be complete at sample 0. `waitfor savepoint <name>` exists only inside an mcam spec `setup`. A level
-  load during a recording is not handled specially (unverified in game): stop first.
+  poll `state` until its `savepoint:` line names the requested savepoint and streaming settled (from outside:
+  `inside_ctl.py wait savepoint <subscene> <savepoint>`, or `inside_ctl.py snapshot`; `inside_ctl.py state` is the
+  Play observe JSON, not this text), and use `keep=` for subscenes that must be complete at sample 0. `waitfor savepoint
+  <name>` exists only inside an mcam spec `setup`. A level load during a recording follows `onLoad` (4.3): with the
+  default `continue` the take goes on (tested: three checkpoint reloads during srec and grec, srec went on after each
+  respawn with one subscene join); `onLoad=stop` ends the sampling at the load.
 - **Late-awake content.** Some content switches on a few frames after its subscene reports active. With `keep=` the start
   waits `settleFrames` (12) frames; without `keep` wait about 10 frames after the load yourself.
 - **MCP idle restore.** The MCP server restores the game after `mcp.idle_restore_s` seconds (default 600; 0 = never;
   `<game>\_mod\editor.cfg`, edit with the game closed) without any tool call, and after `mcp.restore_on_close_s` (default
   60) once the last MCP session closed. The restore stops an `input_track` recording and playback, cancels the running
   action, gives control back to the player and sets the game clock to real time at speed 1. It does not stop an `srec`
-  recording: that keeps recording a scene in which nobody acts any more. Keep calling a cheap tool (for example the
-  `command` tool with `srec record status`) during long takes.
+  recording. Since 0.11.0 the idle restore waits while a manual recording runs (or waits to start) and while the viewer
+  plays, so the agent's held input is not released under a running take; a recording that nobody drives any more still
+  goes on recording. Keep calling a cheap tool (for example the `command` tool with `srec record status`) during long
+  takes.
+- **Full disk.** The recorder checks free space at the start (`minFreeMB`, default 256) and stops cleanly when the disk
+  fills (`stopKind` `disk`); the file up to that sample stays readable. `srec record status json` shows `freeBytes`.
+- **Steam must run.** Without the Steam client the game closes itself about 2 s after it starts.
 - **Step mode and clocks.** In MCP step mode the game is frozen between calls; use `clock=fixed:60` for one sample per
   logic step (section 6). What a sound capture gives for a step-mode take is unverified in game.
 - **Free camera.** While the free camera is on (`cam pose`, `srec load`), the boy gets no input. Switch it off (`cam off`)
@@ -489,6 +603,8 @@ path suffix or a name; it passes when a match was active at some sample. With a 
 | Record keys | 4.3 | `srec record start` key=value, spec `replay.record` | What and how to record. |
 | Play keys | 4.6 | `srec load` key=value | Viewer behaviour. |
 | Keep wait | 30 s | fixed | Longest wait for kept subscenes. |
+| Take folder | `<game>\_mod\srec\take_<date>_<time>` | `srec record start` without a folder | Where manual takes go; a relative folder is under `<game>\_mod\srec\`. |
+| `maxMB`, `maxSeconds`, `minFreeMB`, `onLoad` | 0, 0, 256, `continue` | `srec record start` key=value, spec `replay.record` | Limits and level-load rule (4.3). |
 | Camera-driven list | none | `<game>\_mod\camera_driven.tsv` (written by `srec probe camera`) | Transforms every later recording treats as camera-driven. |
 | `mcp.idle_restore_s` | 600 (0 = never) | editor.cfg | MCP idle restore (section 9). |
 | `mcp.restore_on_close_s` | 60 (0 = never) | editor.cfg | Restore after the last MCP session closed. |

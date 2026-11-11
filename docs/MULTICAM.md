@@ -12,8 +12,10 @@ Conventions in this guide:
 
 - `<game>` is the INSIDE folder (the one with `INSIDE.exe`), `C:/path/to/InsideDevTool` the folder of this repository or
   release, `<take>` a take folder of your choice (always a full path).
-- In-game commands take full paths; forward slashes work. A relative path resolves against the game's working folder, not
-  against this repository. Quote a path that contains spaces (`"C:/My Takes/take1"`).
+- In-game commands take full paths; forward slashes work. A relative `mcam` path resolves against the game's working
+  folder, not against this repository (a relative `srec` folder is a folder under `<game>\_mod\srec\`). Since 0.11.0 the
+  out folder of `mcam` runs is optional: without it a run writes to `<spec dir>\takes\<spec name>_<yyyyMMdd_HHmmss>`
+  (Section 4.1). Quote a path that contains spaces (`"C:/My Takes/take1"`).
 - Python commands run from the repository folder: `python -I tools/...`.
 
 Related documents: [RECORD_REPLAY.md](RECORD_REPLAY.md) (srec recordings and the recording viewer, the cam / hud / clean
@@ -64,8 +66,9 @@ Motion blur means several steps averaged into one output frame.
 MultiCam has no setting, hotkey or background task. Until a command that starts with `mcam` arrives, none of its code runs
 and no game value is changed, so a player who never sends one sees no difference.
 
-Sending commands. `mcam` and its helpers are bridge commands; the editor's in-game console does not run them. Send them
-through one of:
+Sending commands. `mcam` and its helpers are bridge commands. Since 0.11.0 the editor's in-game console (backquote key)
+hands every word it does not know itself to the bridge and prints the reply, so they can be typed there too (`tp`,
+`triggers`, `labels`, `sel` and `help` keep their console meaning there). From outside the game, send them through one of:
 
 - the MCP `command` tool (`InsideDev.Mcp.dll`, see [MCP.md](MCP.md));
 - plain HTTP `POST /cmd` on `http://127.0.0.1:47811` (same DLL; the request body is one command line).
@@ -77,7 +80,8 @@ What each kind of command does to the game:
 
 | Commands | Effect |
 |---|---|
-| `mcam check`, `list`, `pose`, `schema`, `status`, `help`, `probe` | Read only. |
+| `mcam check`, `list`, `pose`, `schema`, `status`, `help`, `probe`, `readback status\|stat` | Read only. |
+| `mcam readback free [force]` | Frees the readback plugin's CPU frames when nobody holds it (Section 1.2). |
 | `mcam views` | Moves a loaded srec viewer to each checked time and back. |
 | `mcam show <cam> [t]` | Moves the free camera to that camera's pose and applies its `hide` / `backfaces` sets. This stays until `cam off`, the next `mcam show` or an mcam run. |
 | `mcam start`, `rehearse`, `preview`, `record`, `replay`, `take`, `passes`, `golden` | A run, with a capture session (below). One run at a time. |
@@ -98,15 +102,20 @@ Stopping a run:
   run is refused with `the previous capture session was not restored: run 'mcam abort' first`.
 
 Capture lock (`session.lockInput`, default true). While a run holds the game, editor hotkeys, the command palette and editor
-mouse actions are off, and outside commands are refused with `busy: mcam capturing (...)`, except
+mouse actions are off, and outside commands are refused with `busy: mcam capturing (allowed now: ...)`, except
 `mcam status|stop|abort|check|list|pose|schema|help`, `srec status|objects|event`, `acap status`, `state`, `game_state`,
-`ping` and `audio`. The run's own setup and cue commands pass. MCP play tools refuse world changes during a capture, and the
-MCP restore never cancels a run.
+`ping`, `audio`, and since 0.11.0 `doctor`, `background [status]` and `cfg [list|get]` (not `cfg set` / `reset`). Type
+`acap status` in full: a bare `acap` gets the busy answer although it means `acap status` elsewhere (a bare `srec`
+passes). The run's own setup and cue commands pass. MCP play tools refuse world changes during a capture, and the MCP
+restore never cancels a run. An mcam run counts as work in progress for the MCP server: the idle restore waits for it.
 
 What a run leaves behind:
 
-- The spec's `setup` and `cues` commands are not undone: `god on` stays on, `panel off` leaves the editor panel closed, a
-  `load` stays loaded, audio rules stay, `seed` has reseeded the game's random generators.
+- The spec's `setup` and `cues` commands are not undone: `god on` stays on, a `load` stays loaded, audio rules stay,
+  `seed` has reseeded the game's random generators. The overlay switches are the exception: with `session.clean` true
+  (the default) the session saves the editor panel and the overlays before the setup runs and puts them back at the end,
+  so `panel off`, `triggers off`, `labels off` and `savepoints off` in a setup change nothing during the run (clean already
+  switched them off) and are undone afterwards. They are only needed with `session.clean` false.
 - Replay runs (`record`, `replay`, `take`, `passes`, `golden`) end with the game frozen at the last sample: `Time.timeScale`
   0 is held every frame until `ts <value>` (`ts 1` resumes play), a level load or the next mcam run. `mcam status` shows
   `[game frozen ...]`. With `replay.play.restore: "reload"` the savepoint is loaded again instead.
@@ -123,21 +132,36 @@ writing `editor.cfg` (`clean off` is refused while a run holds clean frames), `h
 |---|---|---|
 | `bin\InsideDev.dll` (with the loader `bin\version.dll`) | every in-game command | as in the README (`<game>\_mod\`) |
 | `bin\InsideDev.Mcp.dll` | optional: the MCP `command` tool and `POST /cmd` (`tools/mcam_previews.py` needs it) | `<game>\_mod\` |
-| `bin\InsideReadback.dll` | optional: native asynchronous frame readback | `<game>\INSIDE_Data\Plugins\`, copied while the game is closed |
-| ffmpeg | pipe output in game; every video tool | on PATH, or see below |
+| `bin\InsideReadback.dll` | optional: native asynchronous frame readback (version 3 in this release; Play's `grec` uses it too) | `<game>\INSIDE_Data\Plugins\`, copied while the game is closed |
+| ffmpeg | pipe output in game; every video tool | see below |
 | Python 3 with numpy, opencv-python, Pillow, numba, matplotlib | the offline tools | `pip install numpy opencv-python Pillow numba matplotlib` |
 
 Readback plugin. `output.readback` chooses how frames come back from the GPU: `auto` (default) uses the plugin when it is
 installed and finds the swap chain, else ReadPixels on the game thread (the run log says `native plugin not used (...)`);
 `native` fails without the plugin; `readpixels` never uses it. The plugin is used by replay passes with
-`output.format: "pipe"` and by `record.captureGame` and golden grabs (Section 18.2); live v2 visits (`mcam start`) always
-use ReadPixels. `mcam readback test` (about 12 s, poll `mcam readback status`) checks the plugin; `mcam readback stat` prints
-its counters or why it is unavailable (`INSIDE_Data/Plugins/InsideReadback.dll is not installed`).
+`output.format: "pipe"` and by `record.captureGame` and golden grabs (Section 18.2). Live v2 visits (`mcam start`,
+`mcam preview`) use ReadPixels with `auto`; since 0.11.0 `output.readback: "native"` makes them use the plugin with
+`output.format: "pipe"` (the start fails with `refused: output.readback native: <why>` when the plugin is missing or held).
+The plugin serves one session at a time: an mcam pass takes it as owner `mcam` (`mcam readback test` as `readback test`)
+and Play's `grec` as `grec`, and each refuses while the other holds it (`busy: the readback plugin is held by grec`).
 
-ffmpeg in game. `output.format: "pipe"` starts one ffmpeg per enabled camera (at most 8, NVENC sessions). `output.ffmpeg`
-is `"ffmpeg"` by default, looked up as `ffmpeg` and `ffmpeg.exe` in the folders of the game process's PATH; a full path
-works too. `mcam check` warns `output.ffmpeg: not found` when neither resolves. `output.pipeCodec` (default `hevc_nvenc`,
-H.265 only) needs an NVIDIA GPU; `libx265` is the CPU alternative.
+| Command | Reply |
+|---|---|
+| `mcam readback test` | a 120-frame test of the plugin (about 12 s; poll `mcam readback status [json]`, json `{running, result, holder}`) |
+| `mcam readback stat [json]` | the counters, `plugin version N, holder X, session open\|closed, memory held: CPU frames A MB, staging textures B MB`, or why it is unavailable (`INSIDE_Data/Plugins/InsideReadback.dll is not installed`); json: `installed`, `version`, `holder`, `open`, `frame_held`, `hooked`, `cpu_mb`, `staging_mb`, `device`, `source`, `width`, `height`, ... |
+| `mcam readback free [force]` | frees the plugin's CPU frames when nobody holds it (`readback: CPU frames 88.6 -> 0 MB, ...`); `force` also closes a native session no owner registered; `busy: the readback plugin is held by grec (nothing freed)`, `cannot free: <why>` |
+
+Plugin version 3 adds a fallback at the swap chain's Present for frames whose marker the render thread never saw (Play's
+stepper runs, [PLAY.md](PLAY.md) section 4.6). `mcam status json` names the holder in `readback`.
+
+ffmpeg in game. `output.format: "pipe"` starts one ffmpeg per enabled camera (at most 8, NVENC sessions). Since 0.11.0
+every in-game recorder finds ffmpeg the same way: `output.ffmpeg` is `"ffmpeg"` (or `"ffmpeg.exe"`) by default, which
+means `ffmpeg.path` in `<game>\_mod\editor.cfg`, the environment variable `INSIDEDEV_FFMPEG`,
+`<game>\_mod\ffmpeg\ffmpeg.exe`, the game process's PATH, then `C:\ffmpeg\bin\ffmpeg.exe`. Any other value must be the
+full local path of a file named `ffmpeg.exe` (no network path, no relative path, no other program). `mcam check` warns
+`output.ffmpeg: not found` when nothing resolves, and a pipe take is refused at the start (`refused: output.ffmpeg: ...`).
+`output.pipeCodec` is `hevc_nvenc` (default, needs an NVIDIA GPU), `libx265` (CPU) or `auto`; anything else is a lint
+error. With pipe output the first `mcam check` per ffmpeg starts ffmpeg once to test the encoder.
 
 ffmpeg for the tools. `mcam_take.py` takes ffmpeg and ffprobe from the environment variables `FFMPEG` / `FFPROBE` (full
 paths), else from PATH. The compositor needs `hevc_nvenc` (default encoder; `--codec x265` uses libx265) and `zscale`
@@ -159,7 +183,12 @@ Two example specs ship in `specs\`:
   static angle, 5 game seconds in real time. Its static pose is a ChickenGun pose; replace it with your own.
 - `specs/replay_smoke.json`: replay mode at ChickenGun, the hay bale on the farm (`load 7 0`): the vacuum fires chicks at a
   hay bale on a loft, and the bale falls 3-5 s after suction starts. 10 s recorded once in real time and filmed through the
-  game camera and a static view of the outlet; the record pass also grabs every 10th game frame for a golden check.
+  game camera and a static view of the outlet; the record pass also grabs every 10th game frame for a golden check. Its
+  `session.res` is `[0, 0]`: the replay passes keep the game's current resolution. Set a size there only when every pass
+  must have it and your display can show it.
+
+Both specs carry `panel off`, `triggers off`, `labels off`, `savepoints off` in their setup; with the default
+`session.clean` true these lines do nothing (Section 1.1).
 
 v2 capture with the template:
 
@@ -179,7 +208,8 @@ Replay with the smoke spec (the same steps are in its `_workflow` key):
 2. `mcam check C:/path/to/InsideDevTool/specs/replay_smoke.json`
 3. `mcam take C:/path/to/InsideDevTool/specs/replay_smoke.json <take>`: the setup loads ChickenGun, waits for the savepoint
    and spawns the chicks, the record pass runs 10 s in real time, then each camera gets its pass. The game stays frozen at
-   the end: `ts 1` resumes.
+   the end: `ts 1` resumes. Without `<take>` the take goes to `C:/path/to/InsideDevTool/specs/takes/replay_smoke_<yyyyMMdd_HHmmss>`
+   and the reply names it. A second `mcam take` into the same folder is refused (Section 4.1).
 4. Golden check: `mcam golden C:/path/to/InsideDevTool/specs/replay_smoke.json <take>`, then
    `python -I tools/mcam_qa.py replaydiff <take> --record <take>/record`.
 5. `python -I tools/mcam_compose.py angles <take>`, `python -I tools/mcam_compose.py layout <take>`,
@@ -212,21 +242,43 @@ All commands below are bridge commands of `InsideDev.dll` (Section 1.1 lists the
 
 | Command | Result |
 |---|---|
-| `mcam check <spec> [json] [replay\|v2]` | Load + lint + in-game target report, segment table, events, cost. A spec with a `replay` block gets the replay lint; `replay` forces it, `v2` turns it off. Allowed during a run (separate spec object). |
-| `mcam start <spec> <out>` | Capture a take. Refused while another run is active or an srec recording / viewer is loaded. |
-| `mcam rehearse <spec> <out>` | Full timing, cues and events, all CSV logs, no camera visits. |
-| `mcam preview <spec> <out> [t]` | One still per camera now (frozen state, no setup), or at game second `t` of the take (the live game is played to `t`). |
+| `mcam check <spec> [json] [replay\|v2]` | Load + lint + in-game target report, segment table, events, cost. A spec with a `replay` block gets the replay lint; `replay` forces it, `v2` turns it off. Allowed during a run (separate spec object). Since 0.11.0 the text form ends with one line per blocker (`a take is refused until this is fixed: <where>: <message>`), and `json` is one line with the new keys `can_start` (bool), `issues [{severity: error\|warning\|note, where, message}]` and `blockers [text]`. |
+| `mcam start <spec> [<out>] [overwrite=on]` | Capture a take. Refused while another run is active or an srec recording / viewer is loaded. |
+| `mcam rehearse <spec> [<out>] [overwrite=on]` | Full timing, cues and events, all CSV logs, no camera visits. |
+| `mcam preview <spec> [<out>] [t] [overwrite=on]` | One still per camera now (frozen state, no setup), or at game second `t` of the take (the live game is played to `t`). One word that reads as a number is `t` (write `./5` for a folder named 5). |
 | `mcam stop` | Finish the current step, write the files, restore everything. |
 | `mcam abort` | Restore the session at once, even if the runner died; a sound capture is stopped first. |
-| `mcam status [json]` | One-line progress, or progress.json. |
+| `mcam status [json]` | One-line progress, or one JSON line: while running the keys of progress.json plus `readback`; idle `{"state":"idle","frozen":false,"status":"...","last":{...}\|null,"readback":{"installed":true,"holder":""}}`, where `last` describes the last run (`mode`, `name`, `spec`, `out`, `result` = `done` \| `stopped` \| `failed: ...` \| `aborted (...)`, `ok`, `end_reason`, `started`, `finished`, `steps`, `frames`, `captured_steps`, `frames_written`, `game_time`, `real_seconds`, `warning_count`, `error_count`, the last 40 `warnings[]` and `errors[]`, `summary`, `cameras[{name, output, frames, error, ffmpeg}]`, `status`). |
 | `mcam show <camera> [t]` | Put the free camera at that camera's pose at game second `t` (default 0) of the last loaded spec; the reply has a `view:` and a `hide:` line. Refused during a run. |
 | `mcam pose <camera> [t]` | Print that pose: x y z yaw pitch roll fov aim, and a ready `cam pose` line. During a run: the camera's current pose. |
 | `mcam views <spec> [shots \| t,t,...] [cams=a,b] [out=<file.json>]` | View checks of camera poses (6.2). |
 | `mcam list` | Cameras of the last loaded spec with modes and flags. |
-| `mcam probe <obj>` / `mcam probe <x y z r>` | Authoring help: signals, FSMs, triggers, rigidbodies near an object, with ready `events` snippets. |
+| `mcam probe <obj> [json]` / `mcam probe <x y z r> [json]` | Authoring help: signals, FSMs, triggers, rigidbodies near an object, with ready `events` snippets. `json` (new): `{found, path, id, active, pos, match, signals_out, signals_in, fsms, probes, rigidbodies, collision_analyzers, sounds, events}`, where `events` is a name map that can be pasted as a spec's `events`; not found = `{found:false, query, error}`. The area form gives `{center, radius, count, more, objects:[{dist, path, pos, kinds[]}]}`. |
 | `mcam schema` | The live schema from the C# types. |
-| `mcam readback test\|status\|stat` | Readback plugin test and counters (1.2). |
+| `mcam readback test\|status\|stat\|free [force]` | Readback plugin test, counters and freeing (1.2). |
 | `mcam help` | The usage line. |
+
+The out folder (new in 0.11.0). `<out>` is optional for `start`, `rehearse`, `preview`, `record` and `take`: without it the
+run writes to `<spec dir>\takes\<spec name or file name>_<yyyyMMdd_HHmmss>` and the reply has a second line `out: <dir>
+(no out dir given)`. `replay`, `passes` and `golden` without `<out>` take the newest such folder that holds
+`record\scene.srec` (or a new one when `replay.source` is set); when there is none they answer `no recording: no folder
+<pattern> holds record\scene.srec (...)`. Example: `mcam take C:/specs/office.json` answers `multicam take started: ... ->
+C:\specs\takes\office_<yyyyMMdd_HHmmss>`.
+
+Overwriting a take (changed in 0.11.0). A run never writes over a finished take without `overwrite=on`:
+
+| Command | Refused when `<out>` holds | Reply (first line; nothing in the game is touched) |
+|---|---|---|
+| `start`, `rehearse`, `preview` | a take (`run.json` of another mode) | `refused: <dir> already holds a take (run.json, mode <m>). Use a new folder (without an out dir the take goes to <spec dir>\takes\<name>_<time>), or add overwrite=on to replace it` |
+| `record`, `take` | a recording (`record\scene.srec`) or a run | `refused: <dir>\record already holds a recording (scene.srec). Use a new folder, 'mcam replay <spec> <out dir>' to film that recording again, or add overwrite=on to replace it` |
+| `replay` | a finished run (`run.json` of a take or replay) | `refused: <out> already holds a run (<file>): add overwrite=on to replace it, add resume to film only the camera passes that are not finished, or give another folder` |
+
+`overwrite=on|off` (also `1/0`, `true/false`, `yes/no`) may stand anywhere after the spec; a bare `overwrite` or `force`
+answers `usage: write overwrite=on ...`, and any other unknown word is an error (`unknown argument 'x'`). A `run.json`
+with mode `preview` or `rehearse` is not a take (those folders are reused freely); an unreadable `run.json` counts as a
+take. `passes` and `golden` are never refused. When a run replaces an older one, the `<cam>\NNNNN.jpg|.rgba` frame files
+of its cameras are deleted first (log.txt says how many; never other files). `mcam.overwrite=on` in editor.cfg lets
+replay-mode runs write into a folder that holds a run without the word, as before 0.11.0.
 
 The replay commands (`mcam record|replay|take|passes|golden`, `srec`, `acap`) are in Section 18.4. Section 1.1 lists what
 passes the capture lock.
@@ -235,8 +287,10 @@ passes the capture lock.
 
 | Command | Result |
 |---|---|
-| `cam` | Describe the camera. |
-| `cam pose x y z yaw pitch [fov] [seconds] [roll]` | Move the free camera (eased over `seconds`). |
+| `cam` / `cam status [json]` | Describe the camera; `json` (new) is one line `{"ok":true,"free":true,"pos":[x,y,z],"yaw":..,"pitch":..,"roll":..,"fov":..,"near":..,"zoom":..,"gameFov":..,"speed":..,"moving":false,"captureLock":false,"hotkeys":"always"}` (`{"ok":false,"error":"no gameplay camera",...}` without one). |
+| `cam pose x y z yaw pitch [fov] [seconds] [roll]` | Move the free camera (eased over `seconds`). Also reads `(x, y, z)` as a reply prints it; fov is limited to 5..140; non-numbers answer `refused: cam pose needs finite numbers`. |
+| `cam look <target> [dist] [yaw] [pitch] [fov] [seconds] [point=<name>] [size=<share of the frame height>]` | New: frame a target with the free camera. `target`: `boy`, `huddle`, `main`, `game`, `gameaim`, `probe` or an object query as in specs (Section 7); also `dist=`, `yaw=`, `pitch=`, `fov=`, `seconds=`. Defaults: yaw 0, pitch 8, the current fov, dist so that the subject fills `size` (0.4) of the frame height. Reply `cam -> (x, y, z) yaw Y pitch P fov F  looking at <resolved> from D m` or `not found: <why>`. Example: `cam look boy 6 20 10`, `cam look "Crate/Lid" point=bounds size=0.5 seconds=1.5`. |
+| `cam back` | New: back to where the camera was before the last `cam pose` / `cam look` (the game camera or the earlier free pose); `cannot: there is no earlier pose ...` otherwise. |
 | `cam off` | Back to the game camera. |
 | `cam fov <deg>` / `cam roll <deg>` | Free camera FOV / roll. |
 | `cam json [name]` | The current pose as a spec camera: `{"name", "mode": "static", "pos", "yaw", "pitch", "roll", "fov"}`. |
@@ -245,13 +299,20 @@ passes the capture lock.
 | `gamma <0..1>` / `gamma reset` | Post gamma directly (not saved to the user brightness). |
 | `seed <n>` | Seed the game randomness now. |
 | `ts <scale>` | Game time scale; also releases the freeze hold after a replay run. |
+| `postfx json` | New: the game camera's post effects as one JSON line `{ok, camera, depth, hdr, target, screen, effects:[{type, enabled, settings, changed}]}`. |
+
+Free camera settings in `<game>\_mod\editor.cfg` (new in 0.11.0, all listed by `cfg`): `cam.hotkeys` (`always` default,
+`panel` = only while the editor panel is open, `off`) for Insert, `+`, `-` and `0`; `cam.speed` (6 m/s; the mouse wheel
+changes and stores it); `cam.lookSensitivity` (0.25 degrees per pixel, 0.01..5); `cam.invertY` (0; 1 = mouse up looks
+down).
 
 ### 4.3 Setup primitives
 
 Only in `setup`: `wait <real seconds>`, `waitfor loaded`, `waitfor streaming` (streaming active and all cullers done),
 `waitfor savepoint <name>`, `waitfor event <name>` (a spec event). `waitfor savepoint` takes `<subscene> [<savepoint>]` as
 numbers (as in `load 7 0`) or a part of the label `game_state` prints (e.g. `#chickenGun`). Each `waitfor` fails the run after
-60 real seconds (`setup timeout after 60 s`); `wait` has no limit.
+60 real seconds (`setup timeout after 60 s`); `wait` has no limit. A setup may not hold `mcam` commands (`mcam commands
+cannot be setup commands`); a replay setup (`replay.play.setup`) takes only `waitfor loaded | streaming | savepoint`.
 
 ### 4.4 Game sound and run rules
 
@@ -281,7 +342,7 @@ A spec is one JSON object. Minimal example (`specs/template_minimal.json`, notes
   "version": 2,
   "name": "template_minimal",
   "seconds": 5,
-  "setup": ["god on", "panel off", "triggers off", "labels off", "savepoints off"],
+  "setup": ["god on"],
   "render": {"warmup": 1, "samples": 8},
   "cameras": [
     {"name": "game", "mode": "game"},
@@ -309,7 +370,11 @@ Rules:
   merged field by field: root, then `defaults`, then the camera.
 - Angles are Unity Euler degrees: yaw 0 looks into the set (+Z), positive yaw turns toward +X, positive pitch looks DOWN.
   FOV is vertical; 0 means the live game FOV (50.99).
-- Setup commands change the game and are not undone after the take (Section 1.1).
+- Setup commands change the game and are not undone after the take (Section 1.1). The file itself still has the four
+  overlay lines `panel off`, `triggers off`, `labels off`, `savepoints off`; with `session.clean` true they do nothing.
+- Camera names are folder and file names: letters, digits, `_` and `-`. Windows device names (`CON`, `NUL`, `COM1` ...)
+  are refused. Do not name a camera `record`, `golden`, `passes` or `replaydiff`: the check does not refuse them yet, but
+  the camera's frames would land in the take's own sub-folder of that name.
 
 Run order of a take: setup commands -> seed -> preroll (game runs, nothing captured, no cues) -> t=0 -> steps with cues and
 camera visits -> end at `seconds` or `until`, whichever comes first.
@@ -495,6 +560,8 @@ them sees through them. `backfaces` lists object paths (strict, as `hide`; `"<pa
 triangles whose three vertices lie inside that world box, tested at the rest pose) whose meshes the camera also draws from
 behind. Per camera, or for every camera through `defaults.backfaces` (a camera's own list replaces the default, like every
 `defaults` field); a director takes the list of the shot on air's source camera (and the previous shot's inside a blend).
+`backfaces` and `feedForward` (6.6) work in every mode; the false `mcam check` warning `cameras[i].backfaces: ignored by
+mode ...` of 0.10.0 is gone.
 
 ```json
 "defaults": {"backfaces": ["_Moment Big Railing/CantenaRailing/Platform"]},
@@ -545,8 +612,8 @@ A target is a string, a fixed point `[x, y, z]`, or an object `{"of": base, "poi
 
 | Base | Meaning | Points (default first) |
 |---|---|---|
-| `boy` | the boy | `torso`, `head`, `neck`, `root`, `pos3` (capsule base), `bounds`, `bone:<name>` |
-| `huddle` | the huddle | `visual`, `centre`, `top`, `bottom`, `bounds`, `bone:<name>` |
+| `boy` | the boy | `torso`, `head`, `neck`, `root`, `pos3` (capsule base), `pivot`, `bounds`, `top`, `bottom`, `probe`, `bone:<name>` |
+| `huddle` | the huddle | `visual`, `centre` (or `center`), `pos3`, `pivot`, `bounds`, `top`, `bottom`, `probe`, `bone:<name>` |
 | `main` | huddle when active, else boy | as above |
 | `game` / `gameaim` / `probe` | rendered game camera / its aim point / the camera blend probe | none |
 | `<path>` | an object: exact path, else a unique `/`-bounded suffix, else a unique name | `pivot`, `bounds` (renderers, `DECAL_*` excluded), `com`, `rb`, `collider`, `top`, `bottom`, `bone:<child>` |
@@ -581,7 +648,8 @@ Groups follow several objects as one subject:
 
 ### 8.1 Cues
 
-Cues run bridge commands at game times, before the step frame of that time:
+Cues run bridge commands at game times, before the step frame of that time. A cue may not hold `mcam` commands, nor `cam`,
+`freecam`, `zoom`, `res` or `fullscreen` (they move or resize the capture camera); `mcam check` reports them as errors:
 
 ```json
 "cues": [
@@ -637,7 +705,8 @@ A positive offset simply waits for the event. A negative offset needs to know th
 prediction:
 
 1. `expect` on the event (a guess in game seconds), then
-2. the first `event` row of that name in the `rehearsal` folder's events.csv.
+2. the first `event` row of that name in the `rehearsal` folder's events.csv. A relative `rehearsal` is relative to the
+   spec file's folder (the game looks only there; the offline checker warns when it found the folder elsewhere).
 
 When the real event fires at another time, the runner logs a warning and switches to the real time. Workflow: guess with
 `expect`, rehearse with the same `seed`, set `rehearsal` to the rehearsal folder, delete `expect` (it wins over the
@@ -752,11 +821,12 @@ toward the screen (forward z < 0).
 ```
 <out>/
   spec.json        copy of the spec
-  run.json         header and summary: segments, cameras, targets, events, game TAA/post values, warnings, errors
+  run.json         header and summary: segments, cameras, targets, events, game TAA/post values, warnings, errors,
+                   frame_readback (native | readpixels)
   progress.json    live progress (mcam status json)
   log.txt          setup and cue results, warnings
   meta.csv         step,game_time,rate,group,frame,sub,captured,speed,real_time,fixed_steps,segment
-  poses.csv        step,camera,x,y,z,pitch,yaw,roll,fov,qx,qy,qz,qw,aim_x,aim_y,aim_z,near,flags,copy_of
+  poses.csv        step,camera,x,y,z,pitch,yaw,roll,fov,qx,qy,qz,qw,aim_x,aim_y,aim_z,near,flags,copy_of,subj_x,subj_y,subj_z
   events.csv       step,game_time,frame,kind,name,source,detail
   tracks.csv       targets per step (positions, velocities, bounds)
   rig.csv          the gameplay camera per step (camera, aim, rendered and clean pose, probe, shake offsets)
@@ -764,6 +834,15 @@ toward the screen (forward z < 0).
 ```
 
 Pose flags: F fallback (no pose, game pose used), C clamped, W waiting, B blending, X cut, T no target, P copy, S shake.
+run.json, progress.json and spec.json are written through a temporary file and replaced in one step. events.csv may hold
+warn rows from event sources: `object unloaded (<obj>): the event cannot fire until it is loaded again`, `object
+re-resolved after a stream change: <path>`.
+
+Run failures new in 0.11.0 (status, run.json, log.txt): `failed: Exception: '<key>' failed in N steps in a row (...): the
+take is broken and stops here (session.stopAfterErrors N)`, `failed: Exception: the game window is now WxH but the frames
+of this take are WxH: the size must not change during a take`, `failed: Exception: the capture camera is gone (a level
+load destroyed it): the take cannot go on`, `failed: Exception: readback: <plugin error>`, and for a pipe camera `frame
+writer <cam>: writer stalled: ffmpeg took no frame for 30 s (output.stallSeconds)`.
 v1 takes have only the JPEG folders (30 steps per second); the compositor reads them with `--rate` and `--group`.
 
 ## 14. Compositor and QA
@@ -898,11 +977,15 @@ python -I tools/mcam_spec_check.py <spec.json>... [options]
 |---|---|
 | (none) | messages, segment table, events with predictions, cameras with visits and renders, cost and disk estimate, layout sizes, cut holds |
 | `--quiet` | summary, errors and warnings only |
-| `--json` | machine-readable result (messages with stage, all tables) |
+| `--json` | machine-readable result (messages with stage, all tables): one object for one spec, a list for several |
+| `--json-list` | the same, always a list |
+| `--res WxH` | capture size for the crop checks and the disk estimate (default: `session.res` of the spec, else run.json of the take given with `--poses` / `--rehearsal`; unknown otherwise, then the estimate says `size not estimated, the capture size is not known offline (give --res WxH)`) |
+| `--compare GAME.json` | the game's `mcam check <spec> json` for the same spec: list what only one side reports |
+| `--strict` | exit 1 also for `--compare` differences and `--schema-md` doc differences |
 | `--index` | look every object path up in a static level index: a folder with one JSON-lines file per level file (the format `tools/atlas/make_atlas.py --index` reads; not shipped). The folder comes from `--index-dir` or the environment variable `INSIDE_LEVEL_INDEX` (no default); `--levels chickenGun` limits the files |
 | `--rehearsal DIR` | use that rehearsal folder's events.csv for predictions |
 | `--poses DIR` | a shot take (poses.csv, meta.csv, events.csv): every camera's peak speed and turn rate per output second against its motion limits, every director blend and events move of the take against its time window (6.3) |
-| `--ms LO:HI` | engine milliseconds per frame for the time estimate (default 25:40) |
+| `--ms LO:HI` | engine milliseconds per frame (v2) or per replay render for the time estimate, `lo:hi` or one number (default 25:40 for v2, 40:60 for replay) |
 | `--replay` | apply the replay lint also to a spec without a `replay` block (like `mcam check <spec> replay`) |
 | `--v2` | v2 lint only, even for a spec with a `replay` block |
 | `--schema-md` | print the schema tables (Section 19); differences with the design docs go to stderr |
@@ -911,7 +994,23 @@ python -I tools/mcam_spec_check.py <spec.json>... [options]
 | `--types FILE...` | other schema sources (default `MultiCamTypes.cs` and `ReplayTypes.cs`; several files, or the option repeated) |
 | `--design FILE...` | other design docs for the `--schema-md` meanings (default `MULTICAM_DESIGN.md` and `REPLAY_DESIGN.md`) |
 
-Exit codes: 0 no errors, 1 errors, 2 unreadable input (missing file, invalid JSON, schema not parsable).
+Exit codes: 0 no errors, 1 errors (with `--strict` also differences), 2 unreadable input (missing file, invalid JSON,
+schema not parsable), a usage error or an internal error. It runs on Python 3.9 and newer (0.10.0 needed 3.12).
+
+Since 0.11.0 the checker reads the lint tables from the game's C# sources and agrees with `mcam check` on the rules that
+differed (about 20 in 0.10.0): `output.flushEvery` below 1 and an unknown `output.pipeCodec` are errors as in game, and a
+relative `rehearsal` is resolved next to the spec as the game does (a warning when it was found elsewhere). Rerun it
+against your own specs after updating; `--compare` with the game's JSON shows any rule that still differs.
+
+Section 19 is kept in step with the code by `--update-doc`:
+
+```
+python -I tools/mcam_spec_check.py --update-doc docs/MULTICAM.md
+```
+
+It replaces the text between `<!-- schema:begin -->` and `<!-- schema:end -->` and prints `doc check: <Spec>.<key>: no
+meaning in the design doc` for every key whose meaning is missing from MULTICAM_DESIGN.md or REPLAY_DESIGN.md (those rows
+then have an empty Meaning cell until the design doc names them).
 
 What it checks:
 - Binding exactly like the game: the schema is read from `src/InsideDev/Runtime/MultiCamTypes.cs` and `ReplayTypes.cs` (one
@@ -958,9 +1057,11 @@ camera moves. `mcam check`, `mcam preview` and `mcam rehearse` cover those.
 - **MCP idle restore.** The MCP server puts back what MCP tools changed after 600 s without any tool call (EditorState
   `mcp.idle_restore_s`, 0 = never; also when the last MCP session closes, after `mcp.restore_on_close_s`, default 60 s): it
   releases held agent input, stops an input track recording or playback, ends step mode (real time, speed 1) and undoes
-  god / hazard / stream pin / render / audio changes made through MCP. It never cancels an mcam run, but a take that you drive
-  through MCP (a manual `srec record` plus play tools) loses its input when no call arrives for 10 minutes. MCP tool calls
-  and `POST /cmd` count as calls (`mcam status` is enough); file-bridge commands do not. See [MCP.md](MCP.md) section 9.
+  god / hazard / stream pin / render / audio changes made through MCP. It never cancels an mcam run. Since 0.11.0 the
+  restore also waits while work is in progress (`mcp status` names it): an mcam run, a manual `srec record`, a loaded
+  srec viewer that plays, Play's `grec`, `pano`, real-time recorder and input track recording. Outside those, a take that
+  you drive through MCP loses its input when no call arrives for 10 minutes. MCP tool calls and `POST /cmd` count as calls
+  (`mcam status` is enough); file-bridge commands do not. See [MCP.md](MCP.md) section 9.
 - **Step mode and frozen time.** The MCP play tools put the game into step mode with the first call that runs it: frozen
   between calls ([PLAY.md](PLAY.md) section 4.1). An mcam run owns the clock while its session is active: the stepper hands
   off and applies its mode again afterwards. A manual `srec record` does not take the clock: in step mode the game moves
@@ -970,13 +1071,22 @@ camera moves. `mcam check`, `mcam preview` and `mcam rehearse` cover those.
 - **A recording blocks runs.** Every run is refused while the srec viewer or a replay is loaded (`srec end` first) or a manual
   recording runs (`srec record stop` first).
 - **A run that died** leaves its session: `mcam status` says `[session still active: run mcam abort]`; run `mcam abort`.
-- **Relative paths** in `mcam` commands resolve against the game's working folder; use full paths.
+- **Relative paths** in `mcam` commands resolve against the game's working folder; use full paths, or leave the out folder
+  out (Section 4.1).
+- **Repeating a take into the same folder** is refused since 0.11.0 (Section 4.1). After a failed camera pass, film again
+  with `mcam replay <spec> <take> resume` (only the unfinished passes) or `overwrite=on`; `mcam take` again would record a
+  new performance.
+- **Grec and mcam share the readback plugin.** A pipe or golden pass is refused while Play's `grec` holds the plugin, and
+  `grec start` is refused during such a pass. `mcam readback stat` names the holder.
+- **Steam must run.** Without the Steam client the game closes itself about 2 s after it starts.
 
 ### 16.2 Problems and fixes
 
 | Problem | Cause and fix |
 |---|---|
-| Editor overlays or labels in the frames | `session.clean` must stay true; the setup's `panel off`, `triggers off`, `labels off`, `savepoints off` also help. |
+| Editor overlays or labels in the frames | `session.clean` must stay true (it switches every overlay off for the run and back afterwards). Setup lines such as `panel off` only matter with `session.clean` false. |
+| `refused: <dir> already holds a take` / `a recording` / `a run` | Since 0.11.0 a run does not write over a take: give a new folder (or none), `resume` for `mcam replay`, or `overwrite=on` (Section 4.1). |
+| `busy: the readback plugin is held by grec` | Play's `grec` records: `grec stop` first. |
 | The take pauses | Focus loss or the pause menu: the runner holds and logs it. Keep `session.runInBackground` true and do not click into the game window. A minimized window stops the game (16.1). |
 | `busy: mcam capturing` | A run holds the capture lock (Section 1.1): wait (`mcam status`), or `mcam stop` / `mcam abort`. |
 | Objects pop in during a shot | A subscene loaded late: see `late load` marks in events.csv; keep `stream.keepLoaded: "auto"` or add the culler to `stream.cullers`. |
@@ -990,7 +1100,7 @@ camera moves. `mcam check`, `mcam preview` and `mcam rehearse` cover those.
 | Washed-out picture | Too much lift: lower `blacklift` and `postGamma`, or switch the offline lift off. |
 | The game is audible during a take | Expected: MultiCam never mutes the game. Add the optional setup lines of Section 4.4. |
 | The game stays frozen after a take | Replay runs hold time scale 0 at the last sample: `ts 1`. |
-| `output.ffmpeg: not found` | ffmpeg is not on the game's PATH: put its folder on PATH before starting the game, or give the full path in `output.ffmpeg`. |
+| `output.ffmpeg: not found` | No ffmpeg found (Section 1.2): set `ffmpeg.path` in editor.cfg, put `ffmpeg.exe` into `<game>\_mod\ffmpeg\`, put its folder on PATH before starting the game, or give the full path of `ffmpeg.exe` in `output.ffmpeg`. |
 | `output ... is outside ...; pass --force` | The compositor and QA write under `out/` of the repository (Section 14): choose a folder there or add `--force`. |
 | White or black smear in a fast camera move | The game's TAA blur follows the camera motion: keep the motion limits (6.3), check the take with `mcam_spec_check.py <spec> --poses <take>`, lower a shot's `motionBlur`; `mcam_qa.py qa` lists blurred frames per cell. |
 | A prop blocks a replay camera (lamp pole, holdout slab) | `hide` on the camera or on the director shot (6.4); check it with `mcam show` (the `hide:` line) before the pass. |
@@ -1071,7 +1181,9 @@ All `mcam` commands take full paths (Section 1.1). `specs/replay_smoke.json` fol
 5. Plan: `mcam passes <spec> <take>` prints the event times from the recording, the segment table and, per camera, renders,
    copies, estimated seconds and disk. No frames.
 6. Replay passes: `mcam replay <spec> <take>`; `cams=game,bale` and `range=t0:t1` (record seconds) limit a draft.
-   `mcam take <spec> <take>` does the record pass and the replay passes in one session.
+   `mcam take <spec> <take>` does the record pass and the replay passes in one session. A second `mcam replay` into a
+   folder that already holds a finished run needs a word: `resume` films only the camera passes that did not finish
+   (after a crash, a stop or a failed pass), `overwrite=on` films them all again (Section 18.4).
 7. Videos: `python -I tools/mcam_compose.py all <take>`: one video per camera (directors included) and the layouts,
    hevc_nvenc Main10 (`--codec x265` only on request: libx265 slow is many times slower). `all` makes a cut only from an
    explicit `compose.edit` and never drafts an autocut (`mcam_compose.py cut` still does when asked); transitions can be
@@ -1170,18 +1282,32 @@ The `replay` block (all keys in Section 19):
 
 | Command | Result |
 |---|---|
-| `mcam record <spec> <out>` | Record pass only. Writes `<out>/record/`. |
-| `mcam replay <spec> <out> [cams=a,b] [range=t0:t1]` | Load the recording (`replay.source` or `<out>/record`), plan, one pass per camera (directors after their sources). Writes the v2 take layout in `<out>`. |
-| `mcam take <spec> <out> [cams=a,b] [range=t0:t1]` | Record pass and replay passes in one session (no reload between them). |
-| `mcam passes <spec> <out> [cams=a,b] [range=t0:t1]` | Plan only: event times from the recording, segments, renders, copies, time and disk per camera. Writes `<out>/passes/poses.csv` and `meta.csv`, which the Play command `campath` can fly over live play while `grec` films the game's own frames ([PLAY.md](PLAY.md) section 4.6). `poses.csv` is also the place to check what a camera really does (the player-side clamp, holds). |
-| `mcam golden <spec> <out> [every]` | Golden test (Section 18.2 step 4); also writes `golden/noise/` (renders of one frozen frame, for the noise floor). |
-| `mcam status [json]` / `mcam stop` / `mcam abort` | As v2; states `recording` (t, samples, objects, MB, fps, drift) and `replay pass i/n <camera> step j/m eta`. Abort also stops a sound capture first. |
-| `pano <file.png> ...` (needs Play) | A 360 degree panorama of the current frame, also in the recording viewer ([PLAY.md](PLAY.md) sections 4.7 and 7.8). Useful to scout where to put cameras. |
-| `srec load <dir>` / `srec play [speed] [loop]` / `srec pause` / `srec seek <t>` / `srec step <dt>` / `srec end` | Recording viewer: the scene follows the recording while you fly the free camera (no capture). |
-| `srec status` / `srec objects [filter]` | State; object table with key counts, resolution and conflicts. |
-| `srec record start <dir> [roots=a,b] [keep=a,b] [spec=<file>] [clock=real\|fixed:<rate>] [audio=on] [overwrite=on] [<record key>=value ...]` / `srec record stop [keep]` / `srec record status` | Manual recording; `keep=` waits (up to 30 s) until those subscenes are loaded and active, `spec=` takes the spec's `replay.record` as defaults and arms its `events`. |
+| `mcam record <spec> [<out>] [overwrite=on]` | Record pass only. Writes `<out>/record/`. Refused when `<out>/record` already holds a recording, unless `overwrite=on` (Section 4.1). |
+| `mcam replay <spec> [<out>] [cams=a,b] [range=t0:t1] [resume] [overwrite=on]` | Load the recording (`replay.source` or `<out>/record`), plan, one pass per camera (directors after their sources). Writes the v2 take layout in `<out>`. Into a folder that holds a finished run it needs `resume` or `overwrite=on` (below). |
+| `mcam take <spec> [<out>] [cams=a,b] [range=t0:t1] [overwrite=on]` | Record pass and replay passes in one session (no reload between them). Refused when `<out>` holds a recording or a run, unless `overwrite=on`. |
+| `mcam passes <spec> [<out>] [cams=a,b] [range=t0:t1]` | Plan only: event times from the recording, segments, renders, copies, time and disk per camera. Writes `<out>/passes/poses.csv` and `meta.csv`, which the Play command `campath` can fly over live play while `grec` films the game's own frames ([PLAY.md](PLAY.md) section 4.6). `poses.csv` is also the place to check what a camera really does (the player-side clamp, holds). Never refused for an existing folder. |
+| `mcam golden <spec> [<out>] [every \| every=<n>]` | Golden test (Section 18.2 step 4); also writes `golden/noise/` (renders of one frozen frame, for the noise floor). A bare number is `every` only after an out folder. |
+| `mcam status [json]` / `mcam stop` / `mcam abort` | As v2; states `recording` (t, samples, objects, MB, fps, drift) and `replay pass i/n <camera> step j/m eta`, and since 0.11.0 `, targets <text>` (json `targets` {total, resolved, lost, unresolved, groups, rescans, re_resolved, joined, problems}). Abort also stops a sound capture first. |
+| `pano [<file.png>] ...` (needs Play) | A 360 degree panorama of the current frame, also in the recording viewer ([PLAY.md](PLAY.md) sections 4.7 and 7.8). Useful to scout where to put cameras. |
+| `srec load <dir\|last>` / `srec reload` / `srec play [speed] [loop]` / `srec pause` / `srec seek <t>` / `srec step <dt>` / `srec end` | Recording viewer: the scene follows the recording while you fly the free camera (no capture). `last` = the newest take under `<game>\_mod\srec`. |
+| `srec status [json]` / `srec objects [filter]` / `srec list` / `srec events` | State; object table with key counts, resolution and conflicts; takes under `<game>\_mod\srec`; events of the loaded recording ([RECORD_REPLAY.md](RECORD_REPLAY.md) section 4). |
+| `srec record start [<dir>] [roots=a,b] [keep=a,b] [spec=<file>] [clock=real\|fixed:<rate>] [audio=on] [overwrite=on] [<record key>=value ...]` / `srec record stop [keep\|load]` / `srec record status [json]` | Manual recording; `keep=` waits (up to 30 s) until those subscenes are loaded and active, `spec=` takes the spec's `replay.record` as defaults and arms its `events`. Without `<dir>` the take goes to `<game>\_mod\srec\take_<yyyyMMdd_HHmmss>`; a relative `<dir>` is a folder there. |
 | `srec event <name> [detail]` | Timed event in the active recording (manual or mcam); `@name` resolves to its first post. |
-| `acap preflight` / `acap status` / `acap output [audible\|muted]` | Sound capture: "ok" or the refusal reason; capture state; the capture output (18.6). |
+| `acap preflight` / `acap status [json]` / `acap output [audible\|muted]` / `acap result [json]` | Sound capture: "ok" or the refusal reason; capture state; the capture output (18.6); the last finished capture. |
+
+`resume` (new in 0.11.0, `mcam replay` only) keeps the camera passes that finished in the earlier run and films the rest:
+the log says `resume: K finished pass(es) kept (...), M to film (...)` and `pass i/n C: finished in the earlier run, kept
+(resume)`, and run.json `replay.resume.kept` names them. It is refused (`refused: resume: ...`) when the earlier run.json
+is missing or unreadable, belongs to another mode, used another spec (compared with `<out>\spec.json`), covered another
+record range, rendered another size or another step count, or when the recording changed since; and `resume` with
+`overwrite=on` is refused (`refused: resume and overwrite=on exclude each other`). Example: `mcam replay
+C:/specs/shot.json C:/takes/a resume`.
+
+A replay plan larger than `mcam.planMaxMB` (editor.cfg, default 512 MB: steps x cameras) or a timeline over 1,000,000
+output frames is refused at the start; film it in parts with `range=t0:t1`. Director holds are hard links to the source
+camera's frame (`replay.play.holds: "link"`, a copy where hard links are not available; `"copy"` always copies), so a hold takes no extra disk space;
+the log line `pass C: N hold(s): L hard link(s), K copy(ies)` counts them. A camera pass writes its own frame files
+(it deletes an earlier one first), so a hard link never carries a frame into another camera's folder.
 
 The full `srec` and `acap` references are in [RECORD_REPLAY.md](RECORD_REPLAY.md) and [AUDIO.md](AUDIO.md). During record and replay runs the capture
 lock of Section 1.1 applies (`session.lockInput`).
@@ -1222,7 +1348,7 @@ How a capture behaves depends on the capture output, `acap output audible|muted`
 | Output | Behaviour |
 |---|---|
 | `audible` (default) | The game sound plays normally during the record pass. The capture window opens at once at min(`audio.level`, game volume), so the master volume is never raised above the game's own setting. No InsideMuter, heartbeat or flag files; `suspend`, `allowMuterOnly`, `heartbeat` and `maxHeartbeatAge` are not used. |
-| `muted` (opt-in) | For a machine where INSIDE must stay inaudible. From the first `acap` command (or `srec record ... audio=on`, or a run of a spec with a `replay` block) until `acap output audible` or the game exits, the master volume is held at 0 outside capture windows. `tools\muter\InsideMuter.exe` ([LAB.md](LAB.md)) mutes INSIDE's Windows audio sessions and writes a heartbeat (`replay.audio.heartbeat`, default `_mod/muter/heartbeat.json` relative to the game folder; `maxHeartbeatAge` 2 s). The 0 is read back from Wwise, and a stale heartbeat or an unmuted session closes a window. A capture also needs a capture path flag: `<game>\_mod\acap_suspend_ok.json` (suspended capture, `suspend: "auto"`) or `allowMuterOnly: true` plus `<game>\_mod\acap_muteronly_ok.json`; only a passing lab stage writes these files ([LAB.md](LAB.md)). Suspended capture rendered at 0.919x real time in the lab, outside the 0.5 % sync limit. |
+| `muted` (opt-in) | For a machine where INSIDE must stay inaudible. From the first `acap` command (or `srec record ... audio=on`, or a run of a spec with a `replay` block) until `acap output audible` or the game exits, the master volume is held at 0 outside capture windows. `tools\muter\InsideMuter.exe` ([AUDIO.md](AUDIO.md) section 11) mutes INSIDE's Windows audio sessions and writes a heartbeat (`replay.audio.heartbeat`, default `_mod/muter/heartbeat.json` relative to the game folder; `maxHeartbeatAge` 2 s). The 0 is read back from Wwise, and a stale heartbeat or an unmuted session closes a window. A capture also needs a capture path flag: `<game>\_mod\acap_suspend_ok.json` (suspended capture, `suspend: "auto"`) or `allowMuterOnly: true` plus `<game>\_mod\acap_muteronly_ok.json`; only a passing lab stage writes these files ([LAB.md](LAB.md)). Suspended capture rendered at 0.919x real time in the lab, outside the 0.5 % sync limit. Since 0.11.0 InsideMuter un-mutes what it muted when it ends (`--keep-muted` keeps the old behaviour). |
 
 `acap preflight` answers "ok" or why a capture would be refused, for the current output; run it before a sound take.
 Details of both outputs, `acap start` for manual captures and the remaining `acap` commands: [AUDIO.md](AUDIO.md).
@@ -1246,6 +1372,10 @@ Details of both outputs, `acap start` for manual captures and the remaining `aca
 `mcam_audio.py` also has `fix` (repair RIFF / data sizes of a WAV), `info`, `stretch <src> <dst> <factor>` and `check`
 (levels, onsets after event markers). None of the tools plays audio. Exit codes: 0 ok, 1 check failed or audio not usable,
 2 usage or input error, 3 refused.
+
+Sound for a live film instead of a replay take: Play's `grec` films the game's own frames in real time, and its
+`<file>.times.csv` lines the video up with an acap WAV and srec events in every clock mode ([PLAY.md](PLAY.md) section
+4.6.1; audio_capture.json has `clockBase` and, new in 0.11.0, `gameBase`).
 
 ### 18.8 Limits
 
@@ -1298,6 +1428,13 @@ force it). The v2 whole-step-rate rules are off for these specs.
   `audio force rtpc rtpc_master_volume 0` before its first `load` (offline checker only; the line is optional, Section 4.4).
 - Notes: keys the replay ignores (`session.vsync`, `stream.addDuringTake`, `interpolate`, `rehearsal`, `expect`, camera
   render budgets with `look: "game"`), P1/P2 options.
+- New in 0.11.0 (also for v2 specs where they apply): errors for a camera, key or beat `fov` of 170 or more (`fov X must
+  be below 170`), a misspelt beat `point` (`unknown boy point 'hed' (...)`; it was a silent no-target beat), a negative
+  `record.maxMB`, `maxSeconds` or `minFreeMB`, a `record.onLoad` other than `continue` / `stop`, an unknown
+  `output.pipeCodec`, `output.flushEvery` below 1; warnings for a beat `point` that belongs to another target, an unknown
+  `stream.rescan` (auto is used), `record.post`, `replay.play.holds` other than `link` / `copy`, `planChunkMs` outside
+  5..1000, a camera `frame` crop that leaves the frame; a note when a speed-up between segments with sub-frame samples
+  gives the first frames after it a shorter exposure (`replay.play.ramp >= W s keeps the full exposure`).
 
 ## 19. Schema reference
 
@@ -1427,10 +1564,11 @@ Generated by `python -I tools/mcam_spec_check.py --schema-md` from `MultiCamType
 | rig | bool | true | Write rig.csv. |
 | tracks | bool | true | Write tracks.csv. |
 | flushEvery | int | 30 | Steps between CSV flushes. |
-| ffmpeg | string | "ffmpeg" | ffmpeg for pipe mode (default: `ffmpeg` on PATH). |
-| pipeCodec | string | "hevc_nvenc" | Pipe codec (H.265 only). |
+| ffmpeg | string | "ffmpeg" | ffmpeg for pipe mode. `ffmpeg` (or `ffmpeg.exe`) = the tool's own search (`ffmpeg.path` in editor.cfg, `INSIDEDEV_FFMPEG`, `<game>\_mod\ffmpeg\ffmpeg.exe`, `PATH`, `C:\ffmpeg\bin`); anything else must be the full local path of a file named `ffmpeg.exe`. |
+| pipeCodec | string | "hevc_nvenc" | Pipe codec: `hevc_nvenc`, `libx265` or `auto`; anything else is a lint error. |
 | pipeQp | int | 14 | Constant QP for the pipe. |
 | readback | string | "auto" | `auto`: the native async readback plugin (`bin/InsideReadback.dll`) when it loads, else ReadPixels; `native`: the plugin is required; `readpixels`: synchronous ReadPixels on the game thread. Used by `pipe` output, `record.captureGame` and `mcam golden` (added with the replay mode). |
+| stallSeconds | number | 30 | Seconds a full writer queue may make no progress before the take fails ("writer stalled: ffmpeg took no frame for 30 s"); 0 = wait without a limit (the 0.10.0 behaviour). |
 
 #### session (`SessionSpec`)
 
@@ -1447,6 +1585,7 @@ Generated by `python -I tools/mcam_spec_check.py --schema-md` from `MultiCamType
 | holdWhileLoading | bool | true | Hold stepping while the game is loading. |
 | quietLog | bool | true | Silence per-step DevLog lines (SetFree ON/OFF). |
 | gcSteps | int | 0 | > 0: GC.Collect every n steps (long raw takes). |
+| stopAfterErrors | int | 300 | A live take stops when the same error key (SampleGame, targets step, events, evaluate <cam> ...) fails in that many steps in a row; 0 = never. |
 
 #### post (root, defaults.post, camera post) (`PostSpec`)
 
@@ -1474,6 +1613,7 @@ Generated by `python -I tools/mcam_spec_check.py --schema-md` from `MultiCamType
 | timeout | number | 20 | Real seconds to wait for loading. |
 | freeze | bool | false | CullingActive = false during the take (experimental). |
 | addDuringTake | bool | true | Late-load detection and AddAlwaysLoaded during the take. |
+| rescan | string | "auto" | `auto`: after a streaming change the object targets are looked up again (log line "targets: object rescan"); `off`: no rescan. |
 
 #### cameras[] and defaults (`CamSpec`)
 
@@ -1587,6 +1727,15 @@ Generated by `python -I tools/mcam_spec_check.py --schema-md` from `MultiCamType
 | clock | string | "game" | `game` or `output` clock for the replica. |
 | rate | number | 1 | Replica playback rate. |
 | phase | number | 0 | Replica phase seconds. |
+
+#### cameras[].motion (`MotionSpec`)
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| maxSpeed | number | 6 | Peak camera speed in metres per output second (0 = no limit). |
+| maxTurn | number | 35 | Peak turn rate in degrees per output second (0 = no limit). |
+| ease | number | 0.6 | Seconds to speed up and to slow down: a move lasts at least 2 x ease; the limiter's acceleration is maxSpeed / ease. |
+| blurScale | number | 1 | Scale of this camera's replay pass motion blur (times the shot's `motionBlur` for directors). |
 
 #### cameras[].clamp (`ClampSpec`)
 
@@ -1716,6 +1865,10 @@ Generated by `python -I tools/mcam_spec_check.py --schema-md` from `MultiCamType
 | captureGame | bool | false | Also grab the game camera at record res (golden test). |
 | captureEvery | int | 10 | Grab every n-th sample. Each grab stalls the main thread (about 34 ms at 1280x720, R1), so a captureGame record is a golden reference, not pacing grade (2.3.4). |
 | checks | string[] | [] | Content checks of `tools/srec_tool.py report`: `#Subscene` or an object path / suffix / name, optional ` @<from>..<to>` window (seconds or event[+-s]) the object must be active (visible when it has renderers) over. |
+| maxMB | int | 0 | The sampling ends when `scene.srec` reaches this size in MB; 0 = no limit. |
+| maxSeconds | number | 0 | The sampling ends at this record time in seconds; 0 = no limit. |
+| minFreeMB | int | 256 | A start is refused, and a running recording ends, when the drive of the record folder has less free space in MB; 0 = no check. |
+| onLoad | string | "continue" | What a level load (respawn, checkpoint, chapter) does to a running recording: `continue` = the take goes on and reloaded subscenes join again (it ends only when no recorded object is alive and none comes back within 3 s); `stop` = the sampling ends at the load. |
 
 #### replay.record.box (`BoxSpec`)
 
@@ -1749,6 +1902,8 @@ Generated by `python -I tools/mcam_spec_check.py --schema-md` from `MultiCamType
 | maxUnresolved | number | 0.01 | Refuse above this fraction of unresolved dynamic objects (kind `spawned` excluded, reported separately). |
 | monitor | bool | true | 2.4.2. |
 | restore | string | "final" | `final` or `reload` (2.4.8). |
+| holds | string | "link" | How a director hold repeats a frame: `link` = a hard link to the source frame (no extra disk space; a copy when hard links are not available), `copy` = a copy. |
+| planChunkMs | number | 50 | Game-thread time in ms per plan chunk between frozen frames (5..1000). |
 
 #### replay.audio (`AudioCapSpec`)
 

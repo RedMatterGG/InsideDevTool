@@ -53,7 +53,7 @@ Building: `GAME=/path/to/INSIDE sh build/build_lab.sh` (both DLLs, needs `bin/In
 | `lab status` | `<test> running: phase '<phase>', frame <n>, <s> s` or `idle`, and the last verdict line. |
 | `lab stop` / `lab abort` | Stops the running test; everything it changed is restored in the next frame. Verdict `INFO aborted: lab stop` unless it had one. |
 | `lab verdicts` | One line per test: this session's verdict or the `verdict.txt` of `<root>\<test>\` ("(file)"), else `-`. L5 and L12 write into `L5_<stage>` and `L12_<tag>`; read those `verdict.txt` files directly. |
-| `lab out [<dir>]` | Prints or sets the result root (session only). Default `<game>\_mod\replay_tests`. Use an absolute path. |
+| `lab out [<dir>]` | Prints or sets the result root (session only). Default `<game>\_mod\replay_tests`. Use an absolute path: a relative one is stored as typed and resolved against the game's working folder whenever a file is written. Since 0.11.0 a test refuses an output folder that would leave the root (`refused: the output folder ... is not below ...`). |
 | `lab <test> [args]` | Runs a test (`lab l1`, `lab L7 frames=120`, ...). |
 
 Only one test runs at a time. Refused while an mcam session runs, and without a gameplay camera ("load a level first").
@@ -67,7 +67,10 @@ A test runs as a coroutine over many frames; poll `lab status` or wait for `verd
 | `clean=on\|off` | `on` | Hide the editor overlay in grabbed frames (tests with images). |
 | `thr=<n>` | per test | Pixel difference threshold (0-255). |
 | `settle=<n>` | 12 | Frames rendered before a reference grab (TAA settles). |
-| `timeout=<s>` | 600 (L5: secs + 120) | The test fails after this many real seconds. |
+| `timeout=<s>` | 600 | The test fails after this many real seconds. L5 ignores it: its limit is always the stage's `secs` + 120. |
+
+`lab help` and `lab list` are the in-game reference, but their common-argument line still leaves out `settle=` and the
+optional roll of `cam=`, and the L9 usage leaves out `lightradius=`: all three work as documented here.
 
 Arguments are `key=value` (case-insensitive keys) or single words (`force`, `confirm`, `wake`, a stage name). Object
 arguments (`chick=`, `bale=`, `rope=`, `light=`, ...) take a name, a path or `#instanceID` like other bridge commands.
@@ -96,6 +99,8 @@ Most tests use the ChickenGun scene on the farm. Through the bridge:
 ```
 load 7 0
 state                                                     repeat until the "savepoint:" line shows (spawn 7 0)
+                                                          (from outside: inside_ctl.py snapshot, or inside_ctl.py wait savepoint 7 0;
+                                                          inside_ctl.py state is the Play observe JSON, not this text)
 tp 221.0 -221.4 0.66
 call ChickenGunObject/ChickenGunVacuumLogic ChickenGunLogic OnElectricityOn
 call _SaveLogic/ChickensLoaded ChickenSpawner DoSpawn
@@ -294,7 +299,8 @@ sample. INFO when the rope is not visible or barely moving. Images: `record_s0.j
 
 #### L12 camera probe
 
-`lab l12 [tag=<scene name>] [frames=30] [dx=1.5] [yaw=10] [eps=1e-5] [cam=...]`. Result folder `L12_<tag>` (or `L12`).
+`lab l12 [tag=<scene name>] [frames=30] [dx=1.5] [yaw=10] [eps=1e-5] [cam=...]`. Result folder `L12_<tag>` (or `L12`);
+since 0.11.0 the tag is reduced to letters, digits, `_` and `-`.
 
 Frozen. Scans every transform of the scene: `frames` frames with the camera still (control), then `frames` frames
 alternating with a pose `dx` m to the right and `yaw` degrees turned. Transforms that changed only while the camera moved
@@ -336,8 +342,8 @@ machine and all chickens per step. It never uses the game's own Playback system.
 | `det prep [anim=default\|always] [cull=live\|freeze] [stream=live\|keep] [drip=on\|off]` / `det prep full` / `det prep default` | Prep switches (3.2). Without arguments prints them. Refused while a run is busy. |
 | `det cue <k> <command>` | Adds a cue: run `<command>` (any bridge or console command) at logic step k (k >= 0, counted from the moment the load has finished, "all scenes loaded"). Kept sorted by k. |
 | `det cues` / `det cues clear` | Lists / clears the cue track. |
-| `det run <name> <out> [kmax] [kmax=n] [fps=60] [cam=...]` | A record run (3.4). |
-| `det replay <source> <out> [kmax=n] [fps=60] [cam=...]` | A replay run of `<source>`'s inputs and cues (3.4). |
+| `det run <name> <out> [kmax] [kmax=n] [fps=60] [cam=...] [overwrite=on]` | A record run (3.4). |
+| `det replay <source> <out> [kmax=n] [fps=60] [cam=...] [overwrite=on]` | A replay run of `<source>`'s inputs and cues (3.4). |
 | `det zone` | The subscenes of load 7 0 used by the prep, whether they are loaded and kept, and their culler groups, Animations and drip sounds. |
 | `det abort` / `det stop` | Ends the running run now (state `aborted`) and restores everything. |
 
@@ -376,7 +382,8 @@ Cues fire in the fixed-update phase of their step, at most once per step. A reco
 | Argument | Default | Meaning |
 |---|---|---|
 | `<name>` (run) | | A label stored in meta.json. |
-| `<out>` | | Run folder: absolute, or relative to `<game>\_mod\det\`. An existing run there is overwritten. |
+| `<out>` | | Run folder: absolute, or relative to `<game>\_mod\det\`. Changed in 0.11.0: a folder that already holds a run (`steps.csv`) is refused: `refused: <out> already holds a run (steps.csv); give another <out> or add overwrite=on`. |
+| `overwrite=on` | off | Allow writing over an existing run (the 0.10.0 behaviour). Batch scripts that reuse folders need it. |
 | `<source>` (replay) | | A folder path, or the name of a run folder next to `<out>`. Must hold `inputs.csv` and `cues.tsv`; must differ from `<out>`. |
 | `kmax=n` (or a bare number for `run`) | run: 1200; replay: the source's last step | Last step. A record run also stops 210 steps after the bale landed; a replay runs exactly kmax steps. |
 | `fps=n` | 60 | Rendered frames per second of game time: a multiple of 60 from 60 to 600 (120 = 2 frames per logic step). |
@@ -397,6 +404,10 @@ not start within 20 s or finish within 300 s, or a hook failure. At the end ever
 A record run takes the live input of keyboard or gamepad; with no one touching them the input is neutral and the cues do
 the work. During a replay, `det status` compares every finished row with the source: first differing step k* and per
 channel (rng_fixed, rng_update, rng_late, positions above 1e-4 m), and the largest boy, bale and chicken differences.
+Since 0.11.0 an object present in only one of the two runs counts as a divergence (the live text adds `, object in one
+run only k x n`), and one warning says when the two runs log a different number of positions. A run aborts when a step
+without input finds that the game's input core is no longer FilmInput (another tool took it), and inputs beyond the last
+logged step are cut before `inputs.csv` is written.
 
 ### 3.5 Run folder files
 
@@ -438,11 +449,12 @@ Python 3.9 or newer, standard library only. Run folders are compared by step k, 
 
 | Command | Options | Output | Exit codes |
 |---|---|---|---|
-| `compare <run> <ref>` | `--json <file>` | Text report of one run against a reference; JSON with every value. | 0 (any verdict), 2 (a folder has no `steps.csv`) |
-| `matrix <root>` | `--out <file>` (default `<root>\verdict.txt`), `--json <file>` (default `<root>\det_matrix.json`) | Compares the standard runs (3.6), applies the decision rule, prints and writes the verdict. | 0, 2 (not a folder) |
+| `compare <run> <ref>` | `--json [<file>]`, `--exit-zero` | Text report of one run against a reference; JSON with every value (`--json` alone or `--json -`: the JSON on stdout and the text report on stderr). | 0 PASS (strict or film), 1 FAIL, 2 (a folder has no `steps.csv`, usage) |
+| `matrix <root>` | `--out <file>` (default `<root>\verdict.txt`), `--json [<file>]` (default `<root>\det_matrix.json`), `--exit-zero` | Compares the standard runs (3.6), applies the decision rule, prints and writes the verdict. | 0 (the decision starts with "B viable" and no run is missing), 1 (B dropped or the matrix is incomplete), 2 (not a folder) |
 | `selftest` | | Synthetic runs, no game. | 0 ok, 1 failed |
 
-The compare exit code does not carry the verdict: read the first report line.
+Changed in 0.11.0: the exit code carries the verdict. `--exit-zero` gives 0 for every verdict that could be computed
+(the 0.10.0 behaviour).
 
 Window: every reference step up to the reference's bale landing + 210 steps (all reference rows if it has no landing);
 chickens for the film verdict only up to landing + 60 steps (1 s).
@@ -467,8 +479,8 @@ default or full prep, whether 120 fps reproduces 60 fps, and which pairs are str
   volume back with `audio force rtpc rtpc_master_volume <game volume 0-100>` and then `audio clear
   rtpc:rtpc_master_volume`, or restart the game. After S3/S3b Wwise also stays suspended until the game exits: only `lab l5
   s2 ... wake` wakes it; `acap suspend off` does not ("not suspended by acap").
-- **Silent game after InsideMuter.** Its mute stays on the session after it exits ([AUDIO.md](AUDIO.md) section 11).
-- **Muter waits forever** when started and no INSIDE.exe ever appears; it mutes every INSIDE.exe, also a second install.
+- **Muter waits forever** when started and no INSIDE.exe ever appears, unless it was started with `--wait <s>`; it mutes every
+  INSIDE.exe, also a second install.
 - **Minimized or unfocused game.** A minimized game window pauses the game: lab tests stall (watchdog FAIL after 600 frames
   and 10 s, or timeout) and `det` runs abort after 30 s without a logic step. `bg on` (and the run-in-background setting
   `det` switches on for its runs) keeps the game running without focus; whether it also keeps a minimized game running is
@@ -482,7 +494,12 @@ default or full prep, whether 120 fps reproduces 60 fps, and which pairs are str
   locks its own pacing. Do not drive the game through MCP step tools during a `det` run (FilmInput replaces the input
   layer; mixing with the MCP agent input is unverified in game).
 - **`lab verdicts`** does not find L5 and L12 results (they use `L5_<stage>` and `L12_<tag>` folders).
-- **`det_compare.py compare` exits 0 for FAIL.** Use the report text or `--json`.
+- **`det_compare.py` exit codes changed in 0.11.0.** `compare` exits 1 for FAIL (0.10.0 exited 0 for any verdict); scripts
+  that relied on 0 add `--exit-zero`.
+- **`det` folders are not overwritten any more.** A second `det run S1 S1` is refused without `overwrite=on`.
+- **Silent game after InsideMuter.** Since 0.11.0 a muter that ends normally un-mutes what it muted; see
+  [AUDIO.md](AUDIO.md) section 11 for `InsideMuter.exe unmute` and `--keep-muted`.
+- **Steam must run.** Without the Steam client the game closes itself about 2 s after it starts.
 - **Game progress.** `det` and the ChickenGun preparation load savepoint 7 0; whether the game writes its save file then is
   unverified.
 
@@ -499,6 +516,7 @@ default or full prep, whether 120 fps reproduces 60 fps, and which pairs are str
 | Suspend flag | absent | `<game>\_mod\acap_suspend_ok.json` (L5 S3/S3b PASS) | Unlocks the core's Suspend capture path. |
 | Muter-only flag | absent | `<game>\_mod\acap_muteronly_ok.json` (L5 S2 PASS) | Unlocks the core's muter-only path. |
 | Det run folder | relative to `<game>\_mod\det\` | `<out>` argument | Where runs write. |
+| Det overwrite | off | `overwrite=on` on `det run` / `det replay` | Allow a run folder that already holds `steps.csv` (3.4). |
 | Det prep | `anim=default cull=live stream=live drip=on` | `det prep` (session only) | 3.2. |
 | Det cue track | empty | `det cue`, `det cues clear` (session only) | 3.3. |
 | Det kmax, fps | 1200, 60 | `kmax=`, `fps=` | 3.4. |
