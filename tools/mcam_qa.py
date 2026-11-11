@@ -9,6 +9,10 @@ silhouette distance at 99 % coverage judged for rope targets only (--sil-targets
 min(N1, N120), REPLAY_DESIGN 9.2 R3; default output <take>/replaydiff) and the record audio sync check
 (audiosync: lag-0 marker fit, slope, residuals, event markers and onsets, audio_track.wav duration and cross-correlation
 against the record WAV, muxed video durations). Numeric checks only, audio is never played.
+The composed videos are decoded on the GPU when that works (--cpu: on the CPU) and several at once; a video that does not
+decode, or decodes to another frame count than compose_log.json says, is an error. Outputs go where mcam_compose.py puts
+them (--out DIR, else MCAM_OUT, compose.output.root, <take>/out). --json prints one JSON object on stdout.
+Exit codes: 0 ok, 1 errors (the result is bad), 2 input or usage error, 3 refused.
 Usage: python -I tools/mcam_qa.py <qa|sheet|sync|paths|timeline|diverge> <take> [options]
        python -I tools/mcam_qa.py replaydiff <take> [--record <dir>] [--exclude <json>]
        python -I tools/mcam_qa.py audiosync <take> [--record <dir>] [--video <file>]"""
@@ -17,8 +21,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -27,7 +31,9 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mcam_audio as MA
 import mcam_compose as MC
+import mcam_ff as FF
 import mcam_take as MT
 from mcam_take import Take, TakeError
 
@@ -46,6 +52,17 @@ BLUR_WINDOW = 1.5
 BLUR_WARN = 0.35
 BLUR_FAIL = 0.2
 BLUR_GAP = 3
+VIDEO_JOBS = 3
+EXIT_OK, EXIT_BAD, EXIT_INPUT, EXIT_REFUSED = FF.EXIT_OK, FF.EXIT_BAD, FF.EXIT_INPUT, FF.EXIT_REFUSED
+SUMMARY: dict = {}
+
+
+def summarize(rep: 'Report | None' = None, **extra) -> None:
+    """What --json prints at the end: the errors and warnings of the report and the files written."""
+    if rep is not None:
+        SUMMARY['errors'] = [f'{i["check"]}: {i["msg"]}' for i in rep.items if i['level'] == 'error']
+        SUMMARY['warnings'] = [f'{i["check"]}: {i["msg"]}' for i in rep.items if i['level'] == 'warn']
+    SUMMARY.update(extra)
 
 
 def font(px: int, mono: bool = False) -> ImageFont.FreeTypeFont:
@@ -73,6 +90,7 @@ def raw_ctx(ctx: MC.Ctx) -> MC.Ctx:
 
 def save(img: Image.Image, path: Path) -> Path:
     img.save(path, optimize=True)
+    MC.wrote(path)
     print(f'wrote {path}')
     return path
 
@@ -226,6 +244,18 @@ def check_frames(ctx: MC.Ctx, rep: Report) -> dict:
     return stats
 
 
+def side_limit(ctx: MC.Ctx) -> float | None:
+    """The z of the player-side rule (cameras stay at z <= limit and do not look back toward the screen): -2 by default,
+    compose.qa.playerSideZ in the spec (null = no such rule in this scene), off with --no-side-check."""
+    if getattr(ctx.args, 'no_side_check', False):
+        return None
+    qa = ctx.cfg.get('qa') if isinstance(ctx.cfg.get('qa'), dict) else {}
+    if 'playerSideZ' in qa:
+        v = MT.fnum(qa['playerSideZ']) if qa['playerSideZ'] is not None else math.nan
+        return v if math.isfinite(v) else None
+    return MT_PLAYER_Z
+
+
 def check_poses(ctx: MC.Ctx, rep: Report) -> None:
     take = ctx.take
     poses = take.poses()
@@ -233,6 +263,9 @@ def check_poses(ctx: MC.Ctx, rep: Report) -> None:
         rep.add('info', 'poses', 'no poses.csv (v1 take): pose checks skipped')
         return
     game = poses.get('game')
+    side_z = side_limit(ctx)
+    if side_z is None:
+        rep.add('info', 'player_side', 'player-side checks are off (compose.qa.playerSideZ null or --no-side-check)')
     for cam, e in poses.items():
         mode = take.cams[cam].mode if cam in take.cams else ''
         n = len(e['step'])
@@ -257,11 +290,11 @@ def check_poses(ctx: MC.Ctx, rep: Report) -> None:
                         steps=fmt_runs(runs(same)))
         pitch = MT.signed_angle(e['pitch'])
         fwd = e['forward']
-        behind = [int(e['step'][i]) for i in range(n) if e['z'][i] > MT_PLAYER_Z and pitch[i] < 45]
-        back = [int(e['step'][i]) for i in range(n) if fwd[i, 2] < -0.05 and pitch[i] < 60]
+        behind = [int(e['step'][i]) for i in range(n) if e['z'][i] > side_z and pitch[i] < 45] if side_z is not None else []
+        back = [int(e['step'][i]) for i in range(n) if fwd[i, 2] < -0.05 and pitch[i] < 60] if side_z is not None else []
         if behind:
             rep.add('error', 'player_side', f'{cam}{" (director path)" if mode == "director" else ""}: {len(behind)} poses behind '
-                                            f'the line z > {MT_PLAYER_Z} without looking down', steps=fmt_runs(runs(behind)))
+                                            f'the line z > {side_z:g} without looking down', steps=fmt_runs(runs(behind)))
         if back:
             rep.add('error', 'looks_back', f'{cam}: {len(back)} poses looking back toward the screen (forward z < -0.05)',
                     steps=fmt_runs(runs(back)))
@@ -466,6 +499,7 @@ def dark_args(ctx: MC.Ctx, cells: bool = False) -> tuple[int, float]:
 
 
 def video_luma(path: Path, scale: int = 4, gpu: bool = False):
+    """Small gray frames of a composed video. A decode that fails or stops inside a frame raises mcam_ff.FfError."""
     info = MC.ffprobe(path)
     vids = [s for s in info.get('streams', []) if s.get('codec_type') == 'video']
     if 'error' in info or not vids:
@@ -474,47 +508,71 @@ def video_luma(path: Path, scale: int = 4, gpu: bool = False):
     w, h = max(2, W // scale), max(2, H // scale)
     hw = ['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'] if gpu else []
     pre = f'hwdownload,format={MT.gpu_download_format(path)},' if gpu else ''
-    cmd = [MT.FFMPEG, '-hide_banner', '-loglevel', 'error', *hw, '-i', str(path), '-vf', f'{pre}scale={w}:{h}:flags=area,format=gray', '-f',
+    cmd = [FF.ffmpeg(), '-hide_banner', '-loglevel', 'error', *hw, '-i', str(path), '-vf', f'{pre}scale={w}:{h}:flags=area,format=gray', '-f',
            'rawvideo', '-']
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-    n = w * h
-    try:
-        while True:
-            buf = proc.stdout.read(n)
-            if len(buf) < n:
-                break
-            yield np.frombuffer(buf, np.uint8).reshape(h, w), W, H
-    finally:
-        proc.stdout.close()
-        proc.wait()
+    for buf in FF.frames(cmd, w * h, name=f'ffmpeg ({path.name})'):
+        yield np.frombuffer(buf, np.uint8).reshape(h, w), W, H
 
 
-def output_videos(ctx: MC.Ctx) -> list[tuple[Path, dict | None]]:
+def output_stem(f: Path) -> str:
+    stem = f.stem
+    if stem.endswith('_new'):
+        stem = stem[:-4]
+    return stem.replace('_h265', '').replace('_draft', '')
+
+
+def output_entries(ctx: MC.Ctx) -> list[dict]:
+    """The composed videos of the compose_log.json files (file, layout, frames as logged); the newest entry of a file wins."""
     folders = [Path(v) for v in (getattr(ctx.args, 'videos', None) or [])] or [ctx.out]
-    found: dict[str, tuple[Path, dict | None]] = {}
-    lays = {str(l.get('name', 'main')): l for l in MC.layouts_of(ctx) if isinstance(l, dict)}
+    found: dict[str, dict] = {}
+    lays = {MC.safe_name(str(l.get('name', 'main'))): l for l in MC.layouts_of(ctx) if isinstance(l, dict)}
     for d in folders:
-        log = d / 'compose_log.json'
-        if not log.is_file():
-            continue
-        for entry in json.loads(log.read_text(encoding='utf-8')):
-            res = entry.get('result')
-            items = res if isinstance(res, list) else [res] if isinstance(res, dict) else []
-            if isinstance(res, dict) and ('angles' in res or 'layouts' in res):
-                items = list(res.get('angles') or []) + list(res.get('layouts') or []) + ([res['cut']] if isinstance(res.get('cut'), dict) else [])
-            for it in items:
-                if not isinstance(it, dict) or not it.get('file'):
-                    continue
+        for entry in MC.read_log(d / MC.LOG_NAME):
+            for it in MC.result_items(entry.get('result')):
                 f = Path(it['file'])
                 if not f.is_file():
                     continue
-                stem = f.stem.replace('_h265', '').replace('_draft', '')
+                stem = output_stem(f)
                 lay = lays.get(stem[len('layout_'):]) if stem.startswith('layout_') else None
-                found[str(f).lower()] = (f, lay)
-    return sorted(found.values(), key=lambda x: str(x[0]))
+                found[str(f).lower()] = {'file': f, 'lay': lay, 'frames': MT.inum(it.get('frames'), -1)}
+    return sorted(found.values(), key=lambda x: str(x['file']))
 
 
-def check_video(ctx: MC.Ctx, rep: Report, f: Path, lay: dict | None, gpu: bool = False) -> dict:
+def output_videos(ctx: MC.Ctx) -> list[tuple[Path, dict | None]]:
+    return [(e['file'], e['lay']) for e in output_entries(ctx)]
+
+
+def scan_video(ctx: MC.Ctx, f: Path, lay: dict | None, gpu: bool, level: int, cover: float) -> tuple:
+    cells = None
+    black: dict[str, list[int]] = {}
+    near: dict[str, list[int]] = {}
+    lap: dict[str, list[float]] = {}
+    n = 0
+    for j, (g, W, H) in enumerate(video_luma(f, gpu=gpu)):
+        if cells is None:
+            cells = [('frame', 0, 0, g.shape[1], g.shape[0])]
+            if lay is not None:
+                LW, LH, lc = MC.layout_geometry(lay, ctx.sizes, ctx.src_size)
+                sx, sy = g.shape[1] / LW, g.shape[0] / LH
+                cells = [(f'{c.cam}@{c.x},{c.y}', int(c.x * sx), int(c.y * sy), max(1, int(c.w * sx)), max(1, int(c.h * sy))) for c in lc]
+        for name, x, y, w, h in cells:
+            reg = g[y:y + h, x:x + w]
+            if not reg.size:
+                continue
+            p50 = float(np.median(reg))
+            d = float(np.mean(reg < level))
+            if p50 < 2:
+                black.setdefault(name, []).append(j)
+            elif d > cover:
+                near.setdefault(name, []).append(j)
+            lap.setdefault(name, []).append(float(cv2.Laplacian(reg, cv2.CV_32F).var()))
+        n = j + 1
+    return n, cells, black, near, lap
+
+
+def check_video(ctx: MC.Ctx, rep: Report, f: Path, lay: dict | None, gpu: bool = False, frames: int | None = None) -> dict:
+    """Black, near-black and blurred frames of one composed video, per layout cell. `frames` is the count the compositor
+    logged: a video that decodes to another count, or to none, is an error. A GPU decode that fails is tried again on the CPU."""
     level, cover = dark_args(ctx, True)
     a = ctx.args
     bw = float(getattr(a, 'blur_warn', None) or BLUR_WARN)
@@ -522,31 +580,20 @@ def check_video(ctx: MC.Ctx, rep: Report, f: Path, lay: dict | None, gpu: bool =
     fps = float(ctx.take.fps)
     flags: dict = {'frames': 0, 'black': {}, 'near_black': {}, 'blur_fail': {}, 'blur_warn': {}}
     try:
-        cells = None
-        black: dict[str, list[int]] = flags['black']
-        near: dict[str, list[int]] = flags['near_black']
-        lap: dict[str, list[float]] = {}
-        n = 0
-        for j, (g, W, H) in enumerate(video_luma(f, gpu=gpu)):
-            if cells is None:
-                cells = [('frame', 0, 0, g.shape[1], g.shape[0])]
-                if lay is not None:
-                    LW, LH, lc = MC.layout_geometry(lay, ctx.sizes, ctx.src_size)
-                    sx, sy = g.shape[1] / LW, g.shape[0] / LH
-                    cells = [(f'{c.cam}@{c.x},{c.y}', int(c.x * sx), int(c.y * sy), max(1, int(c.w * sx)), max(1, int(c.h * sy))) for c in lc]
-            for name, x, y, w, h in cells:
-                reg = g[y:y + h, x:x + w]
-                if not reg.size:
-                    continue
-                p50 = float(np.median(reg))
-                d = float(np.mean(reg < level))
-                if p50 < 2:
-                    black.setdefault(name, []).append(j)
-                elif d > cover:
-                    near.setdefault(name, []).append(j)
-                lap.setdefault(name, []).append(float(cv2.Laplacian(reg, cv2.CV_32F).var()))
-            n = j + 1
+        try:
+            n, cells, black, near, lap = scan_video(ctx, f, lay, gpu, level, cover)
+        except FF.FfError as e:
+            if not gpu:
+                raise
+            rep.add('warn', 'outputs', f'{f.name}: GPU decode failed ({e}); decoded on the CPU')
+            n, cells, black, near, lap = scan_video(ctx, f, lay, False, level, cover)
         flags['frames'] = n
+        flags['black'], flags['near_black'] = black, near
+        if n == 0:
+            rep.add('error', 'outputs', f'{f.name}: no frame decoded')
+            return flags
+        if frames is not None and frames >= 0 and n != frames:
+            rep.add('error', 'outputs', f'{f.name}: {n} frames decoded, the compositor wrote {frames} (compose_log.json)')
         for kind, bag, what in (('black', black, 'black (luma p50 < 2)'), ('near_black', near, f'near-black (more than {cover:.0%} below {level}/255)')):
             for name, idx in bag.items():
                 rep.add('error', f'output_{kind}', f'{f.name} {name}: {len(idx)} {what} frames at output {time_runs(idx, lambda j: j / fps)}',
@@ -568,18 +615,20 @@ def check_video(ctx: MC.Ctx, rep: Report, f: Path, lay: dict | None, gpu: bool =
                                 frames=fmt_runs(runs(idx)))
         if not black and not near and not blurred:
             rep.add('info', 'outputs', f'{f.name}: {n} frames, {len(cells or [])} region(s), no black, near-black or blurred frame')
-    except (TakeError, OSError, ValueError) as e:
+    except (TakeError, FF.FfError, OSError, ValueError) as e:
         rep.add('error', 'outputs', f'{f.name}: {e}')
     return flags
 
 
 def check_outputs(ctx: MC.Ctx, rep: Report) -> None:
-    vids = output_videos(ctx)
+    vids = output_entries(ctx)
     if not vids:
         rep.add('info', 'outputs', f'no composed videos found (compose_log.json in {ctx.out}; --videos DIR)')
         return
-    for f, lay in vids:
-        check_video(ctx, rep, f, lay)
+    gpu = not getattr(ctx.args, 'cpu', False) and MT.cuda_ok(vids[0]['file'])
+    with ThreadPoolExecutor(max(1, min(VIDEO_JOBS, len(vids)))) as pool:
+        list(pool.map(lambda e: check_video(ctx, rep, e['file'], e['lay'], gpu, e['frames']), vids))
+    rep.add('info', 'outputs', f'{len(vids)} composed video(s) decoded on the {"GPU" if gpu else "CPU"}')
 
 def check_track(ctx: MC.Ctx, rep: Report) -> None:
     try:
@@ -618,6 +667,9 @@ def cmd_qa(ctx: MC.Ctx) -> int:
     doc = {'take': str(ctx.take.root), 'kind': ctx.take.kind, 'cameras': list(ctx.take.cams), 'frames': len(ctx.take.base),
            'errors': errors, 'warnings': warns, 'exit': code, 'items': rep.items}
     (ctx.out / 'qa.json').write_text(json.dumps(doc, indent=1, default=str), encoding='utf-8')
+    MC.wrote(ctx.out / 'qa.json')
+    MC.wrote(ctx.out / 'qa.txt')
+    summarize(rep)
     lines = [f'QA {ctx.take.root} ({ctx.take.kind}): {len(ctx.take.cams)} cameras, {len(ctx.take.base)} output frames, '
              f'{errors} errors, {warns} warnings -> exit {code}']
     order = {'error': 0, 'warn': 1, 'info': 2}
@@ -662,14 +714,10 @@ def tile_grid(tiles: list[list[np.ndarray | None]], row_titles: list[str], col_t
 def sheet_times(ctx: MC.Ctx, tl: MT.Timeline, every: float | None, count: int | None) -> list[int]:
     n = len(tl)
     if count:
-        return sorted(set(np.linspace(0, n - 1, count).round().astype(int).tolist()))
+        return sorted(set(np.linspace(0, n - 1, max(1, int(count))).round().astype(int).tolist()))
     t0, t1 = tl[0].t, tl[n - 1].t
-    ks = []
-    t = t0
-    while t <= t1 + 1e-9:
-        ks.append(tl.frame_at(t))
-        t += every
-    return sorted(set(ks))
+    every = max(float(every or 1.0), 1.0 / max(tl.fps, 1e-6))
+    return sorted({tl.frame_at(t0 + i * every) for i in range(int((t1 - t0) / every + 1e-9) + 1)})
 
 
 def cam_caption(ctx: MC.Ctx, cam: str) -> str:
@@ -867,10 +915,12 @@ def cmd_paths(ctx: MC.Ctx) -> int:
         if ok.any():
             top.plot(tr['x'][ok], tr['z'][ok], '--', color='#9a9a9a', lw=1, label=f'target {name}'[:40])
             side.plot(tr['x'][ok], tr['y'][ok], '--', color='#9a9a9a', lw=1)
-    top.axhline(MT_PLAYER_Z, color='#dc5046', lw=1.2, ls=':')
-    lo, hi = top.get_ylim()
-    top.axhspan(MT_PLAYER_Z, max(hi, MT_PLAYER_Z + 1), color='#dc5046', alpha=0.08)
-    top.text(top.get_xlim()[0], MT_PLAYER_Z + 0.2, '  set side (z > -2): no cameras unless looking down', color='#dc5046', fontsize=9)
+    side_z = side_limit(ctx)
+    if side_z is not None:
+        top.axhline(side_z, color='#dc5046', lw=1.2, ls=':')
+        lo, hi = top.get_ylim()
+        top.axhspan(side_z, max(hi, side_z + 1), color='#dc5046', alpha=0.08)
+        top.text(top.get_xlim()[0], side_z + 0.2, f'  set side (z > {side_z:g}): no cameras unless looking down', color='#dc5046', fontsize=9)
     top.set_aspect('equal', adjustable='datalim')
     side.set_aspect('equal', adjustable='datalim')
     top.legend(facecolor='#18181b', labelcolor='#d8d2c0', fontsize=9, loc='upper right')
@@ -879,6 +929,7 @@ def cmd_paths(ctx: MC.Ctx) -> int:
     fig.tight_layout()
     out = ctx.out / 'paths.png'
     fig.savefig(out, dpi=110, facecolor=fig.get_facecolor())
+    MC.wrote(out)
     print(f'wrote {out}')
     return 0
 
@@ -946,6 +997,7 @@ def cmd_timeline(ctx: MC.Ctx) -> int:
     fig.tight_layout()
     out = ctx.out / 'timeline.png'
     fig.savefig(out, dpi=100, facecolor=fig.get_facecolor())
+    MC.wrote(out)
     print(f'wrote {out}')
     return 0
 
@@ -974,6 +1026,9 @@ def cmd_diverge(ctx: MC.Ctx) -> int:
         pa = np.stack([ta[k][oka] for k in 'xyz'], 1)
         sel = (t >= tb_['game_time'][okb].min()) & (t <= tb_['game_time'][okb].max())
         t, pa = t[sel], pa[sel]
+        if not len(t):
+            print(f'{name[:40]:<40} no common game time in the two takes, skipped')
+            continue
         pb = np.stack([np.interp(t, tb_['game_time'][okb], tb_[k][okb]) for k in 'xyz'], 1)
         d = np.linalg.norm(pa - pb, axis=1)
         first = t[np.argmax(d > 0.05)] if (d > 0.05).any() else None
@@ -984,6 +1039,7 @@ def cmd_diverge(ctx: MC.Ctx) -> int:
               f'> 5 cm from {r["first_over_5cm"]}')
     (ctx.out / 'diverge.json').write_text(json.dumps({'a': str(ctx.take.root), 'b': str(tb.root), 'targets': rows}, indent=1),
                                           encoding='utf-8')
+    MC.wrote(ctx.out / 'diverge.json')
     print(f'wrote {ctx.out / "diverge.json"}')
     return 0
 
@@ -993,13 +1049,15 @@ def cmd_diverge(ctx: MC.Ctx) -> int:
 GOLDEN_NOISE = (0, 1, 16, 120)
 
 
-def standalone_out(args, name: str) -> Path:
-    out = Path(args.out).resolve() if getattr(args, 'out', None) else (MT.OUT_ROOT / MC.safe_name(name)).resolve()
-    base = MT.OUT_ROOT.resolve()
-    if base not in out.parents and out != base and not getattr(args, 'force', False):
-        raise SystemExit(f'output {out} is outside {base}; pass --force to write there')
-    out.mkdir(parents=True, exist_ok=True)
-    return out
+def standalone_out(args, name: str, take_root: Path | None = None) -> Path:
+    """Output folder of replaydiff / audiosync: --out, else the place mcam_compose.py would use for a take of that name."""
+    if getattr(args, 'out', None):
+        out = Path(args.out).resolve()
+    else:
+        root = Path(take_root if take_root is not None else args.take).resolve()
+        out, why = MC.default_out(root, name, read_json(root / 'spec.json'))
+        print(f'output folder: {out} ({why})', file=sys.stderr, flush=True)
+    return MC.claim_out(out, bool(getattr(args, 'force', False)))
 
 
 def read_json(path: Path) -> dict:
@@ -1119,7 +1177,10 @@ def pad_rect(r: tuple, pad: int, W: int, H: int) -> tuple:
 def load_exclusions(path: str | None) -> list[dict]:
     if not path:
         return []
-    doc = json.loads(Path(path).read_text(encoding='utf-8'))
+    try:
+        doc = json.loads(Path(path).read_text(encoding='utf-8'))
+    except (OSError, ValueError) as e:
+        raise SystemExit(f'--exclude {path}: {e}') from None
     items = doc.get('exclude', []) if isinstance(doc, dict) else doc
     out = []
     for i, it in enumerate(items or []):
@@ -1221,7 +1282,7 @@ def golden_paths(args) -> tuple[Path, Path, dict]:
     if args.record:
         rec = Path(args.record).resolve()
     else:
-        rec = MT.find_record_dir(gdir, grun, 'golden') or MT.find_record_dir(root, run, str(run.get('mode') or ''))
+        rec = MA.find_record_dir(gdir, grun, 'golden') or MA.find_record_dir(root, run, str(run.get('mode') or ''))
     if rec is None or not (rec / 'game').is_dir():
         raise FileNotFoundError(f'record folder with game/ frames not found ({rec}); record with replay.record.captureGame true '
                                 f'or pass --record <dir>')
@@ -1270,6 +1331,9 @@ def cmd_replaydiff(args) -> int:
         t = (target or '').lower()
         return any(k == '*' or k in t for k in sil_keys)
     probe = load_rgb(rec_files[samples[0]])
+    if probe is None:
+        print(f'error: {rec_files[samples[0]]} does not decode', file=sys.stderr)
+        return 2
     H, W = probe.shape[:2]
     warns = []
     if not poses:
@@ -1397,6 +1461,10 @@ def cmd_replaydiff(args) -> int:
            'excluded': {k: {'samples': len(v), 'psnr_min': min(v), 'psnr_median': float(np.median(v))} for k, v in excluded.items()},
            'unexplained_top': unexplained, 'warnings': warns, 'rows': rows}
     (out / 'replaydiff.json').write_text(json.dumps(doc, indent=1, default=str), encoding='utf-8')
+    for name in ('replaydiff.json', 'replaydiff.txt'):
+        MC.wrote(out / name)
+    summarize(errors=[f'{c["check"]}: worst {c["worst"]} ({c["unit"]}), {c["failed"]}/{c["n"]} failed' for c in checks if not c['ok']],
+              warnings=list(warns), out=str(out))
     lines = [f'REPLAYDIFF {"PASS" if passed else "FAIL"}: {len(rows)} sample(s), noise N {N if math.isfinite(N) else "n/a"} '
              f'(N1 {nz.get("N1")}, N16 {nz.get("N16")}, N120 {nz.get("N120")})']
     for c in checks:
@@ -1459,7 +1527,7 @@ def replaydiff_sheet(rows: list[dict], rec_files: dict, gold_files: dict, path: 
 def onset(x: np.ndarray, start: int, sr: int, thr_db: float, rise_db: float = 12.0, window_s: float = 0.5) -> dict:
     start = max(0, int(start))
     seg = np.abs(x[start:start + int(window_s * sr)]).astype(np.float64)
-    pre_db = MT.dbfs(x[max(0, start - int(0.1 * sr)):start])
+    pre_db = MA.dbfs(x[max(0, start - int(0.1 * sr)):start])
     if not len(seg):
         return {'abs_ms': None, 'rel_ms': None, 'pre_dbfs': round(pre_db, 1)}
     thr = 10 ** (thr_db / 20.0)
@@ -1505,14 +1573,17 @@ def cmd_audiosync(args) -> int:
         return 2
     run = read_json(root / 'run.json')
     mode = str(run.get('mode') or '')
-    rec = Path(args.record).resolve() if args.record else MT.find_record_dir(root, run, mode)
-    out = standalone_out(args, (run.get('name') or root.name) + '_audiosync')
+    rec = Path(args.record).resolve() if args.record else MA.find_record_dir(root, run, mode)
+    out = standalone_out(args, (run.get('name') or root.name) + '_audiosync', root)
     rep = Report()
     doc: dict = {'take': str(root), 'record': str(rec) if rec else None}
 
     def finish(code: int) -> int:
         doc.update({'errors': rep.count('error'), 'warnings': rep.count('warn'), 'exit': code, 'items': rep.items})
         (out / 'audiosync.json').write_text(json.dumps(doc, indent=1, default=str), encoding='utf-8')
+        for name in ('audiosync.json', 'audiosync.txt'):
+            MC.wrote(out / name)
+        summarize(rep, out=str(out))
         order = {'error': 0, 'warn': 1, 'info': 2}
         lines = [f'AUDIOSYNC {root}: {rep.count("error")} errors, {rep.count("warn")} warnings -> exit {code}']
         for it in sorted(rep.items, key=lambda i: order[i['level']]):
@@ -1534,14 +1605,15 @@ def cmd_audiosync(args) -> int:
         rep.add('error', 'capture', st['verdict'])
         return finish(2)
     try:
-        w = MT.read_wav(rec / 'audio.wav')
-    except TakeError as e:
-        rep.add('error', 'wav', str(e))
+        w = MA.load_wav(rec / 'audio.wav')
+        fps = MA.take_fps(root, run)
+    except (MA.AudioError, OSError) as e:
+        rep.add('error', 'wav' if 'fps' not in str(e) else 'fps', str(e))
         return finish(2)
     for p in w.problems:
         rep.add('error', 'wav_riff', f'audio.wav: {p}')
     rep.add('info', 'wav', f'audio.wav: {w.rate} Hz, {w.channels} ch, {w.bits} bit, {w.seconds:.3f} s, {len(w.markers)} cue markers, '
-                           f'RMS {MT.dbfs(w.mono()):.1f} dBFS')
+                           f'RMS {MA.dbfs(w.mono()):.1f} dBFS')
     rm = MT.read_csv(rec / 'record_meta.csv')
     rt = np.array([MT.fnum(r.get('game_time')) for r in rm])
     rr = np.array([MT.fnum(r.get('real_time')) for r in rm])
@@ -1559,16 +1631,18 @@ def cmd_audiosync(args) -> int:
                                          f'total (cut by mcam_audio.py track)', at=[round(float(rt[i]), 3) for i in big[:10]])
     else:
         rep.add('warn', 'record_meta', 'record_meta.csv missing or empty: event offsets need it')
-    fit = MT.fit_markers(w, MT.read_csv(rec / 'audio_sync.csv'), real_of_game)
+    fit = MA.fit_markers(w, MT.read_csv(rec / 'audio_sync.csv'), real_of_game)
     doc['fit'] = fit
-    fps = MT.fnum(run.get('fps'), 30.0)
+    doc['fps'] = fps
     frame_ms = 1000.0 / fps
     if not fit['ok']:
         rep.add('error', 'fit', fit['reason'])
     else:
-        lvl = 'error' if fit['slope_error'] >= MT.SLOPE_LIMIT else 'info'
+        if fit.get('byte_offsets'):
+            rep.add('info', 'markers', 'the WAV cue positions are byte offsets: divided by the frame size for the fit')
+        lvl = 'error' if fit['slope_error'] >= MA.SLOPE_LIMIT else 'info'
         rep.add(lvl, 'slope', f'fit slope {fit["a"]:.1f} samples/s = {fit["ratio"]:.5f} x the fmt rate {w.rate} '
-                              f'({fit["slope_error"] * 100:.3f} %, limit {MT.SLOPE_LIMIT * 100:g} %)')
+                              f'({fit["slope_error"] * 100:.3f} %, limit {MA.SLOPE_LIMIT * 100:g} %)')
         q = int(fit.get('quantum') or 1)
         q_ms = q / w.rate / math.sqrt(12.0) * 1000.0 if q > 1 else 0.0
         limit = max(float(args.residual_ms), 1.25 * q_ms)
@@ -1606,8 +1680,8 @@ def cmd_audiosync(args) -> int:
             rep.add('warn', 'track', 'no audio_track.wav in the take (run mcam_audio.py track)')
         else:
             try:
-                tw = MT.read_wav(track_path)
-            except TakeError as e:
+                tw = MA.load_wav(track_path)
+            except (MA.AudioError, OSError) as e:
                 rep.add('error', 'track', str(e))
             if tw is not None:
                 for p in tw.problems:
@@ -1631,7 +1705,7 @@ def cmd_audiosync(args) -> int:
             p = int(round(fit['a'] * mf['real'][k] + fit['b']))
             if len(x) < win or p - m < 0 or p + win + m > len(mono) or not math.isfinite(mf['real'][k]):
                 continue
-            if MT.dbfs(x) < -60.0:
+            if MA.dbfs(x) < -60.0:
                 skipped += 1
                 continue
             lag, corr = xcorr_offset(x, mono[p - m:p + win + m], m)
@@ -1736,20 +1810,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--no-blur', action='store_true', help='qa: skip the blur check of composed videos')
     p.add_argument('--videos', action='append', help='qa: folder with compose_log.json of the composed videos (default the QA out folder)')
     p.add_argument('--no-outputs', action='store_true', help='qa: skip the black-frame check of the composed videos')
+    p.add_argument('--cpu', action='store_true', help='qa: decode the composed videos on the CPU (default: on the GPU when it works)')
+    p.add_argument('--no-side-check', action='store_true', help='qa, paths: no player-side rule (cameras behind z > limit, cameras '
+                                                                'looking back); the limit is compose.qa.playerSideZ, default -2')
+    p.add_argument('--json', action='store_true', help='one JSON object on stdout at the end (ok, exit, errors, warnings, written); '
+                                                       'the report text goes to stderr')
     p.add_argument('--taa')
     p.add_argument('--rate', type=float)
     p.add_argument('--group', type=int)
     p.add_argument('--event', action='append')
     p.add_argument('--fps', type=float)
     p.add_argument('--threads', type=int, default=0)
-    p.add_argument('--force', action='store_true')
+    p.add_argument('--force', action='store_true', help='overwrite foreign files in the output folder')
     p.add_argument('--labels', dest='labels', action='store_true', default=None)
     p.add_argument('--no-labels', dest='labels', action='store_false')
     return p
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def run_command(args) -> int:
     if args.command in STANDALONE:
         return STANDALONE[args.command](args)
     try:
@@ -1758,19 +1836,55 @@ def main(argv: list[str] | None = None) -> int:
             raise TakeError('no complete output frames')
     except (TakeError, OSError) as e:
         print(f'error: unreadable take: {e}', file=sys.stderr)
+        summarize(errors=[f'unreadable take: {e}'])
         if args.command == 'qa' and args.out:
             out = Path(args.out)
             out.mkdir(parents=True, exist_ok=True)
             (out / 'qa.json').write_text(json.dumps({'take': args.take, 'exit': 2, 'error': str(e)}, indent=1), encoding='utf-8')
-        return 2
-    ctx = MC.make_ctx(take, args)
+        return EXIT_INPUT
+    try:
+        ctx = MC.make_ctx(take, args)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise SystemExit(f'cannot read the compose settings: {type(e).__name__}: {e}') from None
+    summarize(out=str(ctx.out), warnings=list(take.warnings))
     try:
         return COMMANDS[args.command](ctx)
-    except TakeError as e:
-        print(f'error: {e}', file=sys.stderr)
-        return 1
     finally:
         ctx.store.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    FF.utf8_stdio()
+    args = build_parser().parse_args(argv)
+    js = FF.JsonMode(args.json)
+    SUMMARY.clear()
+    del MC.WRITTEN[:]
+    del MC.NOTES[:]
+    extra: list[str] = []
+
+    def fail(code: int, text: str, prefix: str = 'error: ') -> int:
+        extra.append(text)
+        print(prefix + text, file=sys.stderr, flush=True)
+        return code
+
+    try:
+        code = run_command(args)
+    except MC.Refused as e:
+        code = fail(EXIT_REFUSED, str(e.code), '')
+    except SystemExit as e:
+        if not isinstance(e.code, str):
+            raise
+        code = fail(EXIT_INPUT, e.code, '')
+    except (TakeError, FF.FfError, MA.AudioError) as e:
+        code = fail(EXIT_BAD, str(e))
+    except KeyboardInterrupt:
+        code = fail(EXIT_BAD, 'interrupted')
+    except OSError as e:
+        code = fail(EXIT_BAD, f'{type(e).__name__}: {e}')
+    js.finish({'ok': code == EXIT_OK, 'exit': code, 'command': args.command, 'take': str(Path(args.take).resolve()),
+               'out': SUMMARY.get('out'), 'errors': list(SUMMARY.get('errors') or []) + extra,
+               'warnings': list(SUMMARY.get('warnings') or []) + list(MC.NOTES), 'written': list(dict.fromkeys(MC.WRITTEN))})
+    return code
 
 
 if __name__ == '__main__':

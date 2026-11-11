@@ -1,12 +1,20 @@
 """scene.srec tool (REPLAY_DESIGN 4.2, 4.4, 8.3 REC; encoding notes in the header of src/InsideDev/Runtime/SrecFormat.cs).
 
+Files of a newer recorder are read as far as this tool knows them: unknown blocks and sections are skipped by their
+length, extra bytes at the end of the header are ignored, header fields a file does not have yet read as their defaults,
+and a content version above the one this tool knows is reported (verify --strict then fails).
+Exit codes: 0 ok, 1 the result is bad (verify problems, a failed report check), 2 the file is not readable or a usage error.
+
 Commands (PATH = a .srec file or a folder holding scene.srec or record/scene.srec):
-  info PATH [--json]                      header, counts, durations, section sizes, truncation
+  info PATH [--json] [--fast]             header, counts, durations, section sizes, truncation (--fast: block headers,
+                                          stamps and the index only, no CRC and no sample decoding; no section sizes)
   verify PATH [--strict] [--size] [--json] CRC, block structure, samples, ids, OBJA/OBJD, string refs, INDX and SEND,
                                           record_meta.csv / objects.tsv rows, size formula of 4.4 (exit 0 ok, 1 problems;
                                           a crash prefix passes unless --strict)
-  objects PATH [FILTER] [--kind K]        object table as TSV (id kind path owner comps first last keys ...)
-  export PATH ID|virtual|stamps|events [--out CSV]   one object's keys on every channel, the virtual channel, stamps or events
+  objects PATH [FILTER] [--kind K] [--json]  object table as TSV (id kind path owner comps first last keys ...) or JSON
+  export PATH WHAT [--out CSV]            WHAT = an object id, or an object path / path suffix / name (one object's keys on
+                                          every channel), virtual, stamps, events, render (fog / post fields by name),
+                                          shader or shader:<channel id or property name> (shader channel values)
   dump PATH [--out JSON]                  canonical event list (one JSON event per sample; the same list the C# reader produces)
   synth OUT_DIR [--samples N] [--rate R] [--seed S] [--jitter J] [--hitch] [--truth] [--no-sidecars] [--no-shader]
                                           deterministic synthetic recording (every section, a slow rotator and a slow
@@ -26,6 +34,7 @@ import csv
 import fnmatch
 import json
 import math
+import mmap
 import random
 import re
 import struct
@@ -34,11 +43,12 @@ import zlib
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 MAGIC = 0x43525349
 VERSION = 1
 TAG_HEAD, TAG_OBJECTS, TAG_SAMPLE, TAG_INDEX, TAG_END = 0x44485253, 0x544A424F, 0x4C504D53, 0x58444E49, 0x444E4553
+KNOWN_TAGS = frozenset({TAG_HEAD, TAG_OBJECTS, TAG_SAMPLE, TAG_INDEX, TAG_END})
 KIND_NAMES = ("transform", "boyBone", "clothBone", "particles", "light", "material", "probe", "spawned", "rope", "renderer")
 K_TRANSFORM, K_BOYBONE, K_CLOTHBONE, K_PARTICLES, K_LIGHT, K_MATERIAL, K_PROBE, K_SPAWNED, K_ROPE, K_RENDERER = range(10)
 (S_XF, S_FLAGS, S_PARTICLES, S_LIGHTS, S_MATERIALS, S_VIRTUAL, S_OBJADD, S_OBJDEL, S_PROBES, S_RENDER, S_EVENTS,
@@ -53,6 +63,12 @@ CONTENT_VERSION = 2
 SH_GLOBAL, SH_MATERIAL, SH_BLOCK = 0, 1, 2
 SH_SCOPE_NAMES = ("global", "material", "block")
 DELTA_SECTIONS = frozenset({S_XF, S_FLAGS, S_LIGHTS, S_PROBES, S_CAMACTIVE, S_SHAREDMAT})
+SECTION_EVENT = {S_XF: "Xf", S_FLAGS: "Flags", S_PARTICLES: "Particles", S_LIGHTS: "Light", S_MATERIALS: "Material",
+                 S_VIRTUAL: "Virtual", S_OBJADD: "ObjAdd", S_OBJDEL: "ObjDel", S_PROBES: "Probe", S_RENDER: "Render",
+                 S_EVENTS: "Event", S_MATPROP: "MatProp", S_CAMACTIVE: "CamActive", S_ROPE: "Rope", S_SHAREDMAT: "SharedMat",
+                 S_SHADERDEF: "ShaderDef", S_SHADERVAL: "ShaderVal"}
+OBJECT_EVENTS = frozenset({"Xf", "Flags", "Particles", "Light", "Material", "MatProp", "ObjAdd", "ObjDel", "Probe", "CamActive",
+                           "Rope", "SharedMat"})
 KEY_SECTIONS = frozenset({S_XF, S_FLAGS, S_PARTICLES, S_LIGHTS, S_MATERIALS, S_PROBES, S_CAMACTIVE, S_ROPE, S_SHAREDMAT})
 XF_POS, XF_ROT, XF_SCALE, XF_CUT, XF_PARENT, XF_PREKEY = 1, 2, 4, 8, 16, 32
 FL_ACTIVE, FL_RENDERER, FL_KINEMATIC, FL_LIGHT = 1, 2, 4, 8
@@ -78,6 +94,9 @@ HEADER_FIELDS = (("version", "i32"), ("created", "str"), ("spec", "str"), ("leve
                  ("cameraDriven", "strs"), ("posEps", "f32"), ("rotEps", "f32"), ("cut", "f32"), ("vSyncCount", "i32"),
                  ("targetFrameRate", "i32"), ("refreshRate", "i32"))
 HEADER_DEFAULTS: dict[str, Any] = {"version": 1, "clock": "real", "subscene": -1, "savepoint": -1}
+HEADER_STOPS = frozenset({6, 12, 17, 20, 22, 23, 26})
+HEADER_BASE = 29
+MAX_MAT_PROPS, MAX_MAT_SLOTS, MAX_RENDER_FIELDS, MAX_STRING_GAP = 4096, 1024, 4096, 65536
 
 _U16, _U32, _I32 = struct.Struct("<H"), struct.Struct("<I"), struct.Struct("<i")
 _U64, _I64 = struct.Struct("<Q"), struct.Struct("<q")
@@ -281,9 +300,25 @@ def write_header(b: Buf, h: dict[str, Any]) -> None:
             getattr(b, kind)(v)
 
 
-def read_header(c: Cursor) -> dict[str, Any]:
+def header_default(name: str, kind: str) -> Any:
+    return HEADER_DEFAULTS.get(name, [] if kind == "strs" else "" if kind == "str" else 0.0 if kind in ("f32", "f64") else 0)
+
+
+def read_header(c: Cursor, missing: list[str] | None = None) -> dict[str, Any]:
+    """SRHD fields in order (the rule of SrecCodec.ReadHeader). Fields are only ever appended: a payload that ends after
+    one of the field groups (HEADER_STOPS: field counts at which a header may end; from HEADER_BASE fields on, after any
+    field) is an older file and the rest reads as the defaults (names go to `missing`); bytes after the last known field
+    stay unread (a newer file); a payload that ends anywhere else is damaged (SrecError)."""
     h: dict[str, Any] = {}
-    for name, kind in HEADER_FIELDS:
+    short = False
+    for i, (name, kind) in enumerate(HEADER_FIELDS):
+        if not short and c.pos >= c.end and (i in HEADER_STOPS or i >= HEADER_BASE):
+            short = True
+        if short:
+            h[name] = header_default(name, kind)
+            if missing is not None:
+                missing.append(name)
+            continue
         h[name] = c.str_() if kind == "str" else c.strs() if kind == "strs" else getattr(c, kind)()
     return h
 
@@ -507,10 +542,29 @@ class Recording:
     warnings: list[str] = field(default_factory=list)
     events: list[list[Any]] | None = None
     shader: list[dict[str, Any]] = field(default_factory=list)
+    content_version: int = 0
+    newer: str = ""
+    header_extra: int = 0
+    header_missing: list[str] = field(default_factory=list)
+    unknown_blocks: Counter = field(default_factory=Counter)
+    unknown_sections: Counter = field(default_factory=Counter)
+    fast: bool = False
 
     @property
     def truncated(self) -> bool:
         return not self.complete
+
+    def close(self) -> None:
+        """Releases the file of a mapped read (read_srec(..., map_file=True)); particle_bytes needs it open."""
+        m, fh = getattr(self, "_map", None), getattr(self, "_fh", None)
+        self._data = b""
+        for x in (m, fh):
+            if x is not None:
+                try:
+                    x.close()
+                except (BufferError, OSError, ValueError):
+                    pass
+        self._map = self._fh = None
 
     @property
     def samples(self) -> int:
@@ -527,23 +581,34 @@ class Recording:
     def particle_bytes(self, oid: int, sample: int) -> bytes | None:
         for s, _entry, data_off, n in self.frames.get(oid, ()):
             if s == sample:
-                return self._data[data_off:data_off + n * PARTICLE_BYTES]
+                return bytes(self._data[data_off:data_off + n * PARTICLE_BYTES])
         return None
 
 
 class _Reader:
-    def __init__(self, rec: Recording, data: bytes, events: bool) -> None:
+    """kinds: the event names to produce (None = all); keep: a further test per event; sink: called with each event
+    instead of collecting them in Recording.events (a dump of a long take then needs no event list in memory)."""
+
+    def __init__(self, rec: Recording, data: Any, events: bool, kinds: Iterable[str] | None = None,
+                 keep: Callable[[list[Any]], bool] | None = None, sink: Callable[[list[Any]], None] | None = None) -> None:
         self.rec = rec
         self.data = data
         self.mv = memoryview(data)
-        self.ev: list[list[Any]] | None = [] if events else None
+        self.ev: list[list[Any]] | None = [] if events or sink is not None else None
+        self.kinds = None if kinds is None else frozenset(kinds)
+        self.keep = keep
+        self.sink = sink
         self.header_seen = self.objects_seen = self.begun = False
         self.parents: list[int] = []
         self.renumbered = 0
         self.bad_ref = False
 
     def emit(self, e: list[Any]) -> None:
-        if self.ev is not None:
+        if self.ev is None or (self.kinds is not None and e[0] not in self.kinds) or (self.keep is not None and not self.keep(e)):
+            return
+        if self.sink is not None:
+            self.sink(e)
+        else:
             self.ev.append(e)
 
     def run(self) -> None:
@@ -585,7 +650,7 @@ class _Reader:
                     " (last block of the file)" if last else " (data follows: corrupt, not a crash prefix)")
                 kind = "crc_last" if last else "corrupt"
                 break
-            if not self.header_seen and tag != TAG_HEAD:
+            if not self.header_seen and tag in KNOWN_TAGS and tag != TAG_HEAD:
                 stop, kind = f"first block is {name}, not SRHD", "structure"
                 break
             try:
@@ -615,7 +680,7 @@ class _Reader:
             self.begin()
         self.emit(["End", rec.samples, 0 if rec.complete else 1, list(rec.strings),
                    [[o["first"], o["last"], o["keys"]] for o in rec.objects]])
-        rec.events = self.ev
+        rec.events = self.ev if self.sink is None else None
 
     def block(self, tag: int, pos: int, length: int) -> None:
         c = Cursor(self.mv, pos + 8, pos + 8 + length)
@@ -624,8 +689,9 @@ class _Reader:
             if self.header_seen:
                 rec.warnings.append(f"second SRHD at offset {pos} ignored")
                 return
-            rec.header = read_header(c)
+            rec.header = read_header(c, rec.header_missing)
             self.header_seen = True
+            note_header(rec, c.end - c.pos)
         elif tag == TAG_OBJECTS:
             if self.objects_seen or self.begun:
                 raise SrecError("OBJT after the first sample or twice")
@@ -649,6 +715,11 @@ class _Reader:
         elif tag == TAG_END:
             rec.send = (c.u64(), c.u32())
             rec.complete = True
+        else:
+            name = tag_name(tag)
+            if not rec.unknown_blocks[name]:
+                rec.warnings.append(f"unknown block {name} at offset {pos} skipped ({length} bytes; a block this tool does not know)")
+            rec.unknown_blocks[name] += 1
 
     def begin(self) -> None:
         self.begun = True
@@ -697,7 +768,9 @@ class _Reader:
             if sid == S_STRINGS:
                 continue
             if sid not in SECTION_NAMES:
-                rec.warnings.append(f"sample {index}: unknown section {sid} skipped") if len(rec.warnings) < 50 else None
+                if not rec.unknown_sections[sid]:
+                    rec.warnings.append(f"sample {index}: unknown section {sid} skipped (and in every later sample that has it)")
+                rec.unknown_sections[sid] += 1
                 continue
             sc = Cursor(self.mv, a, b)
             self.section(sid, sc, index, st)
@@ -711,10 +784,12 @@ class _Reader:
         for _ in range(n):
             sid = c.int_()
             s = c.str_()
-            if sid < len(rec.strings):
+            if 0 <= sid < len(rec.strings):
                 if rec.strings[sid] != s:
                     rec.problem(f"string {sid} redefined")
                 continue
+            if sid < 0 or sid - len(rec.strings) > MAX_STRING_GAP:
+                raise SrecError(f"string id {sid} is not valid ({len(rec.strings)} strings known)")
             if sid > len(rec.strings):
                 rec.problem(f"string table gap before id {sid}")
             while len(rec.strings) < sid:
@@ -764,7 +839,7 @@ class _Reader:
         n = c.count(1)
         rec.section_entries[sid] += n
         prev = 0
-        emit = self.ev is not None
+        emit = self.ev is not None and (self.kinds is None or SECTION_EVENT.get(sid) in self.kinds)
         for _ in range(n):
             if sid == S_SHADERDEF:
                 self.shader_def(c, s)
@@ -838,6 +913,8 @@ class _Reader:
             elif sid == S_MATERIALS:
                 kind = c.u8()
                 prop = c.int_()
+                if not 0 <= prop < MAX_MAT_PROPS:
+                    raise SrecError(f"material property index {prop} of id {oid}")
                 value: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0)
                 texture = -1
                 if kind == MAT_FLOAT:
@@ -881,6 +958,8 @@ class _Reader:
             elif sid == S_RENDER:
                 fld = c.int_()
                 typ = c.u8()
+                if not 0 <= fld < MAX_RENDER_FIELDS:
+                    raise SrecError(f"render field {fld}")
                 if typ == VAL_FLOAT:
                     value = (c.f32(), 0.0, 0.0, 0.0)
                 elif typ == VAL_VEC4:
@@ -906,6 +985,8 @@ class _Reader:
                     self.emit(["Rope", s, oid, count, [cf(v) for p in verts for v in p]])
             elif sid == S_SHAREDMAT:
                 slot = c.int_()
+                if not 0 <= slot < MAX_MAT_SLOTS:
+                    raise SrecError(f"shared material slot {slot} of id {oid}")
                 material = self.sref(c.ref())
                 if emit:
                     self.emit(["SharedMat", s, oid, slot, material])
@@ -1005,12 +1086,114 @@ def resolve(path: Path) -> Path:
     return path
 
 
-def read_srec(path: Path, events: bool = False) -> Recording:
+def note_header(rec: Recording, extra: int) -> None:
+    """Messages about a header that is older or newer than this tool."""
+    h = rec.header or {}
+    rec.content_version = int(h.get("version", 1))
+    rec.header_extra = max(0, extra)
+    if rec.content_version > CONTENT_VERSION:
+        rec.newer = (f"content version {rec.content_version} is newer than this tool reads ({CONTENT_VERSION}): blocks, sections "
+                     f"and header fields it does not know are skipped and values may be misread; update the tools")
+        rec.warnings.append(rec.newer)
+    if rec.header_extra:
+        rec.warnings.append(f"SRHD has {rec.header_extra} more byte(s) than this tool reads (header fields of a newer recorder, ignored)")
+    if rec.header_missing:
+        rec.warnings.append(f"SRHD ends before {len(rec.header_missing)} field(s) (an older file): defaults for "
+                            + ", ".join(rec.header_missing[:8]) + (" ..." if len(rec.header_missing) > 8 else ""))
+
+
+def open_data(path: Path, rec: Recording, map_file: bool) -> Any:
+    if map_file and path.stat().st_size > 0:
+        fh = path.open("rb")
+        try:
+            m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        except (OSError, ValueError):
+            fh.close()
+            return path.read_bytes()
+        rec._map, rec._fh = m, fh
+        return m
+    return path.read_bytes()
+
+
+def read_srec(path: Path, events: bool = False, kinds: Iterable[str] | None = None,
+              keep: Callable[[list[Any]], bool] | None = None, map_file: bool = False,
+              sink: Callable[[list[Any]], None] | None = None) -> Recording:
+    """Reads a recording. events: collect the canonical events (kinds / keep narrow them, sink receives them instead of
+    Recording.events). map_file: map the file instead of loading it; the file then stays open until Recording.close()
+    (or the end of the process), so it cannot be deleted or replaced on Windows while the Recording is in use."""
     path = resolve(path)
-    data = path.read_bytes()
     rec = Recording(path=path)
+    data = open_data(path, rec, map_file)
     rec._data = data
-    _Reader(rec, data, events).run()
+    _Reader(rec, data, events, kinds, keep, sink).run()
+    return rec
+
+
+def fast_read(path: Path) -> Recording:
+    """Block headers, the header, the object table, the sample stamps and INDX / SEND only: no CRC check and no sample is
+    decoded. The Recording has stamps without key counts, the objects of OBJT with the key statistics of INDX, and the
+    particle frame table of INDX."""
+    path = resolve(path)
+    rec = Recording(path=path, fast=True)
+    data = open_data(path, rec, True)
+    rec._data = data
+    rec.size = len(data)
+    if len(data) < 8:
+        rec.fatal = "not a scene.srec: shorter than the 8-byte preamble"
+        return rec
+    magic, rec.version, rec.file_flags = _PREAMBLE.unpack_from(data, 0)
+    if magic != MAGIC:
+        rec.fatal = f"not a scene.srec: magic 0x{magic:08X}"
+        return rec
+    if rec.version > VERSION:
+        rec.fatal = f"scene.srec version {rec.version} is newer than this reader ({VERSION})"
+        return rec
+    rd = _Reader(rec, data, False)
+    pos = rec.readable = 8
+    try:
+        while pos < len(data) and not rec.complete:
+            if len(data) - pos < 12:
+                rec.stop, rec.stop_kind = f"incomplete block header at offset {pos}", "incomplete"
+                break
+            tag, length = _FRAME.unpack_from(data, pos)
+            if length > len(data) - pos - 12:
+                rec.stop, rec.stop_kind = f"incomplete {tag_name(tag)} block at offset {pos}", "incomplete"
+                break
+            c = Cursor(rd.mv, pos + 8, pos + 8 + length)
+            if tag == TAG_HEAD and rec.header is None:
+                rec.header = read_header(c, rec.header_missing)
+                note_header(rec, c.end - c.pos)
+            elif tag == TAG_OBJECTS and not rec.objects:
+                for _ in range(c.count(8)):
+                    rec.objects.append(read_object(c))
+            elif tag == TAG_SAMPLE:
+                _, game_time, real_time, logic, frame, fixed, flags = c._s(_STAMP)
+                rec.stamps.append({"sample": len(rec.stamps), "gameTime": game_time, "realTime": real_time, "logicStep": logic,
+                                   "frameCount": frame, "fixedSteps": fixed, "flags": flags, "offset": pos, "bytes": 12 + length,
+                                   "xf": 0, "particles": 0, "pbytes": 0})
+            elif tag == TAG_INDEX:
+                rd.read_index(c)
+            elif tag == TAG_END:
+                rec.send = (c.u64(), c.u32())
+                rec.complete = True
+            elif tag not in KNOWN_TAGS:
+                rec.unknown_blocks[tag_name(tag)] += 1
+            rec.blocks.append((tag_name(tag), pos, 12 + length))
+            pos += 12 + length
+            rec.readable = pos
+        if not rec.complete and not rec.stop:
+            rec.stop, rec.stop_kind = "file ends without INDX/SEND", "eof"
+    except SrecError as e:
+        rec.stop, rec.stop_kind = f"block at offset {pos}: {e}", "decode"
+    if rec.header is None:
+        rec.fatal = "no readable SRHD header" + (f" ({rec.stop})" if rec.stop else "")
+        return rec
+    ix = rec.index
+    if ix is not None:
+        for o, (first, last, keys) in zip(rec.objects, ix["stats"]):
+            o["first"], o["last"], o["keys"] = (first, last, keys) if keys else (-1, -1, 0)
+        rec.frames = {oid: [(s, off, 0, 0) for s, off in fl] for oid, fl in ix["frames"].items()}
+        rec.strings = list(ix["strings"])
     return rec
 
 
@@ -1175,6 +1358,7 @@ class Writer:
         self._touch(oid)
 
     def material(self, oid: int, kind: int, prop: int, value: Sequence[float] = (0, 0, 0, 0), texture: int = -1) -> None:
+        assert kind <= MAT_TEXTURE and 0 <= prop < MAX_MAT_PROPS, (kind, prop)
         self._id(S_MATERIALS, oid, False)
         b = self.sec[S_MATERIALS]
         b.u8(kind)
@@ -1252,6 +1436,7 @@ class Writer:
         self._touch(oid)
 
     def render(self, fld: int, typ: int, value: Sequence[float]) -> None:
+        assert 0 <= fld < MAX_RENDER_FIELDS and typ <= VAL_INT, (fld, typ)
         b = self.sec[S_RENDER]
         b.int_(fld)
         b.u8(typ)
@@ -1288,6 +1473,7 @@ class Writer:
         self._touch(oid)
 
     def shared_mat(self, oid: int, slot: int, material: int) -> None:
+        assert 0 <= slot < MAX_MAT_SLOTS, slot
         self._id(S_SHAREDMAT, oid, True)
         self.sec[S_SHAREDMAT].int_(slot)
         self.sec[S_SHAREDMAT].ref(material)
@@ -1720,11 +1906,36 @@ def write_sidecars(out_dir: Path, w: Writer, name: str) -> None:
 
 # ------------------------------------------------------------------ commands
 
+def kind_name(k: int) -> str:
+    return KIND_NAMES[k] if 0 <= k < len(KIND_NAMES) else str(k)
+
+
+def object_rows(rec: Recording, flt: str = "", kind: str = "") -> list[dict[str, Any]]:
+    out = []
+    for o in rec.objects:
+        kname = kind_name(o["kind"])
+        if kind and kind not in (kname, str(o["kind"])):
+            continue
+        if flt and flt.lower() not in o["path"].lower() and flt.lower() not in o["owner"].lower():
+            continue
+        out.append({"id": o["id"], "kind": kname, "path": o["path"], "owner": o["owner"], "comps": [n for n in comp_names(o["comps"]).split(",") if n],
+                    "first": o["first"], "last": o["last"], "keys": o["keys"],
+                    "flags": [n for i, n in enumerate(OBJ_FLAG_NAMES) if o["flags"] & (1 << i)], "parent": o["parentId"],
+                    "depth": o["depth"], "added": o["addedAt"], "deleted": o["deletedAt"], "types": list(o["types"]),
+                    "ordinals": list(o["ordinals"]), "siblings": list(o["siblings"]), "extent": cf(f32(o["extent"]))})
+    return out
+
+
+def find_objects(rec: Recording, q: str) -> list[dict[str, Any]]:
+    """Objects named by a full path, a path suffix (after a '/') or the last path component."""
+    return [o for o in rec.objects if o["path"] == q or o["path"].endswith("/" + q) or o["path"].split("/")[-1] == q]
+
+
 def write_objects_tsv(path: Path | None, rec: Recording, flt: str = "", kind: str = "") -> int:
     rows = ["\t".join(("id", "kind", "path", "owner", "comps", "first", "last", "keys", "flags", "parent", "depth",
                        "added", "deleted", "types"))]
     for o in rec.objects:
-        kname = KIND_NAMES[o["kind"]] if o["kind"] < len(KIND_NAMES) else str(o["kind"])
+        kname = kind_name(o["kind"])
         if kind and kind not in (kname, str(o["kind"])):
             continue
         if flt and flt.lower() not in o["path"].lower() and flt.lower() not in o["owner"].lower():
@@ -1751,6 +1962,9 @@ def summary(rec: Recording) -> dict[str, Any]:
     h = rec.header or {}
     return {"file": str(rec.path), "bytes": rec.size, "readable": rec.readable, "version": rec.version,
             "complete": rec.complete, "truncated": rec.truncated, "stop": rec.stop, "stopKind": rec.stop_kind,
+            "contentVersion": rec.content_version, "toolContentVersion": CONTENT_VERSION, "newer": bool(rec.newer),
+            "headerExtraBytes": rec.header_extra, "headerMissing": list(rec.header_missing),
+            "unknownBlocks": dict(rec.unknown_blocks), "unknownSections": {str(k): v for k, v in sorted(rec.unknown_sections.items())},
             "header": h, "samples": len(st),
             "duration": st[-1]["gameTime"] - st[0]["gameTime"] if st else 0.0,
             "gameTime": [st[0]["gameTime"], st[-1]["gameTime"]] if st else [],
@@ -1776,18 +1990,48 @@ def summary(rec: Recording) -> dict[str, Any]:
             "problems": rec.problems, "warnings": rec.warnings}
 
 
+def fast_summary(rec: Recording) -> dict[str, Any]:
+    """summary() of a fast_read: what the block headers, the stamps and INDX give; the rest is None."""
+    s = summary(rec)
+    ix = rec.index
+    s["fast"] = True
+    s["crcChecked"] = False
+    s["objects"] = len(ix["stats"]) if ix is not None else len(rec.objects)
+    s["objectsAdded"] = s["objects"] - len(rec.objects) if ix is not None else None
+    s["objectsDeleted"] = None
+    s["keys"] = sum(k for _, _, k in ix["stats"]) if ix is not None else None
+    s["xfKeys"] = None
+    s["sections"] = {}
+    s["particles"] = {"systems": len(rec.frames), "frames": sum(len(v) for v in rec.frames.values()), "count": None, "bytes": None} \
+        if ix is not None else None
+    s["strings"] = len(rec.strings) if ix is not None else None
+    s["shaderChannels"] = None
+    s["shader"] = None
+    s["sizeFormula"] = None
+    s["blocks"] = dict(Counter(b[0] for b in rec.blocks))
+    return s
+
+
 def cmd_info(args: argparse.Namespace) -> int:
-    rec = read_srec(Path(args.path))
+    fast = bool(getattr(args, "fast", False))
+    rec = fast_read(Path(args.path)) if fast else read_srec(Path(args.path), map_file=True)
     if rec.fatal:
         print(f"{rec.path}: {rec.fatal}", file=sys.stderr)
         return 2
-    s = summary(rec)
+    s = fast_summary(rec) if fast else summary(rec)
     if args.json:
         print(json.dumps(s, indent=1, ensure_ascii=False))
         return 0
     h = s["header"]
     state = "complete" if rec.complete else f"TRUNCATED ({rec.stop})"
-    print(f"file      {rec.path}  {rec.size / 1048576:.2f} MB  version {rec.version}  {state}")
+    print(f"file      {rec.path}  {rec.size / 1048576:.2f} MB  version {rec.version}  {state}"
+          + ("  (fast: block headers and index only, CRCs not checked)" if fast else ""))
+    if rec.newer or rec.header_extra or rec.header_missing or rec.unknown_blocks or rec.unknown_sections:
+        print(f"content   version {rec.content_version}" + (f"  NEWER than this tool ({CONTENT_VERSION})" if rec.newer else "")
+              + (f"  {rec.header_extra} header byte(s) of a newer recorder ignored" if rec.header_extra else "")
+              + (f"  {len(rec.header_missing)} header field(s) of an older file at their defaults" if rec.header_missing else "")
+              + ("  unknown blocks " + ", ".join(f"{k} x{v}" for k, v in rec.unknown_blocks.items()) if rec.unknown_blocks else "")
+              + ("  unknown sections " + ", ".join(f"{k} x{v}" for k, v in sorted(rec.unknown_sections.items())) if rec.unknown_sections else ""))
     print(f"header    level {h.get('level')!r}  clock {h.get('clock')}  created {h.get('created')!r}  "
           f"screen {h.get('screenW')}x{h.get('screenH')}  t0 {h.get('t0')}  t0Real {h.get('t0Real')}  "
           f"subscene {h.get('subscene')}/{h.get('savepoint')}")
@@ -1797,6 +2041,17 @@ def cmd_info(args: argparse.Namespace) -> int:
     print(f"samples   {s['samples']}  duration {s['duration']:.3f} s  real span {s['realSpan']:.3f} s" +
           (f"  dt mean {dt['mean'] * 1000:.2f} ms min {dt['min'] * 1000:.2f} max {dt['max'] * 1000:.2f}" if dt else "") +
           f"  hitches {s['hitches']}  holds {s['holds']}  markers {s['markers']}  game frames {s['gameFrames']}")
+    if fast:
+        print(f"objects   {s['objects']}" + (f" ({s['objectsAdded']} added during the take)" if s["objectsAdded"] is not None else " in OBJT")
+              + "  at the start: " + "  ".join(f"{k} {v}" for k, v in sorted(s["kinds"].items())))
+        print(f"keys      {s['keys'] if s['keys'] is not None else 'unknown (no INDX)'}  strings "
+              f"{s['strings'] if s['strings'] is not None else 'unknown'}  index {'yes' if s['index'] else 'no'}")
+        if s["particles"] is not None:
+            print(f"particles {s['particles']['systems']} systems  {s['particles']['frames']} frames")
+        print("blocks    " + ", ".join(f"{k} {v}" for k, v in s["blocks"].items()))
+        for line in rec.warnings[:20]:
+            print(f"warning   {line}")
+        return 0
     print(f"objects   {s['objects']} (OBJA {s['objectsAdded']}, OBJD {s['objectsDeleted']})  " +
           "  ".join(f"{k} {v}" for k, v in sorted(s["kinds"].items())))
     print(f"keys      {s['keys']} (xf {s['xfKeys']})  strings {s['strings']}  index {'yes' if s['index'] else 'no'}")
@@ -1825,7 +2080,7 @@ def sidecar_rows(path: Path) -> int | None:
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
-    rec = read_srec(Path(args.path))
+    rec = read_srec(Path(args.path), map_file=True)
     if rec.fatal:
         print(f"FAIL {rec.path}: {rec.fatal}")
         return 2
@@ -1834,6 +2089,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
     if rec.truncated:
         line = f"truncated: readable prefix of {rec.samples} samples, {rec.readable} of {rec.size} bytes ({rec.stop})"
         (problems if args.strict else notes).append(line)
+    if rec.newer and args.strict:
+        problems.append(rec.newer)
     for side, n in (("record_meta.csv", rec.samples), ("objects.tsv", len(rec.objects))):
         rows = sidecar_rows(rec.path.parent / side)
         if rows is None:
@@ -1869,10 +2126,13 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_objects(args: argparse.Namespace) -> int:
-    rec = read_srec(Path(args.path))
+    rec = read_srec(Path(args.path), map_file=True)
     if rec.fatal:
         print(f"{rec.path}: {rec.fatal}", file=sys.stderr)
         return 2
+    if getattr(args, "json", False):
+        print(json.dumps({"file": str(rec.path), "objects": object_rows(rec, args.filter or "", args.kind or "")}, ensure_ascii=False))
+        return 0
     write_objects_tsv(None, rec, args.filter or "", args.kind or "")
     return 0
 
@@ -1881,15 +2141,80 @@ def fmt(v: Any) -> str:
     return repr(v) if isinstance(v, float) else str(v)
 
 
+def export_target(rec: Recording, what: str) -> int | str:
+    """The object id an export argument names (a number, a path, a path suffix or a name), or an error text."""
+    try:
+        oid = int(what)
+    except ValueError:
+        hits = find_objects(rec, what)
+        if len(hits) == 1:
+            return hits[0]["id"]
+        if not hits:
+            return (f"export: '{what}' is not an object id, an object path / path suffix / name of the recording, virtual, stamps, "
+                    f"events, render or shader[:<channel or name>]")
+        return (f"export: '{what}' names {len(hits)} objects; give the id: "
+                + "; ".join(f"{o['id']} {kind_name(o['kind'])} {o['path']} ordinals {o['ordinals']}" for o in hits[:12])
+                + (" ..." if len(hits) > 12 else ""))
+    if not 0 <= oid < len(rec.objects):
+        return f"export: object {oid} not in the table ({len(rec.objects)} objects)"
+    return oid
+
+
 def cmd_export(args: argparse.Namespace) -> int:
-    rec = read_srec(Path(args.path), events=True)
+    what = args.what
+    key = what.split(":", 1)[0] if what.startswith("shader") else what
+    kinds = {"stamps": (), "events": ("Event",), "virtual": ("Virtual",), "render": ("Render",), "shader": ("ShaderVal",)}.get(key)
+    target: int | str = -1
+    if kinds is None:
+        first = read_srec(Path(args.path), map_file=True)
+        if first.fatal:
+            print(f"{first.path}: {first.fatal}", file=sys.stderr)
+            return 2
+        target = export_target(first, what)
+        first.close()
+        if isinstance(target, str):
+            print(target, file=sys.stderr)
+            return 2
+        oid_ = target
+        rec = read_srec(Path(args.path), events=True, kinds=OBJECT_EVENTS, map_file=True,
+                        keep=lambda e: e[2][0] == oid_ if e[0] == "ObjAdd" else e[2] == oid_)
+    else:
+        rec = read_srec(Path(args.path), events=bool(kinds), kinds=kinds, map_file=True)
     if rec.fatal:
         print(f"{rec.path}: {rec.fatal}", file=sys.stderr)
         return 2
-    what = args.what
     times = [s["gameTime"] for s in rec.stamps]
     rows: list[list[Any]] = []
-    if what == "stamps":
+    if key == "render":
+        h = rec.header or {}
+        names = list(h.get("fogFields") or []) + list(h.get("postFields") or [])
+        head = ["sample", "game_time", "field", "name", "type", "x", "y", "z", "w"]
+        tn = {VAL_FLOAT: "float", VAL_VEC4: "vec4", VAL_INT: "int"}
+        rows = [[e[1], times[e[1]], e[2], names[e[2]] if 0 <= e[2] < len(names) else f"#{e[2]}", tn.get(e[3], e[3]), *e[4:8]]
+                for e in rec.events or []]
+    elif key == "shader":
+        sel = what.split(":", 1)[1] if ":" in what else ""
+        chans = [d for d in rec.shader if not sel or sel == str(d["id"]) or sel == d["name"] or sel == f"{SH_SCOPE_NAMES[d['scope']]}:{d['name']}"]
+        if sel and not chans:
+            print(f"export: no shader channel '{sel}' ({len(rec.shader)} channels: "
+                  + ", ".join(f"{d['id']} {SH_SCOPE_NAMES[d['scope']]}:{d['name']}" for d in rec.shader[:20]) + ")", file=sys.stderr)
+            return 2
+        ids = {d["id"] for d in chans}
+
+        def target_of(d: dict[str, Any]) -> str:
+            if d["scope"] == SH_MATERIAL:
+                return rec.strings[d["target"]] if 0 <= d["target"] < len(rec.strings) else ""
+            if d["scope"] == SH_BLOCK:
+                return rec.objects[d["target"]]["path"] if 0 <= d["target"] < len(rec.objects) else ""
+            return ""
+
+        head = ["sample", "game_time", "channel", "scope", "target", "name", "type", "x", "y", "z", "w"]
+        for e in rec.events or []:
+            if e[2] in ids:
+                d = rec.shader[e[2]]
+                rows.append([e[1], times[e[1]], e[2], SH_SCOPE_NAMES[d["scope"]], target_of(d), d["name"],
+                             "float" if d["type"] == VAL_FLOAT else "vec4", *e[3:7]])
+    elif what == "stamps":
         head = ["sample", "frame_count", "game_time", "dt", "real_time", "real_offset", "logic_step", "fixed_steps", "flags",
                 "xf_keys", "particles", "bytes"]
         t0r = (rec.header or {}).get("t0Real", 0.0)
@@ -1906,14 +2231,7 @@ def cmd_export(args: argparse.Namespace) -> int:
         head = ["sample", "game_time"] + VIRTUAL_COLUMNS
         rows = [[e[1], times[e[1]], *e[2:]] for e in rec.events or [] if e[0] == "Virtual"]
     else:
-        try:
-            oid = int(what)
-        except ValueError:
-            print(f"export: '{what}' is not an object id, virtual, stamps or events", file=sys.stderr)
-            return 2
-        if not 0 <= oid < len(rec.objects):
-            print(f"export: object {oid} not in the table ({len(rec.objects)} objects)", file=sys.stderr)
-            return 2
+        oid = int(target)
         props = {k: list(rec.objects[oid][f"{n}Props"]) for k, n in enumerate(MAT_NAMES)}
         head = ["sample", "game_time", "channel", "bits", "px", "py", "pz", "qx", "qy", "qz", "qw", "sx", "sy", "sz",
                 "parent", "value"]
@@ -1998,16 +2316,32 @@ def dump_json(rec: Recording) -> str:
 
 
 def cmd_dump(args: argparse.Namespace) -> int:
-    rec = read_srec(Path(args.path), events=True)
+    """Two passes, so that the event list of a long take never sits in memory: the first finds the problems and warnings
+    (they stand before the events in the file), the second writes one event per line as it is read."""
+    rec = read_srec(Path(args.path), map_file=True)
     if rec.fatal:
         print(f"{rec.path}: {rec.fatal}", file=sys.stderr)
         return 2
-    text = dump_json(rec)
+    head = json.dumps({"ok": not rec.fatal and not rec.problems, "read": not rec.fatal, "truncated": rec.truncated,
+                       "problems": rec.problems, "warnings": rec.warnings})[:-1] + ', "events": [\n'
+    rec.close()
+    out = open(args.out, "w", encoding="utf-8") if args.out else sys.stdout
+    count = 0
+
+    def line(e: list[Any]) -> None:
+        nonlocal count
+        out.write((",\n" if count else "") + json.dumps(e, ensure_ascii=False))
+        count += 1
+
+    try:
+        out.write(head)
+        read_srec(Path(args.path), events=True, map_file=True, sink=line).close()
+        out.write("\n]}\n")
+    finally:
+        if args.out:
+            out.close()
     if args.out:
-        Path(args.out).write_text(text, encoding="utf-8")
-        print(f"dump: {len(rec.events or [])} events -> {args.out}")
-    else:
-        sys.stdout.write(text)
+        print(f"dump: {count} events -> {args.out}")
     return 0
 
 
@@ -2114,6 +2448,8 @@ class RecordFacts:
             elif e[0] == "Event":
                 self.rows.append({"sample": e[1], "time": self.t(e[1]), "kind": e[2], "name": e[3], "detail": e[4]})
         self.by_path = {o["path"]: o["id"] for o in rec.objects if o["kind"] in TRANSFORM_KINDS}
+        self.by_key = {(o["path"], tuple(o["ordinals"])): o["id"] for o in rec.objects if o["kind"] in TRANSFORM_KINDS}
+        self.path_count = Counter(o["path"] for o in rec.objects if o["kind"] in TRANSFORM_KINDS)
         self.children: dict[int, list[int]] = {}
         for o in rec.objects:
             if o["kind"] not in TRANSFORM_KINDS:
@@ -2140,11 +2476,18 @@ class RecordFacts:
         o = self.rec.objects[oid]
         return bit_spans(self.flags.get(oid, []), self.initial(o), bit, self.alive(o))
 
-    def ancestors(self, path: str) -> list[int]:
+    def ancestors(self, path: str, ordinals: Sequence[int] | None = None) -> list[int]:
+        """Recorded ancestors, nearest first. Same-named siblings share a path, so an ancestor is looked up by its path and
+        the matching start of the object's ordinal chain; the path alone decides only when it is unique or the chain
+        does not have one ordinal per path part."""
         out = []
         parts = path.split("/")
+        chain = tuple(ordinals) if ordinals is not None and len(ordinals) == len(parts) else None
         for k in range(len(parts) - 1, 0, -1):
-            oid = self.by_path.get("/".join(parts[:k]))
+            p = "/".join(parts[:k])
+            oid = self.by_key.get((p, chain[:k])) if chain is not None else self.by_path.get(p)
+            if oid is None and chain is not None and self.path_count.get(p) == 1:
+                oid = self.by_path.get(p)
             if oid is not None:
                 out.append(oid)
         return out
@@ -2155,7 +2498,7 @@ class RecordFacts:
             return hit
         o = self.rec.objects[oid]
         spans = self.self_spans(oid, FL_ACTIVE)
-        anc = self.ancestors(o["path"])
+        anc = self.ancestors(o["path"], o["ordinals"])
         if anc and spans:
             spans = span_cut(spans, self.active_h(anc[0]))
         self.memo[oid] = spans
@@ -2163,7 +2506,17 @@ class RecordFacts:
 
     def subtree(self, root: dict[str, Any]) -> list[int]:
         p = root["path"]
-        return [o["id"] for o in self.rec.objects if o["kind"] in TRANSFORM_KINDS and (o["path"] == p or o["path"].startswith(p + "/"))]
+        n = p.count("/") + 1
+        chain = tuple(root["ordinals"]) if len(root["ordinals"]) == n else None
+        out = []
+        for o in self.rec.objects:
+            if o["kind"] not in TRANSFORM_KINDS or not (o["path"] == p or o["path"].startswith(p + "/")):
+                continue
+            oc = o["ordinals"]
+            if chain is not None and len(oc) == o["path"].count("/") + 1 and tuple(oc[:n]) != chain:
+                continue
+            out.append(o["id"])
+        return out
 
     def visible(self, xf_ids: list[int]) -> tuple[list[tuple[int, int]], int]:
         out: list[tuple[int, int]] = []
@@ -2313,7 +2666,13 @@ def report_spec(path: Path, given: str | None) -> tuple[dict[str, Any], str]:
     cands += [folder / "spec.json", folder.parent / "spec.json"]
     for c in cands:
         if c.is_file():
-            return json.loads(c.read_text(encoding="utf-8")), str(c)
+            try:
+                spec = json.loads(c.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                raise SrecError(f"spec {c}: {e}") from None
+            if not isinstance(spec, dict):
+                raise SrecError(f"spec {c}: a JSON object is expected")
+            return spec, str(c)
     if given:
         raise FileNotFoundError(given)
     return {}, ""
@@ -2329,7 +2688,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     except ValueError as e:
         print(f"report: {e}", file=sys.stderr)
         return 2
-    rec = read_srec(path, events=True)
+    rec = read_srec(path, events=True, kinds=("Flags", "Event"), map_file=True)
     if rec.fatal:
         print(f"{rec.path}: {rec.fatal}", file=sys.stderr)
         return 2
@@ -2342,6 +2701,9 @@ def cmd_report(args: argparse.Namespace) -> int:
             joins = []
     doc = record_report(rec, spec, checks, joins)
     doc["spec"] = spec_path
+    if rec.newer:
+        doc["newer"] = rec.newer
+        print(f"warning: {rec.newer}", file=sys.stderr)
     out = Path(args.out) if args.out else path.parent / "record_report.json"
     out.write_text(json.dumps(doc, indent=1), encoding="utf-8")
     text = report_text(doc)
@@ -2357,10 +2719,11 @@ def build_parser() -> argparse.ArgumentParser:
     a = sub.add_parser("info", help="header, counts, sizes")
     a.add_argument("path")
     a.add_argument("--json", action="store_true")
+    a.add_argument("--fast", action="store_true", help="block headers, stamps and INDX only: no CRC, no sample decoding")
     a.set_defaults(func=cmd_info)
     a = sub.add_parser("verify", help="integrity check (R2)")
     a.add_argument("path")
-    a.add_argument("--strict", action="store_true", help="a truncated prefix fails")
+    a.add_argument("--strict", action="store_true", help="a truncated prefix fails, and so does a content version newer than this tool")
     a.add_argument("--size", action="store_true", help="the 4.4 size formula ratio outside 0.5-2 fails")
     a.add_argument("--json", action="store_true")
     a.set_defaults(func=cmd_verify)
@@ -2368,8 +2731,10 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("path")
     a.add_argument("filter", nargs="?")
     a.add_argument("--kind")
+    a.add_argument("--json", action="store_true", help="one JSON object {file, objects: [...]} instead of TSV")
     a.set_defaults(func=cmd_objects)
-    a = sub.add_parser("export", help="CSV of one object id, virtual, stamps or events")
+    a = sub.add_parser("export", help="CSV of one object (id, path, path suffix or name), virtual, stamps, events, render, "
+                                      "shader[:<channel id or name>]")
     a.add_argument("path")
     a.add_argument("what")
     a.add_argument("--out")
@@ -2401,11 +2766,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
     except FileNotFoundError as e:
         print(f"srec_tool {args.command}: {e}", file=sys.stderr)
+        return 2
+    except (SrecError, OSError, UnicodeError) as e:
+        print(f"srec_tool {args.command}: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
 
 

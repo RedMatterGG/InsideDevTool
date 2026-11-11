@@ -14,22 +14,31 @@ Decode: pipe-mode camera videos (<cam>.mkv) decode on the GPU by default (NVDEC,
 the GPU (scale_cuda) before the download (mcam_take.FrameStore gpu); grading (time-varying per-camera / per-cell LUTs),
 cropping and compositing stay in numpy (cheap copies, identical grades), the RGB -> BT.709 limited 10-bit conversion stays in
 ffmpeg zscale (NVENC's own RGB input path tags the stream BT.601) and hevc_nvenc encodes. --cpu is the old CPU decode path.
-Usage: python -I tools/mcam_compose.py <scan|angles|layout|cut|all|finals|director|autocut|grade|review> <take> [options]"""
+Outputs go to --out DIR, else <MCAM_OUT>/<take name> (environment), else <compose.output.root>/<take name> (spec.json), else
+the folder an earlier version used for this take (<tools>/../out/<take name>, only when it exists), else <take>/out.
+--resume skips a video that is already there, verifies and was made from the same inputs; --json prints one JSON object on
+stdout and sends the progress lines to stderr; `doctor [take]` checks ffmpeg, the encoders and filters, memory and the output
+folder before a first run. Exit codes: 0 ok, 1 an output failed its check or the encode failed, 2 input or usage error,
+3 refused (audio not usable, another encode running, not enough memory, foreign files in the output folder).
+Usage: python -I tools/mcam_compose.py <scan|angles|layout|cut|all|finals|director|autocut|grade|review> <take> [options]
+       python -I tools/mcam_compose.py doctor [take] [--out DIR] [--json]"""
 from __future__ import annotations
 
 import argparse
+import csv
 import ctypes
 import fnmatch
+import hashlib
 import json
 import math
 import os
-import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 
@@ -38,6 +47,8 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mcam_audio as MA
+import mcam_ff as FF
 import mcam_take as MT
 from mcam_take import FrameStore, OutFrame, Take, TakeError, Timeline, smoothstep
 
@@ -49,12 +60,40 @@ except Exception:
 
 TOOLS = Path(__file__).resolve().parent
 FONTS = TOOLS / 'fonts'
-FONT_FILES = {'oswald': FONTS / 'Oswald-Regular.ttf', 'bahnschrift': Path('C:/Windows/Fonts/bahnschrift.ttf'),
-              'mono': Path('C:/Windows/Fonts/consola.ttf')}
+SYSTEM_FONTS = Path(os.environ.get('WINDIR') or os.environ.get('SystemRoot') or os.sep) / 'Fonts'
+FONT_FILES = {'oswald': FONTS / 'Oswald-Regular.ttf', 'bahnschrift': SYSTEM_FONTS / 'bahnschrift.ttf',
+              'mono': SYSTEM_FONTS / 'consola.ttf'}
 MOVING_MODES = {'follow', 'keys', 'rail', 'orbit', 'gamelike', 'frame', 'director', 'gamerel'}
-LOCK_PATH = MT.OUT_ROOT / '.encode.lock'
-MIN_COMMIT_GB = 10.0
+LOCK_NAME = 'mcam_encode.lock'
+COMMIT_HEADROOM_GB = 2.0
+OUT_MARK = '.mcam_out'
+OUT_NAMES = ('angle_*_h265*', 'layout_*_h265*', 'cut_*', 'timeline.json', 'timeline.png', 'grade.json', 'grade_*.cube',
+             'edit_autocut.json', 'director_*.json', 'compose_log.json', 'qa.json', 'qa.txt', 'sheet_*', 'paths.png', 'diverge.json',
+             'review', 'stills', 'audiosync.json', 'audiosync.txt', 'replaydiff.json', 'replaydiff.txt', 'replaydiff.png',
+             'fast_review.json')
+LOG_NAME = 'compose_log.json'
+OLD_OUT_ROOT = MT.OUT_ROOT
+LOG_KEEP = 50
+RESUME_VERSION = 1
+AUDIO_CHUNK = 1 << 20
+EXIT_OK, EXIT_BAD, EXIT_INPUT, EXIT_REFUSED = FF.EXIT_OK, FF.EXIT_BAD, FF.EXIT_INPUT, FF.EXIT_REFUSED
 LIN8 = ((np.arange(256, dtype=np.float64) / 255.0) ** 2.2).astype(np.float32)
+WRITTEN: list[str] = []
+NOTES: list[str] = []
+STOP = threading.Event()
+
+
+class Refused(SystemExit):
+    """The tool will not do this as asked (exit code 3). Other SystemExit texts are input or usage errors (exit code 2)."""
+
+
+def wrote(path) -> None:
+    WRITTEN.append(str(path))
+
+
+def note(text: str) -> None:
+    NOTES.append(text)
+    print(f'warning: {text}', file=sys.stderr, flush=True)
 
 DEFAULT_COMPOSE = {
     'blur': {'space': 'linear', 'shutter': 180},
@@ -339,7 +378,7 @@ class Ctx:
     grades: dict = field(default_factory=dict)
     blur_space: str = 'linear'
     labels: 'Labels | None' = None
-    src_size: tuple = (2560, 1440)
+    src_size: tuple = (0, 0)
     sizes: dict = field(default_factory=dict)
     audio: 'AudioTrack | None' = None
 
@@ -417,17 +456,115 @@ def make_ctx(take: Take, args) -> Ctx:
     return ctx
 
 
+def out_root(take_root: Path, spec: dict | None) -> tuple[Path | None, str]:
+    env = os.environ.get('MCAM_OUT')
+    if env:
+        return Path(env), 'MCAM_OUT'
+    spec = spec if isinstance(spec, dict) else {}
+    for where, sec in (('compose.output.root', spec.get('compose')), ('output.root', spec)):
+        o = sec.get('output') if isinstance(sec, dict) else None
+        if isinstance(o, dict) and isinstance(o.get('root'), str) and o['root']:
+            p = Path(o['root'])
+            return (p if p.is_absolute() else Path(take_root) / p), f'spec {where}'
+    return None, ''
+
+
+def default_out(take_root: Path, name: str, spec: dict | None = None) -> tuple[Path, str]:
+    """Where the outputs of a take go without --out, and why (see the module text)."""
+    root, why = out_root(take_root, spec)
+    if root is not None:
+        return (root / safe_name(name)).resolve(), why
+    old = OLD_OUT_ROOT / safe_name(name)
+    try:
+        if old.is_dir() and any(old.iterdir()):
+            return old.resolve(), 'the folder an earlier version used for this take'
+    except OSError:
+        pass
+    return (Path(take_root) / 'out').resolve(), 'in the take folder'
+
+
+def out_is_ours(out: Path) -> bool:
+    if any((out / name).is_file() for name in (OUT_MARK, LOG_NAME, 'qa.json', 'fast_review.json', 'audiosync.json', 'replaydiff.json')):
+        return True
+    try:
+        root = OLD_OUT_ROOT.resolve()
+    except OSError:
+        return False
+    return root in out.parents
+
+
+def set_stats_root(root) -> None:
+    """The cache of per-camera luma statistics (mcam_take.camera_stats: <root>/_stats/<take>) follows the output place
+    instead of the folder the tools are installed in. Also the initializer of the statistics worker processes."""
+    MT.OUT_ROOT = Path(root)
+
+
+def claim_out(out: Path, force: bool = False) -> Path:
+    """Makes the output folder. An existing folder that this tool has not written to before is used as it is, unless it
+    already holds files under this tool's output names: those would be overwritten, so that needs --force."""
+    try:
+        if out.is_dir() and not force and not out_is_ours(out):
+            foreign = sorted(p.name for p in out.iterdir() if any(fnmatch.fnmatchcase(p.name, pat) for pat in OUT_NAMES))
+            if foreign:
+                raise Refused(f'output folder {out} holds {len(foreign)} file(s) or folder(s) under this tool\'s output names that '
+                              f'it did not write ({", ".join(foreign[:4])}{" ..." if len(foreign) > 4 else ""}); choose another '
+                              f'--out or pass --force to overwrite them')
+        out.mkdir(parents=True, exist_ok=True)
+        mark = out / OUT_MARK
+        if not mark.is_file():
+            mark.write_text('outputs of the InsideDevTool mcam tools (mcam_compose.py, mcam_qa.py, fast_review.py)\n', encoding='utf-8')
+    except OSError as e:
+        raise Refused(f'cannot write into the output folder {out} ({e.strerror or e}); pass --out DIR or set MCAM_OUT') from None
+    return out
+
+
 def resolve_out(take: Take, args) -> Path:
-    out = Path(args.out).resolve() if getattr(args, 'out', None) and not str(args.out).lower().endswith('.json') else (MT.OUT_ROOT / safe_name(take.name)).resolve()
-    root = MT.OUT_ROOT.resolve()
-    if root not in out.parents and out != root and not getattr(args, 'force', False):
-        raise SystemExit(f'output {out} is outside {root}; pass --force to write there')
-    out.mkdir(parents=True, exist_ok=True)
+    given = getattr(args, 'out', None)
+    if given and not str(given).lower().endswith('.json'):
+        out = stats = Path(given).resolve()
+    else:
+        out, why = default_out(take.root, take.name, take.spec)
+        stats = out if out.parent == Path(take.root).resolve() else out.parent
+        print(f'output folder: {out} ({why})', file=sys.stderr, flush=True)
+    claim_out(out, bool(getattr(args, 'force', False)))
+    set_stats_root(stats)
     return out
 
 
 def safe_name(s: str) -> str:
     return ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in s) or 'take'
+
+
+def read_log(path: Path, set_aside: bool = False) -> list:
+    """compose_log.json as a list. A damaged log is not fatal: it reads as empty with a warning (and is renamed to
+    compose_log.bad.json when the caller is about to write a new one)."""
+    if not path.is_file():
+        return []
+    try:
+        doc = json.loads(path.read_text(encoding='utf-8'))
+        if isinstance(doc, list):
+            return [e for e in doc if isinstance(e, dict)]
+        why = 'not a list'
+    except (OSError, ValueError) as e:
+        why = str(e)
+    bad = path.with_name(path.stem + '.bad' + path.suffix)
+    if set_aside:
+        try:
+            os.replace(path, bad)
+            why += f'; kept as {bad.name}'
+        except OSError:
+            pass
+    note(f'{path}: unreadable ({why}); read as empty')
+    return []
+
+
+def result_items(res) -> list[dict]:
+    """The video entries of a command result (a dict, a list, or {'angles', 'layouts', 'cut'})."""
+    if isinstance(res, dict) and ('angles' in res or 'layouts' in res or 'cut' in res):
+        items = list(res.get('angles') or []) + list(res.get('layouts') or []) + ([res['cut']] if isinstance(res.get('cut'), dict) else [])
+    else:
+        items = res if isinstance(res, list) else [res] if isinstance(res, dict) else []
+    return [it for it in items if isinstance(it, dict) and it.get('file')]
 
 
 def setup_grades(ctx: Ctx, cams: list[str]) -> None:
@@ -609,6 +746,9 @@ class Labels:
         self.alpha = float(cfg.get('alpha', 0.7))
         self.names = dict(cfg.get('names') or {})
         self.font_path = self._font(str(cfg.get('font', 'Oswald')))
+        if self.show and self.font_path is None:
+            print(f'labels: no font file found ({cfg.get("font", "Oswald")}, {FONT_FILES["oswald"]}, {FONT_FILES["bahnschrift"]}); '
+                  f'the small built-in font is used (compose.labels.font takes a .ttf path)', file=sys.stderr, flush=True)
         self.cache: dict = {}
         self.lock = threading.Lock()
 
@@ -691,6 +831,7 @@ class Cell:
 
 
 PRESETS = {'16x9_3': (956, 3, 480), '16x9_2': (716, 2, 720)}
+PRESET_WIDTH = 2560
 
 
 def even(v: float) -> int:
@@ -699,18 +840,28 @@ def even(v: float) -> int:
 
 def default_layout(take: Take) -> dict:
     cams = [c for c in take.camera_names() if take.cams[c].mode != 'director']
+    if not cams:
+        raise SystemExit('default layout: the take has only director cameras; name a layout (compose.layouts or --layout)')
     band = 'game' if 'game' in cams else cams[0]
     rest = [c for c in cams if c != band][:3]
     w, h = take.screen()
-    ch = even(w * 1080 / 2560)
+    ch = min(even(h), even(w * 27 / 64))
     rows = [[{'cam': band, 'crop': [0, even((h - ch) / 2), w, ch]}]]
     if rest:
         rows.append([{'cam': c} for c in rest])
-    return {'name': 'main', 'width': 2560, 'gap': 4, 'rows': rows}
+    return {'name': 'main', 'width': even(w), 'gap': 4, 'rows': rows}
+
+
+def layout_width(lay: dict, rows: list, sizes: dict, default_size: tuple) -> int:
+    """Canvas width: the layout's own `width`, else the widest source among its cells (cells never have to grow)."""
+    if lay.get('width'):
+        return even(int(lay['width']))
+    widths = [sizes.get(c.get('cam'), default_size)[0] for row in rows for c in ([row] if isinstance(row, dict) else row)
+              if isinstance(c, dict) and c.get('cam') != 'cut']
+    return even(max(widths or [default_size[0]]))
 
 
 def layout_geometry(lay: dict, sizes: dict, default_size: tuple) -> tuple[int, int, list[Cell]]:
-    W = even(int(lay.get('width', 2560)))
     g = int(lay.get('gap', 4))
     preset = lay.get('preset')
     rows = lay.get('rows')
@@ -721,6 +872,10 @@ def layout_geometry(lay: dict, sizes: dict, default_size: tuple) -> tuple[int, i
         raise SystemExit(f'layout {lay.get("name")}: no rows')
     if preset and preset not in PRESETS:
         raise SystemExit(f'layout {lay.get("name")}: unknown preset {preset} (use {", ".join(PRESETS)})')
+    W = layout_width(lay, rows, sizes, default_size)
+    if W <= 0:
+        raise SystemExit(f'layout {lay.get("name")}: no width (the frame size of its cameras is unknown; give "width")')
+    ps = W / PRESET_WIDTH
     cells: list[Cell] = []
     y = 0
     for ri, row in enumerate(rows):
@@ -732,7 +887,7 @@ def layout_geometry(lay: dict, sizes: dict, default_size: tuple) -> tuple[int, i
             sw, sh = sizes.get(first['cam'], default_size)
             crop = list(first.get('crop') or [0, 0, sw, sh])
             if preset and ri == 0:
-                band_h = PRESETS[preset][0]
+                band_h = even(PRESETS[preset][0] * ps)
                 want_h = crop[2] * band_h / W
                 cy = crop[1] + crop[3] / 2.0
                 crop = [crop[0], max(0.0, min(sh - want_h, cy - want_h / 2.0)), crop[2], want_h]
@@ -746,7 +901,7 @@ def layout_geometry(lay: dict, sizes: dict, default_size: tuple) -> tuple[int, i
             inner = W - (n - 1) * g
             widths = [inner // n + (1 if i < inner % n else 0) for i in range(n)]
             if preset and ri == 1 and n == PRESETS[preset][1]:
-                h = PRESETS[preset][2]
+                h = even(PRESETS[preset][2] * ps)
             else:
                 given = next((c.get('height') for c in row if c.get('height')), None) or (lay.get('heights') or {}).get(str(ri))
                 h = even(float(given)) if given else 2 * math.ceil(max(widths) * 9 / 32)
@@ -896,7 +1051,7 @@ def plan_edit(ctx: Ctx, edit: dict, tl: Timeline | None = None) -> EditPlan:
     if not raw:
         raise SystemExit(f'edit {edit.get("name")}: no shots')
     for s in raw:
-        if s.get('cam') not in take.cams and s.get('cam') != 'cut':
+        if s.get('cam') not in take.cams:
             raise SystemExit(f'edit {edit.get("name")}: camera "{s.get("cam")}" is not in the take ({", ".join(take.cams)})')
         s['_from'] = take.resolve_time(s.get('from', 0), 0.0)
     raw.sort(key=lambda s: s['_from'])
@@ -1003,17 +1158,17 @@ def load_audio(ctx: Ctx) -> AudioTrack:
     take = ctx.take
     if take.replay_mode not in ('replay', 'take'):
         kind = f'run.json mode "{take.mode}"' if take.mode else 'no replay run.json'
-        raise SystemExit(f'--audio record refused: {take.root} is not a replay take ({kind}); v2 takes carry no sound '
-                         f'(REPLAY_DESIGN 6.5)')
+        raise Refused(f'--audio record refused: {take.root} is not a replay take ({kind}); v2 takes carry no sound '
+                      f'(REPLAY_DESIGN 6.5)')
     st = take.audio_state()
     if not st['ok']:
-        raise SystemExit(f'--audio record refused: {st["verdict"]} [record {take.record_dir()}]')
+        raise Refused(f'--audio record refused: {st["verdict"]} [record {take.record_dir()}]')
     try:
-        wav = MT.read_wav(Path(st['track']))
-    except TakeError as e:
-        raise SystemExit(f'--audio record refused: {e}')
+        wav = MA.load_wav(Path(st['track']))
+    except (MA.AudioError, OSError) as e:
+        raise Refused(f'--audio record refused: {e}')
     if wav.problems:
-        raise SystemExit(f'--audio record refused: {wav.path.name}: ' + '; '.join(wav.problems))
+        raise Refused(f'--audio record refused: {wav.path.name}: ' + '; '.join(wav.problems))
     fps = float(take.fps)
     want = (max((f.index for f in take.base.frames), default=-1) + 1) / fps
     if wav.seconds + 1.0 / fps < want:
@@ -1029,10 +1184,10 @@ def require_meta_timeline(ctx: Ctx, tl: Timeline, what: str) -> None:
     if ctx.audio is None:
         return
     if tl.mode != 'meta' or any(f.index < 0 for f in tl.frames):
-        raise SystemExit(f'--audio record refused for {what}: it uses a {tl.mode} timeline; audio_track.wav follows the meta '
-                         f'timeline only (drop edit speed keys or --speed realtime)')
+        raise Refused(f'--audio record refused for {what}: it uses a {tl.mode} timeline; audio_track.wav follows the meta '
+                      f'timeline only (drop edit speed keys or --speed realtime)')
     if abs(tl.fps - ctx.audio.fps) > 1e-6:
-        raise SystemExit(f'--audio record refused for {what}: {tl.fps:g} fps differs from the take timeline {ctx.audio.fps:g} fps')
+        raise Refused(f'--audio record refused for {what}: {tl.fps:g} fps differs from the take timeline {ctx.audio.fps:g} fps')
 
 
 def check_audio_plan(ctx: Ctx, command: str) -> None:
@@ -1043,8 +1198,8 @@ def check_audio_plan(ctx: Ctx, command: str) -> None:
     if command in ('cut', 'all') or (command == 'layout' and uses_cut):
         edit = current_edit(ctx, required=False)
         if edit and edit.get('speed'):
-            raise SystemExit(f'--audio record refused: edit "{edit.get("name", "cut")}" has speed keys (warp timeline); '
-                             f'audio_track.wav follows the meta timeline only')
+            raise Refused(f'--audio record refused: edit "{edit.get("name", "cut")}" has speed keys (warp timeline); '
+                          f'audio_track.wav follows the meta timeline only')
         require_meta_timeline(ctx, base_timeline(ctx), 'the cut')
 
 
@@ -1069,23 +1224,31 @@ def render_audio(track: AudioTrack, mix: list[dict], n: int) -> tuple[np.ndarray
     total = int(round(n * sr / fps))
     out = np.zeros((total, track.channels), np.float32)
     centers = (np.arange(n, dtype=np.float64) + 0.5) * sr / fps
-    pos = np.arange(total, dtype=np.int64)
     deltas = sorted({d for m in mix for d in m})
+    size = len(track.data)
     missing = 0
     for d in deltas:
         w = np.array([m.get(d, 0.0) for m in mix], np.float64)
         if not np.any(w > 1e-6):
             continue
-        g = np.interp(pos.astype(np.float64), centers, w).astype(np.float32)
-        src = pos + int(round(d * sr / fps))
-        need = g > 1e-4
-        ok = (src >= 0) & (src < len(track.data))
-        missing += int(np.count_nonzero(need & ~ok))
-        sel = need & ok
-        out[sel] += track.data[src[sel]] * g[sel, None]
+        shift = int(round(d * sr / fps))
+        for c0 in range(0, total, AUDIO_CHUNK):
+            c1 = min(total, c0 + AUDIO_CHUNK)
+            g = np.interp(np.arange(c0, c1, dtype=np.float64), centers, w).astype(np.float32)
+            g[g <= 1e-4] = 0.0
+            need = int(np.count_nonzero(g))
+            if not need:
+                continue
+            lo, hi = max(c0 + shift, 0), min(c1 + shift, size)
+            if hi <= lo:
+                missing += need
+                continue
+            a, b = lo - shift - c0, hi - shift - c0
+            missing += need - int(np.count_nonzero(g[a:b]))
+            out[c0 + a:c0 + b] += track.data[lo:hi] * g[a:b, None]
     if missing > sr / fps:
-        raise SystemExit(f'--audio record refused: {missing} output samples ({missing / sr:.3f} s) fall outside '
-                         f'{track.path.name} ({len(track.data) / sr:.3f} s); re-run mcam_audio.py track')
+        raise Refused(f'--audio record refused: {missing} output samples ({missing / sr:.3f} s) fall outside '
+                      f'{track.path.name} ({len(track.data) / sr:.3f} s); re-run mcam_audio.py track')
     peak = float(np.max(np.abs(out))) if len(out) else 0.0
     np.clip(out, -1.0, 1.0, out=out)
     return out, {'source': str(track.path), 'codec': track.codec, 'rate': sr, 'channels': track.channels, 'samples': total,
@@ -1093,13 +1256,12 @@ def render_audio(track: AudioTrack, mix: list[dict], n: int) -> tuple[np.ndarray
                  'peak_dbfs': round(20 * math.log10(peak), 2) if peak > 1e-10 else -200.0}
 
 
-def mux_cmd(video: Path, wav: Path, out: Path, codec: str) -> list:
-    cmd = [MT.FFMPEG, '-hide_banner', '-loglevel', 'error', '-y', '-i', str(video), '-i', str(wav), '-map', '0:v:0', '-map',
-           '1:a:0', '-c:v', 'copy']
+def audio_args(codec: str | None) -> list:
+    if codec is None:
+        return []
     if codec == 'flac':
-        return cmd + ['-c:a', 'flac', '-sample_fmt', 's16', '-ar', str(AUDIO_RATE), str(out)]
-    return cmd + ['-c:a', 'aac', '-profile:a', 'aac_low', '-b:a', '320k', '-ar', str(AUDIO_RATE), '-tag:v', 'hvc1',
-                  '-movflags', '+faststart', str(out)]
+        return ['-c:a', 'flac', '-sample_fmt', 's16', '-ar', str(AUDIO_RATE)]
+    return ['-c:a', 'aac', '-profile:a', 'aac_low', '-b:a', '320k', '-ar', str(AUDIO_RATE)]
 
 
 # ------------------------------------------------------------------------------------------------------------- encoding
@@ -1144,12 +1306,17 @@ def encode_cfg(ctx: Ctx) -> EncodeCfg:
     return cfg
 
 
-def ffmpeg_cmd(cfg: EncodeCfg, W: int, H: int, fps: float, out: Path) -> tuple[list, int, int]:
+def ffmpeg_cmd(cfg: EncodeCfg, W: int, H: int, fps: float, out: Path, wav: Path | None = None, audio: str | None = None,
+               threads: int = 0) -> tuple[list, int, int]:
+    """The encode command: raw rgb48le frames on stdin and, with `wav`, the rendered sound as a second input, so the video
+    and its audio are written in one pass."""
     W2, H2 = (even(W * cfg.scale), even(H * cfg.scale)) if cfg.scale != 1.0 else (W, H)
     pix = 'yuv420p10le' if cfg.bits == 10 else 'yuv420p'
     tags = 'setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv'
-    head = [MT.FFMPEG, '-hide_banner', '-loglevel', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb48le', '-s', f'{W}x{H}',
-            '-framerate', f'{fps:g}', '-i', '-', '-an']
+    head = [FF.ffmpeg(), '-hide_banner', '-loglevel', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb48le', '-s', f'{W}x{H}',
+            '-framerate', f'{fps:g}', '-i', '-']
+    head += ['-i', str(wav), '-map', '0:v:0', '-map', '1:a:0'] if wav is not None else ['-an']
+    st = max(1, int(threads) or min(8, os.cpu_count() or 4))
     if cfg.codec == 'x265':
         size = f'w={W2}:h={H2}:filter=spline36:' if (W2, H2) != (W, H) else ''
         vf = f'zscale={size}matrix=709:range=limited:dither=error_diffusion,format={pix},{tags}'
@@ -1158,7 +1325,7 @@ def ffmpeg_cmd(cfg: EncodeCfg, W: int, H: int, fps: float, out: Path) -> tuple[l
         if cfg.bits == 8:
             codec += ['-profile:v', 'main']
     elif cfg.draft:
-        vf = f'scale=w={W2}:h={H2}:flags=area:out_color_matrix=bt709:out_range=tv:threads=8,format={pix},{tags}'
+        vf = f'scale=w={W2}:h={H2}:flags=area:out_color_matrix=bt709:out_range=tv:threads={st},format={pix},{tags}'
         codec = ['-c:v', 'hevc_nvenc', '-preset', cfg.nvpreset, '-rc', 'vbr', '-cq', f'{cfg.cq:g}', '-b:v', '0']
     else:
         size = f'w={W2}:h={H2}:filter=spline36:' if (W2, H2) != (W, H) else ''
@@ -1166,18 +1333,16 @@ def ffmpeg_cmd(cfg: EncodeCfg, W: int, H: int, fps: float, out: Path) -> tuple[l
         codec = ['-c:v', 'hevc_nvenc', '-preset', cfg.nvpreset, '-tune', 'hq', '-profile:v', 'main10' if cfg.bits == 10 else 'main',
                  '-rc', 'vbr', '-cq', f'{cfg.cq:g}', '-b:v', '0', '-spatial-aq', '1', '-temporal-aq', '1', '-aq-strength', '8',
                  '-bf', '3', '-b_ref_mode', 'middle', '-rc-lookahead', '32']
-    return head + ['-vf', vf] + codec + ['-tag:v', 'hvc1', '-movflags', '+faststart', str(out)], W2, H2
+    mp4 = [] if out.suffix.lower() == '.mkv' else ['-tag:v', 'hvc1', '-movflags', '+faststart']
+    return head + ['-vf', vf] + codec + audio_args(audio if wav is not None else None) + mp4 + [str(out)], W2, H2
 
 
 def ffprobe(path: Path, count: bool = False) -> dict:
-    p = subprocess.run([MT.FFPROBE, '-v', 'error', *(['-count_packets'] if count else []), '-show_entries',
-                        'stream=index,codec_type,codec_name,codec_tag_string,profile,pix_fmt,width,height,nb_frames,'
-                        + ('nb_read_packets,' if count else '') + 'color_space,color_transfer,color_primaries,color_range,'
-                        'r_frame_rate,sample_rate,channels,duration:stream_tags=DURATION:format=duration,size', '-of', 'json',
-                        str(path)], capture_output=True, text=True)
-    if p.returncode != 0:
-        return {'error': p.stderr.strip()}
-    return json.loads(p.stdout or '{}')
+    """Streams and format of a media file; {'error': text} when ffprobe fails."""
+    try:
+        return FF.probe(path, count)
+    except FF.FfError as e:
+        return {'error': str(e)}
 
 
 def stream_seconds(s: dict) -> float:
@@ -1236,48 +1401,110 @@ def verify_video(path: Path, frames: int, W: int, H: int, bits: int, audio: str 
     return probs
 
 
+def lock_path() -> Path:
+    """One lock for this user's heavy encodes: in MCAM_OUT when that is set, else in the temp folder."""
+    root = os.environ.get('MCAM_OUT')
+    return (Path(root) if root else Path(tempfile.gettempdir())) / LOCK_NAME
+
+
+def proc_start(pid: int) -> int | None:
+    """Start time of a running process as an opaque number, 0 when it runs but the time cannot be read, None when no such
+    process runs. Stored in the lock next to the pid, so a pid that the system gave to another program does not count."""
+    if pid <= 0:
+        return None
+    if os.name == 'nt':
+        try:
+            k = ctypes.WinDLL('kernel32', use_last_error=True)
+            k.OpenProcess.restype = ctypes.c_void_p
+            k.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+            k.GetProcessTimes.argtypes = [ctypes.c_void_p] + [ctypes.c_void_p] * 4
+            k.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            k.CloseHandle.argtypes = [ctypes.c_void_p]
+            h = k.OpenProcess(0x1000, 0, int(pid))
+            if not h:
+                return 0 if ctypes.get_last_error() == 5 else None
+            try:
+                code = ctypes.c_ulong(0)
+                if k.GetExitCodeProcess(h, ctypes.byref(code)) and code.value != 259:
+                    return None
+                t = [ctypes.c_ulonglong(0) for _ in range(4)]
+                if not k.GetProcessTimes(h, *[ctypes.byref(x) for x in t]):
+                    return 0
+                return int(t[0].value)
+            finally:
+                k.CloseHandle(h)
+        except (OSError, AttributeError):
+            return 0
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except OSError:
+        return 0
+    try:
+        return int(Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def pid_alive(pid: int) -> bool:
+    return pid == os.getpid() or proc_start(pid) is not None
+
+
+def lock_owner(path: Path) -> tuple[int, bool]:
+    """(pid, alive) of the lock file: alive only when that process runs and, where both are known, started at the time the
+    lock recorded."""
+    try:
+        parts = path.read_text().split()
+        pid, start = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+    except (OSError, ValueError, IndexError):
+        return 0, False
+    now = proc_start(pid)
+    return pid, now is not None and (not start or not now or start == now)
+
+
 class EncodeLock:
-    def __init__(self, force: bool):
+    def __init__(self, force: bool, enabled: bool = True):
         self.force = force
+        self.enabled = enabled
         self.held = False
+        self.path = lock_path()
 
     def __enter__(self):
-        MT.OUT_ROOT.mkdir(parents=True, exist_ok=True)
+        if not self.enabled:
+            return self
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise Refused(f'cannot make the folder of the encode lock {self.path} ({e.strerror or e}); pass --no-lock') from None
         for _ in range(2):
             try:
-                fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(fd, str(os.getpid()).encode())
+                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, f'{os.getpid()} {proc_start(os.getpid()) or 0}'.encode())
                 os.close(fd)
                 self.held = True
                 return self
             except FileExistsError:
+                pid, alive = lock_owner(self.path)
+                if alive and not self.force:
+                    raise Refused(f'another encode is running (pid {pid}, {self.path}); one heavy encode at a time '
+                                  f'(--no-lock to run anyway)')
                 try:
-                    pid = int(LOCK_PATH.read_text().strip() or 0)
-                except (OSError, ValueError):
-                    pid = 0
-                if pid and pid_alive(pid) and not self.force:
-                    raise SystemExit(f'another encode is running (pid {pid}, {LOCK_PATH}); one heavy encode at a time (--force to ignore)')
-                try:
-                    LOCK_PATH.unlink()
+                    self.path.unlink()
                 except OSError:
                     pass
+            except OSError as e:
+                raise Refused(f'cannot write the encode lock {self.path} ({e.strerror or e}); pass --no-lock') from None
         if not self.force:
-            raise SystemExit(f'cannot take the encode lock {LOCK_PATH}')
+            raise Refused(f'cannot take the encode lock {self.path} (--no-lock to run without it)')
         return self
 
     def __exit__(self, *exc):
         if self.held:
             try:
-                LOCK_PATH.unlink()
+                self.path.unlink()
             except OSError:
                 pass
-
-
-def pid_alive(pid: int) -> bool:
-    if pid == os.getpid():
-        return True
-    p = subprocess.run(['tasklist', '/FI', f'PID eq {pid}', '/NH'], capture_output=True, text=True)
-    return str(pid) in p.stdout
 
 
 class MemStatus(ctypes.Structure):
@@ -1297,16 +1524,105 @@ def free_commit_gb() -> float:
         return float('inf')
 
 
-def safety_checks(force: bool) -> None:
+def commit_need_gb(ctx: Ctx) -> float:
+    """Commit memory an encode of this take needs: the frame cache, the frames in flight per encode (two per worker in the
+    queue, the canvas and a copy for ffmpeg; a canvas can be twice a source frame) and some headroom."""
+    a = ctx.args
+    w, h = max((s for s in ctx.sizes.values()), key=lambda s: s[0] * s[1], default=ctx.src_size)
+    frame = 2 * max(1, w) * max(1, h) * 6
+    jobs = max(1, int(getattr(a, 'jobs', 0) or 1))
+    flight = jobs * (2 * threads_of(a) + 4) * frame
+    return COMMIT_HEADROOM_GB + int(getattr(a, 'cache_mb', 1536)) / 1024.0 + flight / 2 ** 30
+
+
+def safety_checks(force: bool, need_gb: float | None = None, mem_check: bool = True) -> None:
+    need = COMMIT_HEADROOM_GB if need_gb is None else float(need_gb)
     gb = free_commit_gb()
-    if gb < MIN_COMMIT_GB and not force:
-        raise SystemExit(f'only {gb:.1f} GB free commit (< {MIN_COMMIT_GB:.0f} GB); close something or pass --force')
+    if mem_check and gb < need and not force:
+        raise Refused(f'only {gb:.1f} GB free commit memory, this encode needs about {need:.1f} GB; close something, lower '
+                      f'--cache-mb / --threads / --jobs, or pass --no-mem-check')
+    if os.name == 'nt':
+        try:
+            p = FF.run(['tasklist', '/FI', 'IMAGENAME eq INSIDE.exe', '/NH', '/FO', 'CSV'], timeout=15.0, check=False, name='tasklist')
+            if 'INSIDE.exe' in p.out:
+                print('warning: INSIDE.exe is running; encoding competes with the game for CPU/GPU', flush=True)
+        except FF.FfError:
+            pass
+
+
+def file_sig(path) -> list:
     try:
-        p = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq INSIDE.exe', '/NH'], capture_output=True, text=True)
-        if 'INSIDE.exe' in p.stdout:
-            print('warning: INSIDE.exe is running; encoding competes with the game for CPU/GPU', flush=True)
+        st = Path(path).stat()
+        return [int(st.st_size), int(st.st_mtime)]
     except OSError:
-        pass
+        return [-1, -1]
+
+
+def take_sig(take: Take) -> list:
+    out = [[n, file_sig(take.root / n)] for n in ('meta.csv', 'events.csv', 'run.json', 'spec.json')]
+    for c in take.cams.values():
+        if c.ext == 'mkv':
+            out.append([c.name, 'mkv', file_sig(c.video)])
+        else:
+            steps = sorted(c.files)
+            ends = [file_sig(c.files[s]) for s in (steps[:1] + steps[-1:])]
+            out.append([c.name, c.ext, len(steps), steps[:1], steps[-1:], ends])
+    return out
+
+
+def text_sig(path) -> str:
+    try:
+        return hashlib.sha1(Path(path).read_bytes()).hexdigest() if path and Path(path).is_file() else str(path or '')
+    except OSError:
+        return str(path)
+
+
+def job_key(ctx: Ctx, out: Path, cfg: EncodeCfg, W: int, H: int, fps: float, n: int, title: str, audio: bool) -> str:
+    """Everything that decides the pixels and the sound of one output, as one hash (--resume compares it)."""
+    a = ctx.args
+    doc = {'v': RESUME_VERSION, 'out': out.name, 'title': title, 'size': [W, H], 'fps': fps, 'frames': n, 'encode': asdict(cfg),
+           'compose': ctx.cfg, 'take': take_sig(ctx.take), 'gpu': bool(ctx.store.gpu), 'blur': ctx.blur_space,
+           'args': {k: getattr(a, k, None) for k in ('range', 'frames', 'fps', 'speed', 'shutter', 'no_grade', 'cams', 'rate', 'group',
+                                                     'event', 'labels', 'hold', 'dissolve')},
+           'files': {k: text_sig(getattr(a, k, None)) for k in ('compose', 'grade', 'layout', 'edit')},
+           'grades': {c: g.describe() for c, g in sorted(ctx.grades.items())},
+           'audio': [ctx.audio.codec, file_sig(ctx.audio.path)] if audio and ctx.audio is not None else None}
+    return hashlib.sha1(json.dumps(doc, sort_keys=True, default=str).encode('utf-8')).hexdigest()
+
+
+def resume_hit(ctx: Ctx, out: Path, key: str, n: int, W2: int, H2: int, bits: int, codec: str | None, fps: float) -> dict | None:
+    """The logged result of an earlier run for this output when the video is still the one that run wrote, was made from
+    the same inputs and passes the check again; else None (encode)."""
+    for entry in reversed(read_log(ctx.out / LOG_NAME)):
+        for it in result_items(entry.get('result')):
+            if it.get('inputs') != key or it.get('verify') != 'ok':
+                continue
+            f = Path(it['file'])
+            if f.is_file() and it.get('stamp') == file_sig(f) and not verify_video(f, n, W2, H2, bits, codec, fps):
+                return dict(it, resumed=True)
+    return None
+
+
+def place_output(tmp: Path, out: Path) -> Path:
+    """Moves the finished file over the old output. When the old one is open in another program (a player) the new video
+    gets the name <name>_new and that name is returned."""
+    try:
+        os.replace(tmp, out)
+        return out
+    except PermissionError:
+        alt = out.with_name(out.stem + '_new' + out.suffix)
+        os.replace(tmp, alt)
+        note(f'{out.name} is open in another program and was not replaced: the new video is {alt.name}')
+        return alt
+
+
+def remove_quietly(*files) -> None:
+    for f in files:
+        if f is not None:
+            try:
+                Path(f).unlink()
+            except OSError:
+                pass
 
 
 def encode_video(ctx: Ctx, out: Path, W: int, H: int, fps: float, n: int, make_frame, title: str,
@@ -1319,81 +1635,63 @@ def encode_video(ctx: Ctx, out: Path, W: int, H: int, fps: float, n: int, make_f
         sound = render_audio(ctx.audio, audio_mix, n)
         if ctx.audio.codec == 'flac':
             out = out.with_suffix('.mkv')
-    tmp = out.with_name(out.stem + '.partial.mp4')
-    cmd, W2, H2 = ffmpeg_cmd(cfg, W, H, fps, tmp)
+    codec = ctx.audio.codec if sound is not None else None
+    tmp = out.with_name(out.stem + '.partial' + out.suffix)
+    wav = out.with_name(out.stem + '.partial.wav') if sound is not None else None
+    workers = threads_of(ctx.args)
+    cmd, W2, H2 = ffmpeg_cmd(cfg, W, H, fps, tmp, wav, codec, workers)
+    key = job_key(ctx, out, cfg, W, H, fps, n, title, sound is not None)
+    if getattr(ctx.args, 'resume', False):
+        hit = resume_hit(ctx, out, key, n, W2, H2, cfg.bits, codec, fps)
+        if hit is not None:
+            print(f'{title}: {Path(hit["file"]).name} is up to date (same inputs, check ok): skipped by --resume', flush=True)
+            return hit
     still_set = set(np.linspace(0, n - 1, stills).round().astype(int).tolist()) if stills > 0 and n > 0 else set()
     still_dir = ctx.out / 'stills'
-    workers = threads_of(ctx.args)
     t0 = time.time()
     print(f'{title}: {n} frames {W}x{H} -> {out.name} ({cfg.codec}{" draft" if cfg.draft else ""}, {W2}x{H2}, {fps:g} fps)', flush=True)
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    err: list[bytes] = []
-    drain = threading.Thread(target=lambda: err.append(proc.stderr.read()), daemon=True)
-    drain.start()
     ok = False
     try:
-        with ThreadPoolExecutor(workers) as pool:
+        if wav is not None:
+            MA.write_wav(wav, sound[0], ctx.audio.rate, pcm16=False)
+        with FF.Child(cmd, stdin=True, name='ffmpeg') as enc, ThreadPoolExecutor(workers) as pool:
             q: deque = deque()
-            nxt = 0
-            last = t0
-            for j in range(n):
-                while nxt < n and len(q) < workers * 2:
-                    q.append(pool.submit(make_frame, nxt))
-                    nxt += 1
-                img = q.popleft().result()
-                if img.shape != (H, W, 3) or img.dtype != np.uint16:
-                    raise RuntimeError(f'frame {j}: got {img.shape} {img.dtype}, want {(H, W, 3)} uint16')
-                proc.stdin.write(np.ascontiguousarray(img).data)
-                if j in still_set:
-                    still_dir.mkdir(parents=True, exist_ok=True)
-                    save_png8(img, still_dir / f'{out.stem}_{j:05d}.png', max_w=1600)
-                now = time.time()
-                if now - last > 5 or j == n - 1:
-                    last = now
-                    print(f'  {title}: {j + 1}/{n} frames, {(j + 1) / max(now - t0, 1e-6):.1f} fps', flush=True)
-        proc.stdin.close()
-        code = proc.wait()
-        drain.join(5)
-        if code != 0:
-            raise RuntimeError(f'ffmpeg exit {code}: {b"".join(err).decode(errors="replace")[-800:]}')
+            try:
+                nxt = 0
+                last = t0
+                for j in range(n):
+                    if STOP.is_set():
+                        raise RuntimeError(f'{title}: stopped because another encode of this run failed or was interrupted')
+                    while nxt < n and len(q) < workers * 2:
+                        q.append(pool.submit(make_frame, nxt))
+                        nxt += 1
+                    img = q.popleft().result()
+                    if img.shape != (H, W, 3) or img.dtype != np.uint16:
+                        raise RuntimeError(f'frame {j}: got {img.shape} {img.dtype}, want {(H, W, 3)} uint16')
+                    enc.write(np.ascontiguousarray(img).data)
+                    if j in still_set:
+                        still_dir.mkdir(parents=True, exist_ok=True)
+                        save_png8(img, still_dir / f'{out.stem}_{j:05d}.png', max_w=1600)
+                    now = time.time()
+                    if now - last > 5 or j == n - 1:
+                        last = now
+                        print(f'  {title}: {j + 1}/{n} frames, {(j + 1) / max(now - t0, 1e-6):.1f} fps', flush=True)
+            except BaseException:
+                for fu in q:
+                    fu.cancel()
+                raise
         ok = True
     finally:
-        if not ok:
-            try:
-                proc.kill()
-            except OSError:
-                pass
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-    if sound is not None:
-        wav = out.with_name(out.stem + '.partial.wav')
-        mux = out.with_name(out.stem + '.mux.partial' + out.suffix)
-        muxed = False
-        try:
-            MT.write_wav(wav, sound[0], ctx.audio.rate)
-            p = subprocess.run(mux_cmd(tmp, wav, mux, ctx.audio.codec), capture_output=True, text=True)
-            if p.returncode != 0:
-                raise RuntimeError(f'ffmpeg mux exit {p.returncode}: {p.stderr[-800:]}')
-            muxed = True
-        finally:
-            for f in (wav, tmp) if muxed else (wav, tmp, mux):
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
-        tmp = mux
-    if out.exists():
-        out.unlink()
-    tmp.rename(out)
-    codec = ctx.audio.codec if sound is not None else None
+        remove_quietly(wav, None if ok else tmp)
+    out = place_output(tmp, out)
     probs = verify_video(out, n, W2, H2, cfg.bits, codec, fps)
     dt = time.time() - t0
     res = {'file': str(out), 'frames': n, 'size': [W2, H2], 'fps': fps, 'seconds': round(n / fps, 3), 'codec': cfg.codec,
-           'encode_s': round(dt, 1), 'mb': round(out.stat().st_size / 2 ** 20, 2), 'verify': probs or 'ok'}
+           'encode_s': round(dt, 1), 'mb': round(out.stat().st_size / 2 ** 20, 2), 'verify': probs or 'ok', 'inputs': key,
+           'stamp': file_sig(out)}
     if sound is not None:
         res['audio'] = sound[1]
+    wrote(out)
     print(f'  done in {dt:.1f} s, {res["mb"]} MB, {"audio " + codec + ", " if codec else ""}ffprobe: '
           f'{"ok" if not probs else "; ".join(probs)}', flush=True)
     return res
@@ -1456,6 +1754,7 @@ def cmd_scan(ctx: Ctx) -> dict:
         except (SystemExit, TakeError) as e:
             doc['edit_error'] = str(e)
     (ctx.out / 'timeline.json').write_text(json.dumps(doc, indent=1), encoding='utf-8')
+    wrote(ctx.out / 'timeline.json')
     print(f'take {take.root} ({take.kind}{", " + take.mode if take.replay_mode else ""}), {len(take.cams)} cameras, '
           f'{s["steps"]} steps, {s["frames"]} output frames at {take.fps:g} fps = {s["output_seconds"]} s, '
           f'game {s["game_seconds"][0]}..{s["game_seconds"][1]} s'
@@ -1555,6 +1854,7 @@ def current_edit(ctx: Ctx, required: bool = True) -> dict | None:
     print('no edit given (compose.edit or --edit); drafting one with autocut', flush=True)
     e = autocut_edit(ctx)
     (ctx.out / 'edit_autocut.json').write_text(json.dumps(e, indent=1), encoding='utf-8')
+    wrote(ctx.out / 'edit_autocut.json')
     return e
 
 
@@ -1665,7 +1965,7 @@ def warm_grades(ctx: Ctx, cams: list[str]) -> float:
         job = partial(MT.stats_job, str(ctx.take.root), getattr(a, 'rate', None), getattr(a, 'group', None),
                       parse_events(getattr(a, 'event', None)), gpu=ctx.store.gpu, workers=threads_of(a))
         try:
-            with ProcessPoolExecutor(len(procs)) as pool:
+            with ProcessPoolExecutor(len(procs), initializer=set_stats_root, initargs=(str(MT.OUT_ROOT),)) as pool:
                 list(pool.map(job, procs))
         except Exception as e:
             print(f'grade stats: the parallel processes failed ({type(e).__name__}: {e}); computing them here', flush=True)
@@ -1685,7 +1985,11 @@ def cmd_finals(ctx: Ctx) -> dict:
     n = max(1, min(len(jobs), int(getattr(ctx.args, 'jobs', 0) or 1)))
     print(f'finals: {", ".join(j["title"] for j in jobs)}; grade stats {stats_s} s; {n} encode(s) at once', flush=True)
     with ThreadPoolExecutor(n) as pool:
-        res = list(pool.map(lambda j: run_job(ctx, j), jobs))
+        try:
+            res = list(pool.map(lambda j: run_job(ctx, j), jobs))
+        except BaseException:
+            STOP.set()
+            raise
     doc = {'angles': [r for j, r in zip(jobs, res) if j['kind'] == 'angle'],
            'layouts': [r for j, r in zip(jobs, res) if j['kind'] == 'layout'],
            'grade_stats_s': stats_s, 'jobs': n, 'wall_s': round(time.time() - t0, 1)}
@@ -1795,12 +2099,14 @@ def cmd_review(ctx: Ctx) -> dict:
         with ThreadPoolExecutor(workers) as pool:
             rows = list(pool.map(one, picks))
         with (folder / 'index.csv').open('w', encoding='utf-8', newline='') as fh:
-            fh.write('frame,output_t,game_t,why,file\n')
-            for r in rows:
-                fh.write(','.join(str(x) for x in r) + '\n')
+            cw = csv.writer(fh, lineterminator='\n')
+            cw.writerow(['frame', 'output_t', 'game_t', 'why', 'file'])
+            cw.writerows(rows)
+        wrote(folder)
         doc['outputs'][name] = {'size': [W, H], 'frames': len(rows), 'folder': str(folder)}
         print(f'review {name}: {len(rows)} full-resolution frames {W}x{H} -> {folder} ({time.time() - t0:.1f} s)', flush=True)
     (root / 'review.json').write_text(json.dumps(doc, indent=1), encoding='utf-8')
+    wrote(root / 'review.json')
     print(f'wrote {root / "review.json"}')
     return doc
 
@@ -1817,6 +2123,7 @@ def cmd_cut(ctx: Ctx) -> dict:
         n = min(n, int(ctx.args.frames))
     name = safe_name(plan.name)
     (ctx.out / f'cut_{name}.json').write_text(json.dumps(plan.to_json(), indent=1), encoding='utf-8')
+    wrote(ctx.out / f'cut_{name}.json')
     print(f'cut {plan.name}: {plan.total} frames = {plan.total / plan.tl.fps:.2f} s ({plan.tl.mode} timeline), '
           + ', '.join(f'{s.cam} {s.n / plan.tl.fps:.1f}s' for s in plan.shots), flush=True)
 
@@ -1852,14 +2159,16 @@ def cmd_grade(ctx: Ctx) -> dict:
         lut = g.lut('g16', g.spec.ev)
         idx = np.linspace(0, 65535, 1024).round().astype(int)
         vals = lut[idx] / 65535.0
-        lines = ['TITLE "mcam grade ' + cam + '"', 'LUT_1D_SIZE 1024'] + [f'{v:.6f} {v:.6f} {v:.6f}' for v in vals]
-        (ctx.out / f'grade_{safe_name(cam)}.cube').write_text('\n'.join(lines) + '\n', encoding='ascii')
+        lines = ['TITLE "mcam grade ' + cam.replace('"', "'") + '"', 'LUT_1D_SIZE 1024'] + [f'{v:.6f} {v:.6f} {v:.6f}' for v in vals]
+        (ctx.out / f'grade_{safe_name(cam)}.cube').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        wrote(ctx.out / f'grade_{safe_name(cam)}.cube')
         xs = np.unique(np.concatenate([np.linspace(0, 1, 17), [g.floor]]))
         pts = ' '.join(f'{x:.4f}/{lut[int(round(x * 65535))] / 65535.0:.4f}' for x in xs)
         doc[cam]['ffmpeg_curves'] = f"curves=all='{pts}'"
         print(f'{cam:<14} floor {doc[cam]["floor_8bit"]:6.2f}/255  lift {g.spec.lift} k {g.spec.k} ev {g.spec.ev}'
               f'{"  auto ev " + str(doc[cam]["auto_ev"]) if g.spec.auto else ""}')
     (ctx.out / 'grade.json').write_text(json.dumps(doc, indent=1), encoding='utf-8')
+    wrote(ctx.out / 'grade.json')
     print(f'wrote {ctx.out / "grade.json"} and grade_<cam>.cube')
     return doc
 
@@ -1908,11 +2217,19 @@ def cmd_director(ctx: Ctx) -> dict:
     cam = {'name': 'director', 'mode': 'director', 'label': 'Director', 'minHold': float(edit.get('minHold', 4.0)), 'shots': shots}
     text = json.dumps(cam, indent=1)
     dest = Path(ctx.args.out) if getattr(ctx.args, 'out', None) and str(ctx.args.out).lower().endswith('.json') else ctx.out / f'director_{safe_name(str(edit.get("name", "cut")))}.json'
-    root = MT.OUT_ROOT.resolve()
-    if root not in dest.resolve().parents and not getattr(ctx.args, 'force', False):
-        raise SystemExit(f'{dest} is outside {root}; pass --force')
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(text + '\n', encoding='utf-8')
+    if dest.is_file() and not getattr(ctx.args, 'force', False):
+        try:
+            old = json.loads(dest.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            old = None
+        if not (isinstance(old, dict) and old.get('mode') == 'director'):
+            raise Refused(f'{dest} exists and is not a director camera block; pass --force to overwrite it')
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text + '\n', encoding='utf-8')
+    except OSError as e:
+        raise Refused(f'cannot write {dest} ({e.strerror or e})') from None
+    wrote(dest)
     print(text)
     for w in warn:
         print(f'warning: {w}')
@@ -1937,6 +2254,8 @@ def autocut_edit(ctx: Ctx) -> dict:
     tl = limit_timeline(ctx, base_timeline(ctx))
     fps = tl.fps
     cams = [c for c in cams_arg(ctx, 'all') if ctx.take.cams[c].mode != 'director']
+    if not cams:
+        raise SystemExit('autocut: no camera to cut between (director cameras are not used; see --cams)')
     hold = str(getattr(ctx.args, 'hold', None) or '4:6')
     hmin, _, hmax = hold.partition(':')
     hmin, hmax = float(hmin), float(hmax or hmin)
@@ -1993,9 +2312,143 @@ def cmd_autocut(ctx: Ctx) -> dict:
     e = autocut_edit(ctx)
     p = ctx.out / 'edit_autocut.json'
     p.write_text(json.dumps(e, indent=1), encoding='utf-8')
+    wrote(p)
     print(json.dumps(e, indent=1))
     print(f'wrote {p}')
     return e
+
+
+# --------------------------------------------------------------------------------------------------------------- doctor
+
+def ffmpeg_age(text: str, num: tuple | None) -> tuple[str, str]:
+    if num is not None:
+        return ('ok', '') if num >= (6, 1) else ('warn', 'older than 6.1: update ffmpeg (the encode options were tested on 6.1 and later)')
+    y = text[:10].split('-')
+    if len(y) == 3 and all(p.isdigit() for p in y):
+        return ('ok', '') if (int(y[0]), int(y[1])) >= (2023, 11) else ('warn', 'a build from before 6.1: update ffmpeg')
+    return 'info', 'version not recognised'
+
+
+def ff_test(cmd: list) -> str:
+    try:
+        FF.run([FF.ffmpeg(), '-hide_banner', '-loglevel', 'error', '-threads', '2'] + cmd, timeout=90.0)
+        return ''
+    except FF.FfError as e:
+        return str(e)
+
+
+def folder_writable(path: Path) -> str:
+    p = path
+    while not p.exists() and p.parent != p:
+        p = p.parent
+    try:
+        with tempfile.NamedTemporaryFile(dir=str(p), prefix='.mcam_doctor_'):
+            pass
+        return ''
+    except OSError as e:
+        return f'{p}: {e.strerror or e}'
+
+
+def doctor_rows(args) -> list[dict]:
+    rows: list[dict] = []
+
+    def add(level: str, name: str, detail: str, fix: str = '') -> None:
+        rows.append({'check': name, 'level': level, 'detail': detail, 'fix': fix})
+
+    tools_ok = True
+    for which in ('ffmpeg', 'ffprobe'):
+        try:
+            text, num = FF.version(which)
+            level, why = ffmpeg_age(text, num) if which == 'ffmpeg' else ('ok', '')
+            add(level, which, f'{FF.exe(which)}  version {text}', why)
+        except FF.FfError as e:
+            tools_ok = False
+            add('fail', which, str(e), f'install ffmpeg (6.1 or later, a build with NVENC and libzimg) and put it on PATH, or set {which.upper()}')
+    if tools_ok:
+        try:
+            enc, flt = FF.encoders(), FF.filters()
+        except FF.FfError as e:
+            enc, flt = set(), set()
+            add('fail', 'ffmpeg lists', str(e))
+        chain = 'zscale=matrix=709:range=limited:dither=error_diffusion,format=yuv420p10le'
+        null = ['-f', 'null', '-']
+        src = ['-f', 'lavfi', '-i', 'color=c=gray:s=256x144:r=30,format=rgb48le', '-frames:v', '2']
+        z = 'zscale' in flt
+        zerr = ff_test(src + ['-vf', chain] + null) if z else 'filter zscale is not in this ffmpeg'
+        add('ok' if not zerr else 'fail', 'filter zscale', 'RGB to BT.709 limited 10 bit works' if not zerr else zerr,
+            '' if not zerr else 'install an ffmpeg build with libzimg (zscale); only --draft encodes work without it')
+        nv = 'hevc_nvenc' in enc
+        nerr = ff_test(src + ['-vf', chain if not zerr else 'format=yuv420p10le', '-c:v', 'hevc_nvenc', '-preset', 'p5'] + null) if nv \
+            else 'encoder hevc_nvenc is not in this ffmpeg'
+        add('ok' if not nerr else 'warn', 'encoder hevc_nvenc', 'test encode ok (the default codec)' if not nerr else nerr,
+            '' if not nerr else 'use --codec x265 (no NVIDIA encoder here: needs an NVIDIA card, a current driver and an ffmpeg build with NVENC)')
+        xerr = ff_test(src + ['-vf', chain if not zerr else 'format=yuv420p10le', '-c:v', 'libx265', '-preset', 'ultrafast',
+                              '-x265-params', 'log-level=error:pools=2'] + null) if 'libx265' in enc else 'encoder libx265 is not in this ffmpeg'
+        add('ok' if not xerr else ('fail' if nerr else 'warn'), 'encoder libx265', 'test encode ok (--codec x265)' if not xerr else xerr,
+            '' if not xerr else 'install an ffmpeg build with libx265' + ('' if nerr else ' (only needed for --codec x265)'))
+        aerr = '' if 'aac' in enc else 'encoder aac is not in this ffmpeg'
+        add('ok' if not aerr else 'warn', 'encoder aac', 'present (--audio record)' if not aerr else aerr,
+            '' if not aerr else '--audio record needs it; --audio-codec flac writes MKV instead')
+        cuda = 'scale_cuda' in flt and 'hwdownload' in flt
+        add('ok' if cuda else 'warn', 'filter scale_cuda', 'present (GPU decode of the camera videos)' if cuda else 'not in this ffmpeg',
+            '' if cuda else 'the camera videos are decoded on the CPU (same as --cpu)')
+    add('ok' if HAVE_NUMBA else 'warn', 'numba', 'present (fast motion blur and saturation)' if HAVE_NUMBA else 'not installed',
+        '' if HAVE_NUMBA else 'pip install numba (optional: the numpy path is several times slower with sub-step blur)')
+    font = Labels._font('Oswald')
+    add('ok' if font else 'warn', 'label font', str(font) if font else f'none of {FONT_FILES["oswald"]}, {FONT_FILES["bahnschrift"]}',
+        '' if font else 'labels use the small built-in font; set compose.labels.font to a .ttf path or use --no-labels')
+    take = None
+    if getattr(args, 'take', None):
+        try:
+            take = Take(Path(args.take), getattr(args, 'rate', None), getattr(args, 'group', None), parse_events(getattr(args, 'event', None)))
+            add('ok' if len(take.base) else 'fail', 'take', f'{take.root}: {take.kind}, {len(take.cams)} camera(s), {len(take.base)} output '
+                f'frames at {take.fps:g} fps', '' if len(take.base) else 'no complete output frame: check the camera folders and meta.csv')
+            for w in take.warnings[:5]:
+                add('warn', 'take', w)
+        except TakeError as e:
+            add('fail', 'take', str(e), 'give the take folder (the one with the camera folders or <cam>.mkv files)')
+    if take is not None and len(take.base):
+        mkvs = [c.video for c in take.cams.values() if c.ext == 'mkv' and c.video is not None]
+        if mkvs and tools_ok:
+            gpu = MT.cuda_ok(mkvs[0])
+            add('ok' if gpu else 'warn', 'GPU decode', f'{mkvs[0].name}: ' + ('NVDEC test ok' if gpu else 'NVDEC test failed'),
+                '' if gpu else 'the compositor falls back to the CPU decode by itself (--cpu)')
+        sizes = {}
+        for c in take.cams:
+            try:
+                sizes[c] = take.frame_size(c)
+            except Exception as e:
+                add('fail', 'frame size', f'{c}: {type(e).__name__}: {e}', 'the first frame of this camera does not decode')
+        store = FrameStore(take, cache_mb=1)
+        ctx = Ctx(take, store, {}, args, Path('.'), sizes=sizes, src_size=next(iter(sizes.values()), (0, 0)))
+        need, free = commit_need_gb(ctx), free_commit_gb()
+        add('ok' if free >= need else 'fail', 'memory', f'{free:.1f} GB free commit memory, an encode of this take needs about {need:.1f} GB',
+            '' if free >= need else 'close programs or lower --cache-mb / --threads / --jobs (--no-mem-check skips the check)')
+        given = getattr(args, 'out', None)
+        out, why = (Path(given).resolve(), '--out') if given else default_out(take.root, take.name, take.spec)
+    else:
+        free = free_commit_gb()
+        add('ok' if free >= COMMIT_HEADROOM_GB else 'warn', 'memory', f'{free:.1f} GB free commit memory (give a take for the need of its encode)')
+        out, why = (Path(args.out).resolve(), '--out') if getattr(args, 'out', None) else (None, '')
+    if out is not None:
+        werr = folder_writable(out)
+        add('ok' if not werr else 'fail', 'output folder', f'{out} ({why})' + ('' if not werr else f': not writable ({werr})'),
+            '' if not werr else 'pass --out DIR or set the MCAM_OUT environment variable to a folder you can write')
+    pid, alive = lock_owner(lock_path())
+    if alive and pid != os.getpid():
+        add('warn', 'encode lock', f'an encode is running (pid {pid}, {lock_path()})', 'wait for it, or pass --no-lock')
+    return rows
+
+
+def cmd_doctor(args) -> tuple[int, dict]:
+    rows = doctor_rows(args)
+    fails = sum(1 for r in rows if r['level'] == 'fail')
+    warns = sum(1 for r in rows if r['level'] == 'warn')
+    for r in rows:
+        print(f'{r["level"].upper():<5} {r["check"]:<20} {r["detail"]}' + (f'\n      -> {r["fix"]}' if r['fix'] else ''), flush=True)
+    print(f'doctor: {fails} failed, {warns} warning(s), {len(rows) - fails - warns} ok', flush=True)
+    code = EXIT_BAD if fails else EXIT_OK
+    return code, {'ok': not fails, 'exit': code, 'command': 'doctor', 'failed': fails, 'warnings': warns, 'checks': rows}
 
 
 COMMANDS = {'scan': cmd_scan, 'angles': cmd_angles, 'layout': cmd_layout, 'cut': cmd_cut, 'all': cmd_all, 'finals': cmd_finals,
@@ -2015,10 +2468,10 @@ def parse_events(items: list[str] | None) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('command', choices=sorted(COMMANDS))
-    p.add_argument('take')
+    p.add_argument('command', choices=sorted(set(COMMANDS) | {'doctor'}))
+    p.add_argument('take', nargs='?', help='take folder (optional for doctor)')
     p.add_argument('--compose', help='compose JSON file (else <take>/spec.json "compose")')
-    p.add_argument('--out', help='output folder (default <repo>/out/<take>); director: a .json file')
+    p.add_argument('--out', help='output folder, anywhere (default: see the text above); director: a .json file')
     p.add_argument('--fps', type=float)
     p.add_argument('--range', help='t0:t1 game seconds or @event refs')
     p.add_argument('--frames', type=int, help='limit output frames (tests)')
@@ -2034,7 +2487,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--crf', type=float)
     p.add_argument('--preset')
     p.add_argument('--threads', type=int, default=0)
-    p.add_argument('--jobs', type=int, default=0, help='finals: videos encoded at once (default 1; 2 ran slower on the E2 take)')
+    p.add_argument('--jobs', type=int, default=0, help='finals: videos encoded at once (default 1; more is rarely faster, the '
+                                                       'frame rendering already uses --threads)')
     p.add_argument('--cache-mb', type=int, default=1536)
     p.add_argument('--rate', type=float, help='v1 fallback steps per game second (30)')
     p.add_argument('--group', type=int, help='v1 fallback steps per output frame (1)')
@@ -2056,45 +2510,117 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--audio', choices=['none', 'record'], default='none',
                    help='record: mux the replay take audio_track.wav (refused unless record.json audio.usable is true)')
     p.add_argument('--audio-codec', choices=['aac', 'flac'], default='aac', help='aac: AAC-LC 320 kb/s in MP4; flac: FLAC in MKV')
-    p.add_argument('--force', action='store_true')
+    p.add_argument('--force', action='store_true', help='overwrite foreign files in the output folder, and (as before) ignore '
+                                                        'the encode lock and the memory check')
+    p.add_argument('--no-lock', action='store_true', help='do not take or respect the one-encode-at-a-time lock')
+    p.add_argument('--no-mem-check', action='store_true', help='skip the free commit memory check')
+    p.add_argument('--min-commit-gb', type=float, help='free commit memory an encode needs (default: from the frame size, '
+                                                       '--cache-mb, --threads and --jobs)')
+    p.add_argument('--resume', action='store_true', help='skip a video that exists, passes its check and was made from the same '
+                                                         'inputs (compose_log.json); the rest is encoded')
+    p.add_argument('--json', action='store_true', help='one JSON object on stdout at the end (ok, exit, outputs, errors, '
+                                                       'warnings, written); progress goes to stderr')
     p.add_argument('--cpu', action='store_true', help='old CPU path: decode the camera videos on the CPU and shrink cells with INTER_AREA (fallback)')
     return p
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def write_log(ctx: Ctx, command: str, argv: list, res) -> None:
+    log = ctx.out / LOG_NAME
+    hist = read_log(log, set_aside=True)
+    hist.append({'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'command': command, 'argv': list(argv), 'result': res,
+                 'grades': {c: g.describe() for c, g in ctx.grades.items()}})
+    tmp = log.with_name(log.name + '.tmp')
+    tmp.write_text(json.dumps(hist[-LOG_KEEP:], indent=1, default=str), encoding='utf-8')
+    os.replace(tmp, log)
+    wrote(log)
+
+
+def run_command(args, argv: list, state: dict) -> int:
+    """Runs one command; returns the exit code. state gets 'take', 'out' and 'result' for the --json summary."""
+    if args.command == 'doctor':
+        code, state['doctor'] = cmd_doctor(args)
+        return code
+    if not args.take:
+        raise SystemExit(f'usage: mcam_compose.py {args.command} <take> [options] (the take folder is missing)')
     try:
         take = Take(Path(args.take), args.rate, args.group, parse_events(args.event))
     except TakeError as e:
-        print(f'error: {e}', file=sys.stderr)
-        return 2
+        raise SystemExit(f'error: {e}') from None
+    state['take'] = take
     if not len(take.base):
-        print('error: take has no complete output frames', file=sys.stderr)
-        return 2
-    ctx = make_ctx(take, args)
+        raise SystemExit('error: take has no complete output frames')
     try:
-        if args.command in HEAVY and args.audio == 'record':
+        ctx = make_ctx(take, args)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise SystemExit(f'cannot read the compose settings: {type(e).__name__}: {e}') from None
+    state['out'] = ctx.out
+    try:
+        heavy = args.command in HEAVY
+        if heavy and args.audio == 'record':
             ctx.audio = load_audio(ctx)
             check_audio_plan(ctx, args.command)
-        if args.command in HEAVY:
+        if heavy:
             print(f'decode: {"GPU (NVDEC + scale_cuda)" if ctx.store.gpu else "CPU"}', flush=True)
-            safety_checks(args.force)
-            with EncodeLock(args.force):
+            need = args.min_commit_gb if args.min_commit_gb is not None else commit_need_gb(ctx)
+            safety_checks(args.force, need, not args.no_mem_check)
+            with EncodeLock(args.force, not args.no_lock):
                 res = COMMANDS[args.command](ctx)
         else:
             res = COMMANDS[args.command](ctx)
-        if args.command in HEAVY:
-            log = ctx.out / 'compose_log.json'
-            hist = json.loads(log.read_text(encoding='utf-8')) if log.is_file() else []
-            hist.append({'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'command': args.command, 'argv': sys.argv[1:], 'result': res,
-                         'grades': {c: g.describe() for c, g in ctx.grades.items()}})
-            log.write_text(json.dumps(hist, indent=1), encoding='utf-8')
-    except TakeError as e:
-        print(f'error: {e}', file=sys.stderr)
-        return 1
+        state['result'] = res
+        if heavy:
+            write_log(ctx, args.command, argv, res)
+            bad = [it for it in result_items(res) if it.get('verify', 'ok') != 'ok']
+            if bad:
+                for it in bad:
+                    state['errors'].append(f'{Path(it["file"]).name}: ' + '; '.join(map(str, it['verify'] if isinstance(it['verify'], list) else [it['verify']])))
+                print(f'error: {len(bad)} output(s) failed the check: ' + ', '.join(Path(it['file']).name for it in bad), file=sys.stderr)
+                return EXIT_BAD
+        return EXIT_OK
     finally:
         ctx.store.close()
-    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    FF.utf8_stdio()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(argv)
+    js = FF.JsonMode(args.json)
+    del WRITTEN[:]
+    del NOTES[:]
+    STOP.clear()
+    state: dict = {'errors': []}
+
+    def fail(code: int, text: str, prefix: str = 'error: ') -> int:
+        state['errors'].append(text)
+        print(prefix + text, file=sys.stderr, flush=True)
+        return code
+
+    try:
+        code = run_command(args, argv, state)
+    except Refused as e:
+        code = fail(EXIT_REFUSED, str(e.code), '')
+    except SystemExit as e:
+        if not isinstance(e.code, str):
+            raise
+        code = fail(EXIT_INPUT, e.code, '')
+    except (FF.FfError, TakeError, MA.AudioError) as e:
+        code = fail(EXIT_BAD, str(e))
+    except KeyboardInterrupt:
+        code = fail(EXIT_BAD, 'interrupted; the encoder was stopped and its partial file removed')
+    except (OSError, RuntimeError) as e:
+        code = fail(EXIT_BAD, f'{type(e).__name__}: {e}')
+    if 'doctor' in state:
+        js.finish(state['doctor'])
+        return code
+    take = state.get('take')
+    js.finish({'ok': code == EXIT_OK, 'exit': code, 'command': args.command, 'take': str(take.root) if take is not None else args.take,
+               'out': str(state['out']) if state.get('out') else None,
+               'outputs': [{'file': it['file'], 'frames': it.get('frames'), 'verify': it.get('verify'), 'resumed': bool(it.get('resumed'))}
+                           for it in result_items(state.get('result'))],
+               'errors': state['errors'], 'warnings': (list(take.warnings) if take is not None else []) + list(NOTES),
+               'written': list(dict.fromkeys(WRITTEN))})
+    return code
 
 
 if __name__ == '__main__':

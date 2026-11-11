@@ -1,11 +1,17 @@
 """Input replay determinism compare (REPLAY_DESIGN 7.5, 7.6) for InsideDev.Det run folders (steps.csv, events.csv, meta.json).
 compare: one run against a reference, aligned by logic step k: PASS strict / PASS film / FAIL, k*, rng split, culprit window.
 matrix: the standard runs of a root folder (S1-S5, P1, C1-C4, F1, V1) against their references, then the 7.6 decision rule.
-Usage: python -I tools/det_compare.py compare <run> <ref> [--json f] | matrix <root> [--out f] [--json f] | selftest"""
+Exit codes, so that a script can stop on the verdict: 0 PASS (compare: strict or film; matrix: the decision starts with
+"B viable" and no run is missing), 1 FAIL / B dropped / incomplete matrix, 2 input or usage error. --exit-zero gives 0 for
+every verdict that could be computed (the behaviour before 0.11.0). --json alone (or --json -) prints the result as one JSON
+object on stdout and the text report on stderr; --json FILE writes the file as before.
+Usage: python -I tools/det_compare.py compare <run> <ref> [--json [f]] | matrix <root> [--out f] [--json [f]] | selftest"""
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
+import io
 import json
 import math
 import sys
@@ -24,6 +30,7 @@ EVENT_KINDS = ('baleFall', 'baleLand', 'shot', 'baleHit', 'kill')
 RNG_PROBES = ('rng_fixed', 'rng_update', 'rng_late')
 INPUT_COLS = ('in_x', 'in_y', 'in_jump', 'in_action')
 STRICT, FILM, FAIL = 'PASS strict', 'PASS film', 'FAIL'
+EXIT_OK, EXIT_BAD, EXIT_INPUT = 0, 1, 2
 CULPRIT = {
     'rng_fixed': 'between the lateUpdate hook (-400) of the previous frame and the fixedUpdate hook of step k: LateUpdate after '
                  '-400 (UmbrellaExecutive: CrowdDude, Hair, FakeRagdollJoint2; HuddleLegControl, HuddleArmControl2), rendering '
@@ -101,14 +108,18 @@ def load_run(path: Path) -> Run:
         if 'k' not in header:
             raise RunError(f'{steps}: no k column')
         rows: dict[int, dict[str, str]] = {}
+        bad, first_bad = 0, 0
         for r in rd:
-            if len(r) < len(header):
+            if not r:
                 continue
             d = dict(zip(header, r))
             try:
+                if len(r) != len(header):
+                    raise ValueError
                 rows[int(d['k'])] = d
             except ValueError:
-                continue
+                bad += 1
+                first_bad = first_bad or rd.line_num
     events: list[tuple[int, str, str, str]] = []
     ev = path / 'events.csv'
     if ev.is_file():
@@ -126,8 +137,13 @@ def load_run(path: Path) -> Run:
     if mp.is_file():
         try:
             meta = json.loads(mp.read_text(encoding='utf-8'))
-        except json.JSONDecodeError as e:
+        except (OSError, ValueError) as e:
             meta = {'_error': str(e)}
+    if not isinstance(meta, dict):
+        meta = {'_error': 'meta.json is not an object'}
+    if bad:
+        meta['warnings'] = list(meta.get('warnings') or []) + [f'steps.csv: {bad} malformed row(s) skipped (another field count than the '
+                                                               f'header or no step number; first at line {first_bad})']
     return Run(path, meta, header, rows, events, read_tsv_paths(path / 'chicks.tsv'), read_tsv_paths(path / 'culls.tsv'))
 
 
@@ -183,6 +199,7 @@ class Result:
     shots: list[int] = field(default_factory=lambda: [0, 0])
     killed: list[str] = field(default_factory=lambda: ['', ''])
     culprit: str = ''
+    chick_mismatch: bool = False
 
     @property
     def passed(self) -> bool:
@@ -198,9 +215,11 @@ def chick_map(run: Run, ref: Run, res: Result) -> list[tuple[int, int, str]]:
         lost = [p for p in ref.chicks if p not in idx]
         res.notes.append(f'chick lists differ ({n_ref} vs {n_run}); matched by path, {len(lost)} unmatched')
         if lost:
+            res.chick_mismatch = True
             res.reasons.append(f'{len(lost)} chick(s) of the reference missing in the run: {", ".join(lost[:3])}')
         return out
     if n_ref != n_run:
+        res.chick_mismatch = True
         res.reasons.append(f'chick count differs: ref {n_ref}, run {n_run}')
     return [(i, i, names_ref[i]) for i in range(min(n_ref, n_run))]
 
@@ -230,8 +249,11 @@ def compare(run: Run, ref: Run) -> Result:
         res.notes.append(f'camera: run {cam_run}, ref {cam_ref}')
     if run.culls and ref.culls and run.culls != ref.culls:
         res.notes.append(f'culler group lists differ ({len(run.culls)} vs {len(ref.culls)}): cull_bits not comparable')
-    for w in run.meta.get('warnings', []):
+    for w in run.meta.get('warnings') or []:
         res.notes.append(f'run warning: {w}')
+    for w in ref.meta.get('warnings') or []:
+        if 'malformed' in str(w):
+            res.notes.append(f'reference warning: {w}')
     chicks = chick_map(run, ref, res)
     window = [k for k in sorted(ref.rows) if k <= res.window_end]
     missing = [k for k in window if k not in run.rows]
@@ -292,7 +314,7 @@ def compare(run: Run, ref: Run) -> Result:
     kr, kn = ref.killed(res.window_end), run.killed(res.window_end)
     res.killed = [','.join(kr), ','.join(kn)]
     res.culprit = culprit(res)
-    strict = (not missing and all(v < 0 for v in res.k_rng.values()) and res.k_pos < 0
+    strict = (not missing and all(v < 0 for v in res.k_rng.values()) and res.k_pos < 0 and not res.chick_mismatch
               and all(res.events[kd][0] == res.events[kd][1] for kd in EVENT_KINDS) and res.rows_compared > 0)
     film_reasons = []
     if missing:
@@ -313,7 +335,7 @@ def compare(run: Run, ref: Run) -> Result:
             film_reasons.append(f'{kd} step {(e[1][:1] or [-1])[0]} != ref {(e[0][:1] or [-1])[0]}')
     if res.shots[0] != res.shots[1]:
         film_reasons.append(f'shot count {res.shots[1]} != ref {res.shots[0]}')
-    film = not film_reasons and res.rows_compared > 0
+    film = not film_reasons and res.rows_compared > 0 and not res.chick_mismatch
     res.verdict = STRICT if strict else FILM if film else FAIL
     if res.verdict != STRICT:
         res.reasons.extend(film_reasons if res.verdict == FAIL else [])
@@ -572,9 +594,26 @@ def selftest() -> int:
         text = matrix_text(results, decision, problems)
         if 'R13 input replay verdict' not in text:
             fails.append('matrix text header missing')
+        (root / 'S2' / 'chicks.tsv').write_text('i\tpath\n0\ta/Chicken (0)\n1\ta/Chicken (9)\n', encoding='utf-8')
+        lost = compare(load_run(root / 'S2'), runs['S1'])
+        if lost.verdict != FAIL or not lost.chick_mismatch:
+            fails.append(f'run without a chick of the reference: {lost.verdict} != {FAIL}')
+        lines = (root / 'S3' / 'steps.csv').read_text(encoding='utf-8').splitlines()
+        lines[50] += ',99'
+        (root / 'S3' / 'steps.csv').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        shifted = compare(load_run(root / 'S3'), runs['S1'])
+        if shifted.verdict != FAIL or shifted.rows_missing != 1 or not any('malformed' in n for n in shifted.notes):
+            fails.append(f'row with an extra field: {shifted.verdict}, missing {shifted.rows_missing}, notes {shifted.notes}')
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            codes = [main(['compare', str(root / 'S5'), str(root / 'S4')]), main(['compare', str(root / 'C2'), str(root / 'S1')]),
+                     main(['compare', str(root / 'C2'), str(root / 'S1'), '--exit-zero']),
+                     main(['compare', str(root / 'nothing'), str(root / 'S1')]),
+                     main(['matrix', str(root), '--out', str(root / 'v.txt'), '--json', str(root / 'm.json')])]
+        if codes != [EXIT_OK, EXIT_BAD, EXIT_OK, EXIT_INPUT, EXIT_BAD]:
+            fails.append(f'exit codes {codes} != [0, 1, 0, 2, 1]')
     for f in fails:
         print('FAIL ' + f)
-    print(f'selftest: {len(checks) + 5 - len(fails)} ok, {len(fails)} failed')
+    print(f'selftest: {len(checks) + 8 - len(fails)} ok, {len(fails)} failed')
     return 1 if fails else 0
 
 
@@ -586,42 +625,65 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser('compare', help='one run against a reference')
     c.add_argument('run', type=Path)
     c.add_argument('ref', type=Path)
-    c.add_argument('--json', type=Path)
+    c.add_argument('--json', nargs='?', const='-', help='result as JSON: a file, or stdout when no file (or -) is given')
     m = sub.add_parser('matrix', help='all standard runs of a root folder, then the 7.6 decision')
     m.add_argument('root', type=Path)
     m.add_argument('--out', type=Path, help='verdict text (default <root>/verdict.txt)')
-    m.add_argument('--json', type=Path, help='results (default <root>/det_matrix.json)')
+    m.add_argument('--json', nargs='?', const='-', help='results as JSON: a file (default <root>/det_matrix.json); stdout when '
+                                                        'given without a file (or -), the file is then written too')
+    for s in (c, m):
+        s.add_argument('--exit-zero', action='store_true', help='exit 0 whatever the verdict (the behaviour before 0.11.0)')
+        s.add_argument('--exit-code', action='store_true', help='accepted for scripts; the verdict decides the exit code by default')
     sub.add_parser('selftest', help='synthetic runs, no game')
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError, OSError):
+            pass
     a = build_parser().parse_args(argv)
     if a.cmd == 'selftest':
         return selftest()
+    to_stdout = a.json == '-'
+    say = sys.stderr if to_stdout else sys.stdout
     try:
         if a.cmd == 'compare':
             res = compare(load_run(a.run), load_run(a.ref))
-            print(report(res))
-            if a.json:
-                a.json.write_text(json.dumps(to_json(res), indent=1), encoding='utf-8')
-            return 0
+            code = EXIT_OK if res.passed or a.exit_zero else EXIT_BAD
+            print(report(res), file=say)
+            doc = dict(to_json(res), ok=res.passed, exit=code)
+            if to_stdout:
+                print(json.dumps(doc))
+            elif a.json:
+                Path(a.json).write_text(json.dumps(doc, indent=1), encoding='utf-8')
+            return code
         if not a.root.is_dir():
             raise RunError(f'{a.root}: not a folder')
         results, problems = matrix(a.root)
         decision = decide(results)
         text = matrix_text(results, decision, problems)
+        good = bool(decision) and decision[0].startswith('B viable') and not problems
+        code = EXIT_OK if good or a.exit_zero else EXIT_BAD
         out = a.out or a.root / 'verdict.txt'
         out.write_text(text, encoding='utf-8')
-        js = a.json or a.root / 'det_matrix.json'
-        js.write_text(json.dumps({'decision': decision, 'problems': problems,
-                                  'results': {n: to_json(r) for n, r in results.items()}}, indent=1), encoding='utf-8')
-        print(text, end='')
-        print(f'written {out} and {js}')
-        return 0
+        js = Path(a.json) if a.json and not to_stdout else a.root / 'det_matrix.json'
+        doc = {'ok': good, 'exit': code, 'decision': decision, 'problems': problems, 'results': {n: to_json(r) for n, r in results.items()},
+               'written': [str(out), str(js)]}
+        js.write_text(json.dumps(doc, indent=1), encoding='utf-8')
+        print(text, end='', file=say)
+        print(f'written {out} and {js}', file=say)
+        if to_stdout:
+            print(json.dumps(doc))
+        return code
     except RunError as e:
         print(f'error: {e}', file=sys.stderr)
-        return 2
+        return EXIT_INPUT
+    except (OSError, UnicodeError, csv.Error) as e:
+        print(f'error: {type(e).__name__}: {e}', file=sys.stderr)
+        return EXIT_INPUT
 
 
 if __name__ == '__main__':

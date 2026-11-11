@@ -6,7 +6,10 @@ references, record folder and audio state, WAV read/write with cue/labl markers 
 gpu=True, the compositor default): pipe mkv frames decode on NVDEC (-hwaccel cuda) and shrink by 2 / 4 / 8 on the GPU
 (scale_cuda bilinear) before the download, one ffmpeg reader per camera and reduce; full-size frames are bit-identical to the
 CPU decode, shrunk ones differ from the CPU INTER_AREA shrink by about 1/255 on edges (51-52 dB PSNR); luma statistics (grade
-floors) always use the full-size decode + INTER_AREA, so grades are identical in both modes."""
+floors) of a pipe mkv always come from one CPU reader that shrinks by 8 inside ffmpeg (scale flags=area), so grades are
+identical in both modes. A reader starts near the frame it is asked for (ffmpeg -ss before -i, constant frame rate; env
+MCAM_NO_SEEK=1 decodes from the first frame as before) and never waits on a dead or silent ffmpeg (MCAM_FFMPEG_STALL_S, 120).
+Frames handed out are read-only and shared with the cache, never copied."""
 from __future__ import annotations
 
 import csv
@@ -19,7 +22,10 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
+import tempfile
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,18 +33,20 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import mcam_audio as MA
+
 REPO = Path(__file__).resolve().parent.parent
 OUT_ROOT = REPO / 'out'
 FFMPEG = os.environ.get('FFMPEG') or shutil.which('ffmpeg') or 'ffmpeg'
 FFPROBE = os.environ.get('FFPROBE') or shutil.which('ffprobe') or 'ffprobe'
 LUMA = np.array([0.22, 0.707, 0.071], np.float32)
 FRAME_RE = re.compile(r'^(\d+)\.(jpg|jpeg|png|rgba)$', re.I)
-TIME_RE = re.compile(r'^@([A-Za-z0-9_.]+)\s*(?:([+-])\s*([0-9]*\.?[0-9]+))?$')
 REDUCE_FLAGS = {1: cv2.IMREAD_COLOR, 2: cv2.IMREAD_REDUCED_COLOR_2, 4: cv2.IMREAD_REDUCED_COLOR_4, 8: cv2.IMREAD_REDUCED_COLOR_8}
-STATS_VERSION = 3
-REPLAY_MODES = ('record', 'replay', 'take', 'passes', 'golden')
+STATS_VERSION = 4
+STATS_REDUCE = 8
+REPLAY_MODES = MA.REPLAY_MODES
 REPLAY_DIRS = {'record', 'golden', 'passes', 'noise'}
-SLOPE_LIMIT = 0.005
+SLOPE_LIMIT = MA.SLOPE_LIMIT
 
 
 class TakeError(Exception):
@@ -123,17 +131,11 @@ def read_csv(path: Path) -> list[dict]:
 
 
 def fnum(v, default: float = math.nan) -> float:
-    try:
-        if v is None or v == '':
-            return default
-        return float(v)
-    except (TypeError, ValueError):
-        return default
+    return MA.fnum(v, default)
 
 
 def inum(v, default: int = -1) -> int:
-    f = fnum(v)
-    return default if math.isnan(f) else int(round(f))
+    return MA.inum(v, default)
 
 
 def parse_time_ref(value) -> tuple[str | None, float]:
@@ -144,11 +146,18 @@ def parse_time_ref(value) -> tuple[str | None, float]:
     s = str(value).strip()
     if not s.startswith('@'):
         return None, fnum(s)
-    m = TIME_RE.match(s)
-    if not m:
+    ok, name, off = _spec_time(s)
+    if not ok or not name:
         raise TakeError(f'bad time reference {value!r} (use a number or "@event+1.5")')
-    off = float(m.group(3)) if m.group(3) else 0.0
-    return m.group(1), (-off if m.group(2) == '-' else off)
+    return name, off
+
+
+def _spec_time(text: str) -> tuple:
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    from mcam_spec_check import parse_time
+    return parse_time(text)
 
 
 def smoothstep(x: float) -> float:
@@ -228,7 +237,8 @@ class Take:
         return out
 
     def _discover_cameras(self) -> None:
-        run_cams = {c.get('name'): c for c in (self.run or {}).get('cameras', []) if isinstance(c, dict)}
+        listed_run = (self.run or {}).get('cameras')
+        run_cams = {c.get('name'): c for c in (listed_run if isinstance(listed_run, list) else []) if isinstance(c, dict)}
         listed = []
         for c in self._spec_cameras():
             listed.append((c['name'], c))
@@ -351,23 +361,8 @@ class Take:
         return out
 
     def _fps(self) -> float:
-        if self.replay_mode in ('record', 'golden') and self.kind == 'v2':
-            cap = np.sort(self.t[self.captured == 1])
-            d = np.diff(cap)
-            d = d[d > 1e-6]
-            if len(d):
-                return float(max(1.0, round(1.0 / float(np.median(d)))))
-        run_fps = fnum((self.run or {}).get('fps'))
-        if run_fps > 0:
-            return run_fps
-        timing = (self.spec or {}).get('timing') or {}
-        if self.kind == 'v2' and fnum(timing.get('fps')) > 0:
-            return fnum(timing.get('fps'))
-        if self.kind in ('v2-draft', 'v1') and fnum(timing.get('fps')) > 0 and not (self.spec or {}).get('rates'):
-            return fnum(timing.get('fps'))
-        if len(self.rate):
-            return float(self.rate[0] / max(1, self.group[0]))
-        return 30.0
+        return MA.resolve_fps(self.run, self.spec, self.kind, self.replay_mode, self.t[self.captured == 1],
+                              self.rate[0] if len(self.rate) else None, self.group[0] if len(self.group) else None, 30.0)
 
     def _meta_timeline(self) -> Timeline:
         frames: list[OutFrame] = []
@@ -586,28 +581,7 @@ class Take:
 
 
 def find_record_dir(root: Path, run: dict | None, mode: str = '') -> Path | None:
-    root = Path(root)
-    if mode == 'record' or (root / 'record_meta.csv').is_file() or (root / 'scene.srec').is_file():
-        return root
-    run = run or {}
-    cands = []
-    rec = run.get('recording')
-    if isinstance(rec, dict) and rec.get('dir'):
-        cands.append(rec.get('dir'))
-    elif isinstance(rec, str) and rec:
-        cands.append(rec)
-    for key, sub in (('replay', 'source'), ('record', 'dir')):
-        d = run.get(key)
-        if isinstance(d, dict) and d.get(sub):
-            cands.append(d.get(sub))
-    cands += [root / 'record', root.parent / 'record']
-    for c in cands:
-        p = Path(c)
-        if not p.is_absolute():
-            p = root / p
-        if (p / 'record.json').is_file() or (p / 'record_meta.csv').is_file() or (p / 'scene.srec').is_file():
-            return p.resolve()
-    return None
+    return MA.find_record_dir(root, run, mode)
 
 
 def audio_state(take_root: Path, rec: Path | None, rj: dict | None) -> dict:
@@ -655,12 +629,65 @@ def jpeg_size(data: bytes) -> tuple[int, int]:
 
 
 _CUDA_OK: dict[str, bool] = {}
+_VIDEO_INFO: dict[tuple, dict] = {}
+_VIDEO_LOCK = threading.Lock()
+PROBE_TIMEOUT_S = 30.0
+
+
+def run_tool(cmd: list, timeout: float = PROBE_TIMEOUT_S) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout)
+    except FileNotFoundError as e:
+        raise TakeError(f'{cmd[0]} not found: set the FFMPEG / FFPROBE environment variables or put ffmpeg on PATH') from e
+    except subprocess.TimeoutExpired as e:
+        raise TakeError(f'{Path(str(cmd[0])).name} gave no answer in {timeout:.0f} s for {cmd[-1]}') from e
+    except OSError as e:
+        raise TakeError(f'cannot run {cmd[0]}: {e}') from e
+
+
+def _rate(text) -> float:
+    a, _, b = str(text or '').partition('/')
+    try:
+        v = float(a) / float(b or 1)
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+    return v if math.isfinite(v) and v > 0 else 0.0
+
+
+def video_info(path: Path) -> dict:
+    path = Path(path)
+    try:
+        st = path.stat()
+    except OSError as e:
+        raise TakeError(f'{path}: {e}') from e
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    with _VIDEO_LOCK:
+        hit = _VIDEO_INFO.get(key)
+    if hit is not None:
+        return hit
+    p = run_tool([FFPROBE, '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                  'stream=width,height,pix_fmt,r_frame_rate,avg_frame_rate', '-of', 'json', str(path)])
+    tail = ' | '.join((p.stderr or '').strip().splitlines()[-2:])
+    try:
+        stream = (json.loads(p.stdout or '{}').get('streams') or [{}])[0] if p.returncode == 0 else {}
+    except ValueError:
+        stream = {}
+    w, h = inum(stream.get('width'), 0), inum(stream.get('height'), 0)
+    if w <= 0 or h <= 0:
+        raise TakeError(f'{path}: no readable video stream (ffprobe exit {p.returncode}' + (f': {tail}' if tail else '') + ')')
+    fps, avg = _rate(stream.get('r_frame_rate')), _rate(stream.get('avg_frame_rate'))
+    info = {'width': w, 'height': h, 'pix_fmt': str(stream.get('pix_fmt') or ''), 'fps': fps,
+            'cfr': fps > 0 and (avg <= 0 or abs(avg - fps) <= fps * 0.002)}
+    with _VIDEO_LOCK:
+        _VIDEO_INFO[key] = info
+    return info
 
 
 def gpu_download_format(path: Path) -> str:
-    p = subprocess.run([FFPROBE, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=pix_fmt', '-of', 'csv=p=0', str(path)],
-                       capture_output=True, text=True)
-    pix = p.stdout.strip()
+    try:
+        pix = video_info(path)['pix_fmt']
+    except TakeError:
+        pix = ''
     deep = any(k in pix for k in ('10', '12', '16'))
     if '444' in pix:
         return 'yuv444p16le' if deep else 'yuv444p'
@@ -681,10 +708,8 @@ def cuda_ok(path: Path) -> bool:
 
 
 def probe_size(path: Path) -> tuple[int, int]:
-    p = subprocess.run([FFPROBE, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0',
-                        str(path)], capture_output=True, text=True)
-    w, h = (p.stdout.strip().split(',') + ['0', '0'])[:2]
-    return int(w or 0), int(h or 0)
+    info = video_info(path)
+    return info['width'], info['height']
 
 
 def load_poses(path: Path) -> dict:
@@ -833,36 +858,60 @@ def read_exact(f, size: int) -> bytearray:
 
 
 class MkvReader:
-    LOOKBACK = 24
+    LOOKBACK = 16
+    MAX_LOOKBACK = 64
     AHEAD = 8
+    AHEAD_CPU = 4
+    SEEK_FORWARD = 240
+    PRE_ROLL = 8
 
-    def __init__(self, path: Path, w: int, h: int, reduce: int = 1, gpu: str = ''):
+    def __init__(self, path: Path, w: int, h: int, reduce: int = 1, gpu: str = '', fps: float = 0.0):
         self.path, self.reduce, self.gpu = path, max(1, reduce), gpu
         self.w, self.h = (w, h) if self.reduce == 1 else (max(1, w // self.reduce), max(1, h // self.reduce))
+        self.fps = float(fps) if fps and fps > 0 and os.environ.get('MCAM_NO_SEEK') != '1' else 0.0
+        self.stall = max(1.0, fnum(os.environ.get('MCAM_FFMPEG_STALL_S'), 120.0))
         self.proc = None
         self.pos = 0
+        self.frames: int | None = None
+        self.lookback = self.LOOKBACK
+        self.last_error = ''
+        self.stalled = False
+        self.opens = 0
         self.lock = threading.Lock()
         self.recent: OrderedDict = OrderedDict()
         self.ahead: queue.Queue | None = None
         self.pump: threading.Thread | None = None
         self.stop = threading.Event()
+        self.errlog = None
 
-    def command(self) -> list:
+    def command(self, start: int = 0) -> list:
+        seek = ['-ss', f'{max(0.0, (start - 0.5) / self.fps):.6f}'] if start > 0 and self.fps > 0 else []
         if not self.gpu:
-            return [FFMPEG, '-v', 'error', '-i', str(self.path), '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-']
+            vf = ['-vf', f'scale={self.w}:{self.h}:flags=area'] if self.reduce > 1 else []
+            return [FFMPEG, '-v', 'error', *seek, '-i', str(self.path), *vf, '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-']
         vf = (f'scale_cuda={self.w}:{self.h}:interp_algo=bilinear,' if self.reduce > 1 else '') + f'hwdownload,format={self.gpu}'
-        return [FFMPEG, '-v', 'error', '-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda', '-i', str(self.path), '-vf', vf, '-f', 'rawvideo',
-                '-pix_fmt', 'rgb24', '-']
+        return [FFMPEG, '-v', 'error', '-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda', *seek, '-i', str(self.path), '-vf', vf,
+                '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-']
 
-    def _open(self) -> None:
+    def _open(self, start: int = 0) -> None:
         self.close()
-        self.proc = subprocess.Popen(self.command(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
-        self.pos = 0
-        if self.gpu:
-            self.stop = threading.Event()
-            self.ahead = queue.Queue(self.AHEAD)
-            self.pump = threading.Thread(target=self._pump, args=(self.proc, self.ahead, self.stop), daemon=True)
-            self.pump.start()
+        if self.fps <= 0:
+            start = 0
+        self.errlog = tempfile.TemporaryFile()
+        try:
+            self.proc = subprocess.Popen(self.command(start), stdout=subprocess.PIPE, stderr=self.errlog, bufsize=0)
+        except OSError as e:
+            self.errlog.close()
+            self.errlog = None
+            raise TakeError(f'{FFMPEG} cannot be started ({e}): set the FFMPEG environment variable or put ffmpeg on PATH') from e
+        self.pos = start
+        self.opens += 1
+        self.stalled = False
+        self.last_error = ''
+        self.stop = threading.Event()
+        self.ahead = queue.Queue(self.AHEAD if self.gpu else self.AHEAD_CPU)
+        self.pump = threading.Thread(target=self._pump, args=(self.proc, self.ahead, self.stop), daemon=True)
+        self.pump.start()
 
     def _pump(self, proc, q: queue.Queue, stop: threading.Event) -> None:
         size = self.w * self.h * 3
@@ -881,45 +930,108 @@ class MkvReader:
             if item is None:
                 return
 
-    def _next(self, size: int) -> bytes:
-        if self.ahead is None:
-            return read_exact(self.proc.stdout, size)
-        item = self.ahead.get()
-        return item if item is not None else b''
+    def _next(self) -> bytes:
+        waited = time.monotonic()
+        while True:
+            try:
+                item = self.ahead.get(timeout=0.25)
+            except queue.Empty:
+                if self.pump is None or not self.pump.is_alive():
+                    try:
+                        item = self.ahead.get_nowait()
+                    except queue.Empty:
+                        return b''
+                elif time.monotonic() - waited > self.stall:
+                    self.stalled = True
+                    return b''
+                else:
+                    continue
+            return item if item is not None else b''
+
+    def _error_tail(self) -> str:
+        if self.errlog is None:
+            return ''
+        try:
+            self.errlog.seek(0, 2)
+            n = self.errlog.tell()
+            self.errlog.seek(max(0, n - 600))
+            text = self.errlog.read().decode('utf-8', 'replace')
+        except (OSError, ValueError):
+            return ''
+        return ' | '.join(ln.strip() for ln in text.strip().splitlines()[-2:] if ln.strip())
+
+    def held_bytes(self) -> int:
+        q = self.ahead
+        return (len(self.recent) + (q.qsize() if q is not None else 0)) * self.w * self.h * 3
 
     def read(self, index: int) -> np.ndarray:
         with self.lock:
             hit = self.recent.get(index)
             if hit is not None:
-                return hit.copy()
-            if self.proc is None or index < self.pos:
-                self._open()
-            size = self.w * self.h * 3
+                return hit
+            if self.frames is not None and index >= self.frames:
+                raise TakeError(f'{self.path}: frame {index} not available (the video has {self.frames} frames'
+                                + (f'; {self.last_error}' if self.last_error else '') + ')')
+            if self.proc is None or index < self.pos or index - self.pos > self.SEEK_FORWARD:
+                if self.proc is not None and 0 < self.pos - index <= self.MAX_LOOKBACK:
+                    self.lookback = min(self.MAX_LOOKBACK, max(self.lookback * 2, self.pos - index + self.PRE_ROLL))
+                self._open(max(0, index - self.PRE_ROLL))
+            first = self.pos
             while True:
-                buf = self._next(size)
-                if len(buf) < size:
-                    raise TakeError(f'{self.path}: frame {index} not available')
+                buf = self._next()
+                if len(buf) < self.w * self.h * 3:
+                    end = self.pos
+                    stalled = self.stalled
+                    self.close()
+                    if stalled:
+                        raise TakeError(f'{self.path}: frame {index} not available: ffmpeg gave no frame for {self.stall:.0f} s'
+                                        + (f' ({self.last_error})' if self.last_error else ''))
+                    if end > first or first == 0:
+                        self.frames = end if self.frames is None else min(self.frames, end)
+                    raise TakeError(f'{self.path}: frame {index} not available' + (f' (the video has {end} frames)' if self.frames == end else '')
+                                    + (f': {self.last_error}' if self.last_error else ''))
                 im = np.frombuffer(buf, np.uint8).reshape(self.h, self.w, 3)
+                im.setflags(write=False)
                 self.recent[self.pos] = im
-                while len(self.recent) > self.LOOKBACK:
+                self.recent.move_to_end(self.pos)
+                while len(self.recent) > self.lookback:
                     self.recent.popitem(last=False)
-                if self.pos == index:
-                    self.pos += 1
-                    return im.copy()
                 self.pos += 1
+                if self.pos - 1 == index:
+                    return im
 
     def close(self) -> None:
         self.stop.set()
-        if self.proc is not None:
+        proc, self.proc = self.proc, None
+        if proc is not None:
             try:
-                self.proc.kill()
+                proc.kill()
             except OSError:
                 pass
-            self.proc = None
+        ended = True
         if self.pump is not None:
             self.pump.join(2)
+            ended = not self.pump.is_alive()
             self.pump = None
+        if proc is not None:
+            if ended:
+                try:
+                    proc.stdout.close()
+                except (OSError, ValueError):
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
         self.ahead = None
+        if self.errlog is not None:
+            if proc is not None:
+                self.last_error = self._error_tail()
+            try:
+                self.errlog.close()
+            except OSError:
+                pass
+            self.errlog = None
 
 
 class FrameStore:
@@ -944,22 +1056,38 @@ class FrameStore:
             i = 0
         return cam.files[int(cam.steps[i])]
 
+    def _reader(self, cam: Camera, reduce: int, gpu: bool) -> MkvReader:
+        key = (cam.name, reduce, gpu)
+        with self.lock:
+            reader = self.mkv.get(key)
+        if reader is None:
+            info = video_info(cam.video)
+            made = MkvReader(cam.video, info['width'], info['height'], reduce, gpu_download_format(cam.video) if gpu else '',
+                             info['fps'] if info['cfr'] else 0.0)
+            with self.lock:
+                reader = self.mkv.setdefault(key, made)
+        return reader
+
+    def _frame_index(self, cam: Camera, step: int) -> int:
+        with self.lock:
+            index = self.mkv_index.get(cam.name)
+            if index is None:
+                cap = [int(s) for s, c in zip(self.take.step, self.take.captured) if c == 1]
+                index = self.mkv_index[cam.name] = {s: i for i, s in enumerate(cap)}
+        idx = index.get(step)
+        if idx is None:
+            raise TakeError(f'{cam.name}.mkv: step {step} was not captured')
+        return idx
+
+    def stats_frame(self, cam: Camera, step: int) -> np.ndarray:
+        if cam.ext != 'mkv':
+            return self._decode(cam, step, STATS_REDUCE, exact=True)
+        return self._reader(cam, STATS_REDUCE, False).read(self._frame_index(cam, step))
+
     def _decode(self, cam: Camera, step: int, reduce: int, exact: bool = False) -> np.ndarray:
         if cam.ext == 'mkv':
             r = reduce if self.gpu and not exact and reduce in (2, 4, 8) else 1
-            key = (cam.name, r)
-            with self.lock:
-                reader = self.mkv.get(key)
-                if reader is None:
-                    w, h = probe_size(cam.video)
-                    reader = self.mkv[key] = MkvReader(cam.video, w, h, r, gpu_download_format(cam.video) if self.gpu else '')
-                if cam.name not in self.mkv_index:
-                    cap = [int(s) for s, c in zip(self.take.step, self.take.captured) if c == 1]
-                    self.mkv_index[cam.name] = {s: i for i, s in enumerate(cap)}
-            idx = self.mkv_index[cam.name].get(step)
-            if idx is None:
-                raise TakeError(f'{cam.name}.mkv: step {step} was not captured')
-            im = reader.read(idx)
+            im = self._reader(cam, r, self.gpu).read(self._frame_index(cam, step))
             return im if r == reduce else shrink(im, reduce)
         path = self._path(cam, step)
         if cam.ext == 'rgba':
@@ -998,7 +1126,8 @@ class FrameStore:
                 self.decodes += 1
                 self.cache[key] = im
                 self.cache_bytes += im.nbytes
-                while self.cache_bytes > self.limit and len(self.cache) > 1:
+                held = sum(r.held_bytes() for r in self.mkv.values())
+                while self.cache_bytes + held > self.limit and len(self.cache) > 1:
                     _, old = self.cache.popitem(last=False)
                     self.cache_bytes -= old.nbytes
             return im
@@ -1008,7 +1137,9 @@ class FrameStore:
             ev.set()
 
     def close(self) -> None:
-        for r in self.mkv.values():
+        with self.lock:
+            readers = list(self.mkv.values())
+        for r in readers:
             r.close()
 
     def drop_readers(self) -> None:
@@ -1027,7 +1158,8 @@ def shrink(im: np.ndarray, reduce: int) -> np.ndarray:
 
 def stats_dir(take: Take) -> Path:
     h = hashlib.sha1(str(take.root).lower().encode('utf-8')).hexdigest()[:10]
-    return OUT_ROOT / '_stats' / f'{take.root.name}_{h}'
+    base = Path(os.environ['INSIDE_STATS_DIR']) if os.environ.get('INSIDE_STATS_DIR') else OUT_ROOT / '_stats'
+    return base / f'{take.root.name}_{h}'
 
 
 def camera_stats(take: Take, store: FrameStore, cam: str, steps: list[int], workers: int = 8) -> dict:
@@ -1047,7 +1179,7 @@ def camera_stats(take: Take, store: FrameStore, cam: str, steps: list[int], work
 
     def one(s: int):
         try:
-            im = store._decode(c, int(s), 8, exact=True)
+            im = store.stats_frame(c, int(s))
         except Exception:
             return None
         y = (im.astype(np.float32) @ LUMA)
@@ -1081,8 +1213,8 @@ def camera_stats(take: Take, store: FrameStore, cam: str, steps: list[int], work
     crush = hists[:, :2].sum(1) / tot[:, 0]
     out = {'version': np.array(STATS_VERSION), 'steps': steps_arr, 'mtime': np.array(mtime), 'hist': hists, 'logmean': logmean,
            'ok': ok, 'energy': energy, 'p50': p50, 'p005': p005, 'p99': p99, 'mean': mean, 'clip': clip, 'crush': crush}
-    d.mkdir(parents=True, exist_ok=True)
     try:
+        d.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(path, **out)
     except OSError:
         pass
@@ -1130,171 +1262,25 @@ class Wav:
         return self.data.mean(axis=1) if self.data.ndim == 2 else self.data
 
 
-def _decode_pcm(raw: bytes, fmt: int, bits: int, channels: int) -> np.ndarray:
-    if fmt == 3 and bits == 32:
-        a = np.frombuffer(raw, '<f4').astype(np.float32)
-    elif fmt == 3 and bits == 64:
-        a = np.frombuffer(raw, '<f8').astype(np.float32)
-    elif bits == 16:
-        a = np.frombuffer(raw, '<i2').astype(np.float32) / 32768.0
-    elif bits == 24:
-        b = np.frombuffer(raw[:len(raw) // 3 * 3], np.uint8).reshape(-1, 3).astype(np.int32)
-        v = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
-        a = (np.where(v >= 1 << 23, v - (1 << 24), v)).astype(np.float32) / float(1 << 23)
-    elif bits == 32:
-        a = np.frombuffer(raw, '<i4').astype(np.float32) / float(1 << 31)
-    elif bits == 8:
-        a = (np.frombuffer(raw, np.uint8).astype(np.float32) - 128.0) / 128.0
-    else:
-        raise TakeError(f'unsupported WAV sample format {fmt}/{bits} bit')
-    ch = max(1, channels)
-    return a[:len(a) // ch * ch].reshape(-1, ch)
-
-
 def read_wav(path: Path, with_data: bool = True) -> Wav:
-    path = Path(path)
-    if not path.is_file():
-        raise TakeError(f'{path}: not found')
-    size = path.stat().st_size
-    problems: list[str] = []
-    fmt = channels = rate = bits = align = 0
-    data_off = data_len = -1
-    cue_pos: dict[int, int] = {}
-    labels: dict[int, str] = {}
-    with path.open('rb') as fh:
-        head = fh.read(12)
-        if len(head) < 12 or head[:4] != b'RIFF' or head[8:12] != b'WAVE':
-            raise TakeError(f'{path}: not a RIFF/WAVE file')
-        riff = struct.unpack('<I', head[4:8])[0]
-        if riff == 0xFFFFFFFF or riff + 8 != size:
-            problems.append(f'RIFF size {riff} + 8 != file size {size}' + (' (unfinalized: mcam_audio.py fix)' if riff == 0xFFFFFFFF else ''))
-        pos = 12
-        while pos + 8 <= size:
-            fh.seek(pos)
-            hdr = fh.read(8)
-            cid, n = hdr[:4], struct.unpack('<I', hdr[4:8])[0]
-            body = pos + 8
-            if cid == b'data':
-                if n == 0xFFFFFFFF or body + n > size:
-                    problems.append(f'data size {n} runs past the file end ({size - body} bytes left)'
-                                    + (' (unfinalized: mcam_audio.py fix)' if n == 0xFFFFFFFF else ''))
-                    n = size - body
-                data_off, data_len = body, n
-            elif cid == b'fmt ' and n >= 16:
-                b = fh.read(n)
-                fmt, channels, rate, _, align, bits = struct.unpack('<HHIIHH', b[:16])
-                if fmt == 0xFFFE and n >= 26:
-                    fmt = struct.unpack('<H', b[24:26])[0]
-            elif cid == b'cue ' and n >= 4:
-                b = fh.read(n)
-                cnt = struct.unpack('<I', b[:4])[0]
-                for k in range(min(cnt, (n - 4) // 24)):
-                    cid_k, position, _, _, _, offset = struct.unpack('<II4sIII', b[4 + 24 * k:28 + 24 * k])
-                    cue_pos[cid_k] = offset if offset or not position else position
-            elif cid == b'LIST' and n >= 4:
-                b = fh.read(n)
-                if b[:4] == b'adtl':
-                    i = 4
-                    while i + 8 <= len(b):
-                        sid, sn = b[i:i + 4], struct.unpack('<I', b[i + 4:i + 8])[0]
-                        if sid == b'labl' and sn >= 4:
-                            lid = struct.unpack('<I', b[i + 8:i + 12])[0]
-                            labels[lid] = b[i + 12:i + 8 + sn].split(b'\0', 1)[0].decode('latin-1')
-                        i += 8 + sn + (sn & 1)
-            if n == 0xFFFFFFFF:
-                break
-            pos = body + n + (n & 1)
-        if fmt == 0 or rate <= 0 or channels <= 0:
-            raise TakeError(f'{path}: no fmt chunk')
-        if data_off < 0:
-            raise TakeError(f'{path}: no data chunk')
-        align = align or channels * bits // 8
-        frames = data_len // max(1, align)
-        data = None
-        if with_data:
-            fh.seek(data_off)
-            data = _decode_pcm(fh.read(frames * align), fmt, bits, channels)
-    markers = [{'id': k, 'sample': int(v), 'label': labels.get(k, '')} for k, v in sorted(cue_pos.items(), key=lambda kv: kv[1])]
+    try:
+        w = MA.load_wav(path, with_data)
+    except MA.AudioError as e:
+        raise TakeError(str(e)) from None
     cues: dict[str, int] = {}
-    for m in markers:
+    for m in w.markers:
         if m['label'] and m['label'] not in cues:
             cues[m['label']] = m['sample']
-    return Wav(path, int(rate), int(channels), int(bits), int(fmt), int(frames), data, markers, cues, problems)
+    return Wav(w.path, int(w.rate), int(w.channels), int(w.bits), int(w.format), int(w.frames), w.data, w.markers, cues, w.problems)
 
 
 def write_wav(path: Path, data: np.ndarray, rate: int, pcm16: bool = False, markers: list | None = None) -> Path:
-    path = Path(path)
-    a = np.asarray(data, np.float32)
-    if a.ndim == 1:
-        a = a[:, None]
-    ch = a.shape[1]
-    if pcm16:
-        raw = np.clip(np.round(a * 32768.0), -32768, 32767).astype('<i2').tobytes()
-        fmt = struct.pack('<HHIIHH', 1, ch, rate, rate * ch * 2, ch * 2, 16)
-        extra = b''
-    else:
-        raw = a.astype('<f4').tobytes()
-        fmt = struct.pack('<HHIIHHH', 3, ch, rate, rate * ch * 4, ch * 4, 32, 0)
-        extra = b'fact' + struct.pack('<II', 4, a.shape[0])
-    chunks = b'fmt ' + struct.pack('<I', len(fmt)) + fmt + extra + b'data' + struct.pack('<I', len(raw)) + raw
-    if len(raw) & 1:
-        chunks += b'\0'
-    if markers:
-        cue = struct.pack('<I', len(markers)) + b''.join(struct.pack('<II4sIII', i + 1, int(s), b'data', 0, 0, int(s))
-                                                         for i, (s, _) in enumerate(markers))
-        adtl = b'adtl'
-        for i, (_, label) in enumerate(markers):
-            body = struct.pack('<I', i + 1) + label.encode('ascii') + b'\0'
-            adtl += b'labl' + struct.pack('<I', len(body)) + body + (b'\0' if len(body) & 1 else b'')
-        chunks += b'cue ' + struct.pack('<I', len(cue)) + cue + b'LIST' + struct.pack('<I', len(adtl)) + adtl
-    path.write_bytes(b'RIFF' + struct.pack('<I', 4 + len(chunks)) + b'WAVE' + chunks)
-    return path
+    return MA.write_wav(path, data, rate, pcm16, markers)
 
 
 def dbfs(x) -> float:
-    if x is None or not len(x):
-        return -200.0
-    rms = float(np.sqrt(np.mean(np.square(np.asarray(x, np.float64)))))
-    return 20.0 * math.log10(rms) if rms > 1e-10 else -200.0
+    return MA.dbfs(x)
 
 
 def fit_markers(wav: Wav, rows: list[dict], real_of_game=None) -> dict:
-    pts, missing, events = [], [], []
-    for r in rows:
-        label = (r.get('label') or '').strip()
-        pos = wav.cues.get(label)
-        if pos is None:
-            missing.append(label)
-            continue
-        pts.append((fnum(r.get('real_time')), float(pos), label, inum(r.get('lag'), 0), fnum(r.get('game_time')), inum(r.get('sample'))))
-    lag0 = [p for p in pts if p[3] == 0 and math.isfinite(p[0])]
-    out = {'rate': wav.rate, 'markers': len(pts), 'lag0': len(lag0), 'missing': missing, 'ok': False}
-    if len(lag0) < 2:
-        out['reason'] = f'{len(lag0)} lag-0 marker(s) matched between audio_sync.csv and the WAV cue/labl chunks (2 needed)'
-        return out
-    x = np.array([p[0] for p in lag0], np.float64)
-    y = np.array([p[1] for p in lag0], np.float64)
-    if np.ptp(x) <= 1e-6:
-        out['reason'] = 'lag-0 markers share one real_time'
-        return out
-    a, b = np.polyfit(x, y, 1)
-    res = y - (a * x + b)
-    ratio = a / wav.rate
-    quantum = math.gcd(*(int(v) for v in y))
-    out.update({'ok': True, 'a': float(a), 'b': float(b), 'ratio': float(ratio), 'slope_error': float(abs(ratio - 1.0)),
-                'quantum': quantum if 256 <= quantum <= 65536 else 1,
-                'residual_ms': float(np.sqrt(np.mean(res ** 2)) / wav.rate * 1000.0),
-                'residual_max_ms': float(np.max(np.abs(res)) / wav.rate * 1000.0),
-                'usable': bool(abs(ratio - 1.0) < SLOPE_LIMIT)})
-    for p in pts:
-        if p[3] == 0:
-            continue
-        e = {'label': p[2], 'lag': p[3], 'game_time': p[4], 'sample': p[5],
-             'offset_post_ms': round((p[1] - (a * p[0] + b)) / wav.rate * 1000.0, 3)}
-        if real_of_game is not None and math.isfinite(p[4]):
-            r = real_of_game(p[4])
-            if math.isfinite(r):
-                e['offset_event_ms'] = round((p[1] - (a * r + b)) / wav.rate * 1000.0, 3)
-        events.append(e)
-    out['events'] = events
-    return out
+    return MA.fit_markers(wav, rows, real_of_game)

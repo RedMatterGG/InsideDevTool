@@ -1,13 +1,16 @@
 """Fast review of the finals (the director angle and the layouts of a compose): full-resolution PNG frames at every review event
 and every --every s (2), the composed-video QA of mcam_qa (black, near-black per layout cell, blur), the frames QA flags, and
 contact sheets (director, layout, events with both finals side by side, QA flags on an output-time strip), all into one folder.
-Reads the final MP4s (NVDEC; --cpu decodes on the CPU), never the camera videos. Exit 0 ok, 1 QA errors, 2 nothing to review.
+Reads the final videos (NVDEC; --cpu decodes on the CPU), never the camera videos. A final that does not decode is an error.
+Exit codes: 0 ok, 1 QA errors or a failed decode, 2 nothing to review or a usage error, 3 refused. --json prints one JSON
+object on stdout (the report text then goes to stderr).
 Usage: python -I tools/fast_review.py <take> [--videos DIR] [--out DIR] [--every 2] [--events a,b] [--around 0] [--near 0.5]"""
 from __future__ import annotations
 
 import argparse
+import csv
 import json
-import subprocess
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -19,6 +22,7 @@ from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mcam_compose as MC
+import mcam_ff as FF
 import mcam_qa as MQ
 import mcam_take as MT
 
@@ -26,13 +30,12 @@ THUMB = (640, 360)
 FLAG_KINDS = ('black', 'near_black', 'blur_fail', 'blur_warn')
 FLAG_COLORS = {'black': (220, 60, 60), 'near_black': (235, 140, 50), 'blur_fail': (200, 80, 200), 'blur_warn': (150, 130, 210)}
 MAX_FLAG_FRAMES = 16
+PICK_BATCH = 2000
+EXIT_OK, EXIT_BAD, EXIT_INPUT, EXIT_REFUSED = FF.EXIT_OK, FF.EXIT_BAD, FF.EXIT_INPUT, FF.EXIT_REFUSED
 
 
 def compose_range(videos: Path) -> str | None:
-    log = videos / 'compose_log.json'
-    if not log.is_file():
-        return None
-    for entry in reversed(json.loads(log.read_text(encoding='utf-8'))):
+    for entry in reversed(MC.read_log(videos / MC.LOG_NAME)):
         argv = list(entry.get('argv') or [])
         if '--range' in argv and argv.index('--range') + 1 < len(argv):
             return argv[argv.index('--range') + 1]
@@ -41,40 +44,47 @@ def compose_range(videos: Path) -> str | None:
     return None
 
 
-def finals_of(ctx: MC.Ctx) -> list[tuple[str, Path, dict | None]]:
+def final_entries(ctx: MC.Ctx) -> list[dict]:
     keep = {f'angle_{MC.safe_name(c)}' for c in MC.finals_cams(ctx)}
     out = []
-    for f, lay in MQ.output_videos(ctx):
-        stem = f.stem.replace('_h265', '').replace('_draft', '')
+    for e in MQ.output_entries(ctx):
+        stem = MQ.output_stem(e['file'])
         if stem in keep or stem.startswith('layout_'):
-            out.append((stem, f, lay))
+            out.append(dict(e, name=stem))
     return out
 
 
+def finals_of(ctx: MC.Ctx) -> list[tuple[str, Path, dict | None]]:
+    return [(e['name'], e['file'], e['lay']) for e in final_entries(ctx)]
+
+
 def video_frames(path: Path) -> int:
-    info = MC.ffprobe(path)
+    mkv = path.suffix.lower() == '.mkv'
+    info = MC.ffprobe(path, count=mkv)
     v = [s for s in info.get('streams', []) if s.get('codec_type') == 'video']
-    return MT.inum(v[0].get('nb_frames'), -1) if v else -1
+    return MT.inum(v[0].get('nb_read_packets' if mkv else 'nb_frames'), -1) if v else -1
 
 
 def extract(path: Path, idx: list[int], gpu: bool):
-    W, H = MT.probe_size(path)
-    sel = '+'.join(f'eq(n,{i})' for i in sorted(set(idx)))
+    """(frame index, RGB image) of the picked frames, in order. The picks go to ffmpeg in batches so that the command line
+    stays short; a decode that fails raises mcam_ff.FfError."""
+    W, H = FF.video_size(path)
+    picks = sorted({int(i) for i in idx if int(i) >= 0})
     hw = ['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'] if gpu else []
     pre = f'hwdownload,format={MT.gpu_download_format(path)},' if gpu else ''
-    vf = f"select='{sel}',{pre}scale=in_color_matrix=bt709:in_range=tv:out_range=pc,format=rgb24"
-    cmd = [MT.FFMPEG, '-hide_banner', '-loglevel', 'error', *hw, '-i', str(path), '-vf', vf, '-fps_mode', 'passthrough', '-f', 'rawvideo', '-']
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     size = W * H * 3
-    try:
-        for i in sorted(set(idx)):
-            buf = proc.stdout.read(size)
-            if len(buf) < size:
+    for b in range(0, len(picks), PICK_BATCH):
+        part = picks[b:b + PICK_BATCH]
+        sel = '+'.join(f'eq(n,{i})' for i in part)
+        vf = f"select='{sel}',{pre}scale=in_color_matrix=bt709:in_range=tv:out_range=pc,format=rgb24"
+        cmd = [FF.ffmpeg(), '-hide_banner', '-loglevel', 'error', *hw, '-i', str(path), '-vf', vf, '-fps_mode', 'passthrough',
+               '-frames:v', str(len(part)), '-f', 'rawvideo', '-']
+        k = 0
+        for buf in FF.frames(cmd, size, name=f'ffmpeg ({path.name})'):
+            if k >= len(part):
                 break
-            yield i, np.frombuffer(buf, np.uint8).reshape(H, W, 3)
-    finally:
-        proc.stdout.close()
-        proc.wait()
+            yield part[k], np.frombuffer(buf, np.uint8).reshape(H, W, 3)
+            k += 1
 
 
 def save_frames(path: Path, picks: list[tuple[int, str]], gt: np.ndarray, fps: float, folder: Path, gpu: bool,
@@ -96,10 +106,11 @@ def save_frames(path: Path, picks: list[tuple[int, str]], gt: np.ndarray, fps: f
     for fu in futs:
         fu.result()
     with (folder / 'index.csv').open('w', encoding='utf-8', newline='') as fh:
-        fh.write('frame,output_t,game_t,why,file\n')
+        cw = csv.writer(fh, lineterminator='\n')
+        cw.writerow(['frame', 'output_t', 'game_t', 'why', 'file'])
         for j in sorted(rows):
             r = rows[j]
-            fh.write(f'{r["frame"]},{r["output_t"]},{r["game_t"]},{r["why"]},{r["file"]}\n')
+            cw.writerow([r['frame'], r['output_t'], r['game_t'], r['why'], r['file']])
     return rows
 
 
@@ -167,21 +178,25 @@ def flag_frames(flags: dict, limit: int = MAX_FLAG_FRAMES) -> list[tuple[int, st
 def build_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('take')
-    p.add_argument('--videos', help='folder with compose_log.json of the finals (default the take folder)')
+    p.add_argument('--videos', help='folder with compose_log.json of the finals (default: the take folder when it holds one, else '
+                                    'the output folder mcam_compose.py uses for the take)')
     p.add_argument('--out', help='output folder (default <videos>/fast_review)')
     p.add_argument('--every', type=float, default=2.0)
     p.add_argument('--events', help='comma list of event names / patterns / @event+s (default compose.review.events)')
     p.add_argument('--around', type=float, default=0.0, help='seconds around each event with frames every --near (0 = the event frame only)')
     p.add_argument('--near', type=float, default=0.5)
     p.add_argument('--range', help='t0:t1 of the compose (default: the --range of the last compose in compose_log.json)')
-    p.add_argument('--threads', type=int, default=8)
+    p.add_argument('--threads', type=int, default=0, help='PNG writer threads (default: the processor count, at most 8)')
     p.add_argument('--cpu', action='store_true', help='decode on the CPU')
     p.add_argument('--no-blur', action='store_true')
+    p.add_argument('--force', action='store_true', help='overwrite foreign files in the output folder')
+    p.add_argument('--json', action='store_true', help='one JSON object on stdout at the end (ok, exit, errors, warnings, written)')
     return p.parse_args(argv)
 
 
 def ctx_for(a: argparse.Namespace, videos: Path, out: Path) -> MC.Ctx:
-    ns = MC.build_parser().parse_args(['review', a.take, '--out', str(out), '--cpu', '--force'] + (['--range', a.range] if a.range else []))
+    ns = MC.build_parser().parse_args(['review', a.take, '--out', str(out), '--cpu'] + (['--force'] if a.force else [])
+                                      + (['--range', a.range] if a.range else []))
     ns.videos = [str(videos)]
     ns.no_blur = a.no_blur
     for k in ('dark_level', 'dark_cover', 'cell_dark_cover', 'blur_warn', 'blur_fail'):
@@ -189,19 +204,31 @@ def ctx_for(a: argparse.Namespace, videos: Path, out: Path) -> MC.Ctx:
     return MC.make_ctx(MT.Take(Path(a.take)), ns)
 
 
-def main(argv: list[str] | None = None) -> int:
+def default_videos(take_root: Path) -> Path:
+    if (take_root / MC.LOG_NAME).is_file():
+        return take_root
+    spec = MQ.read_json(take_root / 'spec.json')
+    run = MQ.read_json(take_root / 'run.json')
+    return MC.default_out(take_root, str(spec.get('name') or run.get('name') or take_root.name), spec)[0]
+
+
+def review(a: argparse.Namespace, state: dict) -> int:
     t0 = time.time()
-    a = build_args(argv)
     take_root = Path(a.take).resolve()
-    videos = Path(a.videos).resolve() if a.videos else take_root
+    videos = Path(a.videos).resolve() if a.videos else default_videos(take_root)
     out = Path(a.out).resolve() if a.out else videos / 'fast_review'
     if not a.range:
         a.range = compose_range(videos)
-    ctx = ctx_for(a, videos, out)
-    finals = finals_of(ctx)
+    try:
+        ctx = ctx_for(a, videos, out)
+    except MT.TakeError as e:
+        raise SystemExit(f'error: unreadable take: {e}') from None
+    state['out'] = str(out)
+    entries = final_entries(ctx)
+    finals = [(e['name'], e['file'], e['lay']) for e in entries]
+    logged = {e['name']: e['frames'] for e in entries}
     if not finals:
-        print(f'error: no finals in {videos / "compose_log.json"} (run mcam_compose.py finals first)', file=sys.stderr)
-        return 2
+        raise SystemExit(f'error: no finals in {videos / MC.LOG_NAME} (run mcam_compose.py finals first, or pass --videos DIR)')
     gpu = not a.cpu and MT.cuda_ok(finals[0][1])
     tl = MC.limit_timeline(ctx, MC.base_timeline(ctx))
     gt = np.array([f.t for f in tl.frames])
@@ -210,21 +237,38 @@ def main(argv: list[str] | None = None) -> int:
     events = MC.review_events(ctx, pats)
     picks = MC.review_picks(gt, events, a.every, a.near, a.around)
     rep = MQ.Report()
+    state['rep'] = rep
     timings: dict[str, float] = {'setup_s': round(time.time() - t0, 2)}
     for name, f, _ in finals:
         nf = video_frames(f)
         if nf != len(gt):
             rep.add('warn', 'timeline', f'{f.name}: {nf} frames, the take timeline in range {a.range or "all"} has {len(gt)}; times may be off')
     t1 = time.time()
-    with ThreadPoolExecutor(max(2, a.threads)) as pool, ThreadPoolExecutor(2 * len(finals)) as jobs:
-        qa_f = {name: jobs.submit(MQ.check_video, ctx, rep, f, lay, gpu) for name, f, lay in finals}
-        fr_f = {name: jobs.submit(save_frames, f, picks, gt, fps, out / name, gpu, pool) for name, f, _ in finals}
+    writers = max(2, a.threads or min(8, os.cpu_count() or 4))
+
+    def frames_of(f: Path, which: list, folder: Path, pool: ThreadPoolExecutor) -> dict:
+        try:
+            return save_frames(f, which, gt, fps, folder, gpu, pool)
+        except FF.FfError as e:
+            if not gpu:
+                rep.add('error', 'frames', f'{f.name}: {e}')
+                return {}
+            rep.add('warn', 'frames', f'{f.name}: GPU decode failed ({e}); decoded on the CPU')
+        try:
+            return save_frames(f, which, gt, fps, folder, False, pool)
+        except FF.FfError as e:
+            rep.add('error', 'frames', f'{f.name}: {e}')
+            return {}
+
+    with ThreadPoolExecutor(writers) as pool, ThreadPoolExecutor(2 * len(finals)) as jobs:
+        qa_f = {name: jobs.submit(MQ.check_video, ctx, rep, f, lay, gpu, logged.get(name)) for name, f, lay in finals}
+        fr_f = {name: jobs.submit(frames_of, f, picks, out / name, pool) for name, f, _ in finals}
         flags = {k: v.result() for k, v in qa_f.items()}
         frames = {k: v.result() for k, v in fr_f.items()}
         timings['frames_and_qa_s'] = round(time.time() - t1, 2)
         t2 = time.time()
         flagged = {name: flag_frames(flags[name]) for name, _, _ in finals}
-        ff = {name: jobs.submit(save_frames, f, flagged[name], gt, fps, out / name / 'flags', gpu, pool) for name, f, _ in finals if flagged[name]}
+        ff = {name: jobs.submit(frames_of, f, flagged[name], out / name / 'flags', pool) for name, f, _ in finals if flagged[name]}
         flag_rows = {k: v.result() for k, v in ff.items()}
         timings['flag_frames_s'] = round(time.time() - t2, 2)
     t3 = time.time()
@@ -272,13 +316,50 @@ def main(argv: list[str] | None = None) -> int:
     doc = {'take': str(take_root), 'videos': str(videos), 'range': a.range, 'decode': 'gpu' if gpu else 'cpu', 'finals': {n: str(f) for n, f, _ in finals},
            'events': [[round(t, 4), n] for t, n in events], 'frames': {n: len(frames[n]) for n in names},
            'flag_frames': {n: len(flag_rows.get(n, {})) for n in names}, 'sheets': [str(s) for s in sheets], 'timings': timings,
-           'errors': errors, 'warnings': warns, 'items': rep.items,
+           'errors': errors, 'warnings': warns, 'exit': EXIT_BAD if errors else EXIT_OK, 'items': rep.items,
            'flags': {n: {k: {c: MQ.fmt_runs(MQ.runs(v), 50) for c, v in (flags[n].get(k) or {}).items() if v} for k in FLAG_KINDS} for n in names}}
     (out / 'fast_review.json').write_text(json.dumps(doc, indent=1, default=str), encoding='utf-8')
+    state['written'] = [str(out / 'fast_review.json'), str(out / 'qa.txt')] + [str(s) for s in sheets] + [str(out / n) for n in names]
     print('\n'.join(lines))
     print(f'frames {doc["frames"]}, flag frames {doc["flag_frames"]}, sheets: ' + ', '.join(s.name for s in sheets))
     print(f'timings {json.dumps(timings)} -> {out}')
-    return 1 if errors else 0
+    return EXIT_BAD if errors else EXIT_OK
+
+
+def main(argv: list[str] | None = None) -> int:
+    FF.utf8_stdio()
+    a = build_args(argv)
+    js = FF.JsonMode(a.json)
+    del MC.NOTES[:]
+    state: dict = {}
+    extra: list[str] = []
+
+    def fail(code: int, text: str, prefix: str = 'error: ') -> int:
+        extra.append(text)
+        print(prefix + text, file=sys.stderr, flush=True)
+        return code
+
+    try:
+        code = review(a, state)
+    except MC.Refused as e:
+        code = fail(EXIT_REFUSED, str(e.code), '')
+    except SystemExit as e:
+        if not isinstance(e.code, str):
+            raise
+        code = fail(EXIT_INPUT, e.code, '')
+    except (MT.TakeError, FF.FfError) as e:
+        code = fail(EXIT_BAD, str(e))
+    except KeyboardInterrupt:
+        code = fail(EXIT_BAD, 'interrupted')
+    except OSError as e:
+        code = fail(EXIT_BAD, f'{type(e).__name__}: {e}')
+    rep = state.get('rep')
+    items = rep.items if rep is not None else []
+    js.finish({'ok': code == EXIT_OK, 'exit': code, 'command': 'fast_review', 'take': str(Path(a.take).resolve()), 'out': state.get('out'),
+               'errors': [f'{i["check"]}: {i["msg"]}' for i in items if i['level'] == 'error'] + extra,
+               'warnings': [f'{i["check"]}: {i["msg"]}' for i in items if i['level'] == 'warn'] + list(MC.NOTES),
+               'written': state.get('written') or []})
+    return code
 
 
 if __name__ == '__main__':

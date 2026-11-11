@@ -2,7 +2,10 @@
 
 Object keys use the same " #n" numbering for same-named siblings as LevelCompare.Map, so a live object finds its row.
 Reads only; run with: python -I make_atlas.py --index <levels dir> --audit <tables dir> --game <INSIDE dir> --out <dir>
+Exit codes: 0 ok, 2 an input file is missing or not in the expected form.
 """
+from __future__ import annotations
+
 import argparse
 import csv
 import json
@@ -18,6 +21,13 @@ BUILTIN = {'Transform', 'RectTransform', 'MeshFilter', 'MeshRenderer', 'SkinnedM
            'HingeJoint', 'FixedJoint', 'SpringJoint', 'ConfigurableJoint', 'LensFlare', 'Projector', 'Cloth', 'WindZone'}
 CHARACTER_TYPES = {0: 'Unknown', 1: 'Boy', 2: 'Huddle'}
 UNCERTAIN_WIRE = 'created_outside_PreAwake'
+KEEP_FIELDS = ('m_Children', 'm_Father', 'sender', 'receiver', 'sortedSavepoints', 'cachedSpawnPos', 'characterType', 'isCheckpointOnly')
+FILE_KEYS = ('fileID', 'm_FileID', 'fileId')
+LEVEL_RE = re.compile(r'level(\d+)$')
+
+
+class AtlasError(Exception):
+    pass
 
 
 class Level:
@@ -48,38 +58,67 @@ class Level:
         return [n for n, _ in names.most_common(6)]
 
 
+def local_ref(ref) -> int | None:
+    """pathID of a reference into the same file; None for no reference or one into another file (it would name a wrong
+    object of this level)."""
+    if not isinstance(ref, dict) or ref.get('pathID') is None:
+        return None
+    for k in FILE_KEYS:
+        v = ref.get(k)
+        if isinstance(v, int) and not isinstance(v, bool) and v != 0:
+            return None
+    return ref['pathID']
+
+
 def load_level(path: Path) -> Level:
+    """One level index file <file>__<scene>.jsonl. Only what the tables use is kept in memory: of a game object its name and
+    component list, of a component its class, script, game object and the fields named in KEEP_FIELDS."""
     file, scene = path.stem.split('__', 1)
     lv = Level(file, scene)
-    for line in path.open(encoding='utf-8'):
-        r = json.loads(line)
-        if r['rec'] == 'gameobject':
-            lv.gos[r['pathID']] = r
-        elif r['rec'] == 'component':
-            lv.comps[r['pathID']] = r
-    tr_go = {pid: c['go'] for pid, c in lv.comps.items() if c['class'] in TRANSFORMS and 'go' in c}
-
-    def walk(tid: int, parent_path: str | None) -> None:
-        c = lv.comps[tid]
-        go = c['go']
-        if parent_path is None:
-            lv.path[go] = lv.gos[go]['name']
-        seen = Counter()
-        for ref in c['fields'].get('m_Children') or []:
-            ctid = ref['pathID']
-            if ctid not in tr_go:
+    with path.open(encoding='utf-8') as fh:
+        for n, line in enumerate(fh, 1):
+            if not line.strip():
                 continue
-            cgo = tr_go[ctid]
-            name = lv.gos[cgo]['name']
-            seen[name] += 1
-            lv.path[cgo] = lv.path[go] + '/' + name + (f' #{seen[name]}' if seen[name] > 1 else '')
-            lv.children[go].append(cgo)
-            walk(ctid, lv.path[cgo])
+            try:
+                r = json.loads(line)
+                kind, pid = r['rec'], r['pathID']
+                if kind == 'gameobject':
+                    lv.gos[pid] = {'name': r['name'], 'components': r['components']}
+                elif kind == 'component':
+                    f = r.get('fields') or {}
+                    c = {'class': r['class'], 'script': r.get('script'), 'fields': {k: f[k] for k in KEEP_FIELDS if k in f}}
+                    if 'go' in r:
+                        c['go'] = r['go']
+                    lv.comps[pid] = c
+            except (ValueError, KeyError, TypeError) as e:
+                raise AtlasError(f'{path.name} line {n}: {type(e).__name__}: {e}') from None
+    tr_go = {pid: c['go'] for pid, c in lv.comps.items() if c['class'] in TRANSFORMS and c.get('go') in lv.gos}
+
+    def walk(root: int) -> None:
+        lv.path[tr_go[root]] = lv.gos[tr_go[root]]['name']
+        stack = [root]
+        while stack:
+            tid = stack.pop()
+            go = tr_go[tid]
+            seen = Counter()
+            kids = []
+            for ref in lv.comps[tid]['fields'].get('m_Children') or []:
+                ctid = local_ref(ref)
+                if ctid not in tr_go:
+                    continue
+                cgo = tr_go[ctid]
+                name = lv.gos[cgo]['name']
+                seen[name] += 1
+                if cgo in lv.path:
+                    continue
+                lv.path[cgo] = lv.path[go] + '/' + name + (f' #{seen[name]}' if seen[name] > 1 else '')
+                lv.children[go].append(cgo)
+                kids.append(ctid)
+            stack.extend(reversed(kids))
 
     for tid, go in tr_go.items():
-        father = lv.comps[tid]['fields'].get('m_Father')
-        if not father or father.get('pathID') not in tr_go:
-            walk(tid, None)
+        if local_ref(lv.comps[tid]['fields'].get('m_Father')) not in tr_go and go not in lv.path:
+            walk(tid)
     return lv
 
 
@@ -101,11 +140,18 @@ def go_of(lv: Level, comp_id: int) -> int | None:
     return c.get('go') if c else None
 
 
+def num(text) -> int | None:
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
 def hidden_rows(levels: dict[str, Level], audit: Path) -> list[list]:
     rows = []
     for r in read_tsv(audit / '09_unused_orphans_files' / 'dormant_gates.tsv'):
         lv = levels.get(r['file'])
-        go = int(r['go_pathID'])
+        go = num(r['go_pathID'])
         if lv is None or go not in lv.path or r['status'] == 'BASELINE':
             continue
         sub = lv.subtree(go)
@@ -113,7 +159,7 @@ def hidden_rows(levels: dict[str, Level], audit: Path) -> list[list]:
                      ','.join(lv.scripts(sub))])
     for r in read_tsv(audit / '09_unused_orphans_files' / 'opened_gates.tsv'):
         lv = levels.get(r['file'])
-        go = int(r['go_pathID'])
+        go = num(r['go_pathID'])
         if lv is None or go not in lv.path:
             continue
         sub = lv.subtree(go)
@@ -133,14 +179,13 @@ def wire_rows(levels: dict[str, Level], audit: Path) -> tuple[list[list], int]:
             skipped += 1
             continue
         lv = levels.get(r['file'])
-        cid = int(r['connector_pathID'])
+        cid = num(r['connector_pathID'])
         comp = lv.comps.get(cid) if lv else None
         if comp is None:
             continue
         f = comp['fields']
-        snd = (f.get('sender') or {}).get('pathID')
-        rcv = (f.get('receiver') or {}).get('pathID')
-        rows.append([lv.file, lv.path.get(comp['go'], ''), r['signalOutName'], r['signalInName'], lv.path.get(snd, ''),
+        snd, rcv = local_ref(f.get('sender')), local_ref(f.get('receiver'))
+        rows.append([lv.file, lv.path.get(comp.get('go'), ''), r['signalOutName'], r['signalInName'], lv.path.get(snd, ''),
                      lv.path.get(rcv, ''), r['status'], r['flags']])
     return rows, skipped
 
@@ -151,7 +196,8 @@ def fsm_rows(levels: dict[str, Level], audit: Path) -> list[list]:
         if not r['unreachable_states'] and not r['events_without_source']:
             continue
         lv = levels.get(r['file'])
-        go = go_of(lv, int(r['fsm_pathID'])) if lv else None
+        cid = num(r['fsm_pathID'])
+        go = go_of(lv, cid) if lv and cid is not None else None
         if go is None or go not in lv.path:
             continue
         rows.append([lv.file, lv.path[go], r['fsm_name'], r['unreachable_states'], r['events_without_source']])
@@ -171,8 +217,9 @@ def savepoint_rows(levels: dict[str, Level], subscene_index: Path) -> tuple[list
         if lv is None:
             areas.append([idx, name, '', -1])
             continue
-        node = next((c for c in lv.comps.values() if c.get('script') == 'SubsceneNode' and lv.path.get(c['go']) == name), None)
-        refs = [x['pathID'] for x in (node['fields'].get('sortedSavepoints') or [])] if node else []
+        node = next((c for c in lv.comps.values() if c.get('script') == 'SubsceneNode' and lv.path.get(c.get('go')) == name), None)
+        refs = [local_ref(x) for x in (node['fields'].get('sortedSavepoints') or [])] if node else []
+        refs = [sid for sid in refs if sid in lv.comps]
         areas.append([idx, name, lv.file, len(refs)])
         for i, sid in enumerate(refs):
             sp = lv.comps[sid]
@@ -181,30 +228,38 @@ def savepoint_rows(levels: dict[str, Level], subscene_index: Path) -> tuple[list
             info = CHARACTER_TYPES.get(f.get('characterType'), str(f.get('characterType')))
             if f.get('isCheckpointOnly'):
                 info += ', checkpoint-only'
-            points.append([name, i, lv.file, lv.path.get(sp['go'], ''), repr(p.get('x', 0.0)), repr(p.get('y', 0.0)),
+            points.append([name, i, lv.file, lv.path.get(sp.get('go'), ''), repr(p.get('x', 0.0)), repr(p.get('y', 0.0)),
                            repr(p.get('z', 0.0)), info])
     return areas, points
 
 
+def level_order(file: str) -> tuple:
+    if file == 'mainData':
+        return (0, 0, file)
+    m = LEVEL_RE.match(file)
+    return (1, int(m.group(1)), file) if m else (2, 0, file)
+
+
 def level_rows(levels: dict[str, Level], game: Path) -> list[list]:
     rows = []
-    for lv in sorted(levels.values(), key=lambda v: (v.file != 'mainData', int(v.file[5:]) if v.file != 'mainData' else 0)):
+    for lv in sorted(levels.values(), key=lambda v: level_order(v.file)):
         f = game / 'INSIDE_Data' / lv.file
         rows.append([lv.file, lv.scene, f.stat().st_size if f.exists() else -1, len(lv.gos)])
     return rows
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--index', type=Path, required=True)
-    ap.add_argument('--audit', type=Path, required=True)
-    ap.add_argument('--game', type=Path, required=True)
-    ap.add_argument('--out', type=Path, required=True)
-    a = ap.parse_args()
+def build(a: argparse.Namespace) -> int:
+    if not a.index.is_dir():
+        raise AtlasError(f'--index {a.index}: not a folder')
     levels = {}
     for p in sorted(a.index.glob('*.jsonl')):
+        if '__' not in p.stem:
+            print(f'skipped {p.name}: not <file>__<scene>.jsonl', file=sys.stderr)
+            continue
         lv = load_level(p)
         levels[lv.file] = lv
+    if not levels:
+        raise AtlasError(f'--index {a.index}: no <file>__<scene>.jsonl level files')
     a.out.mkdir(parents=True, exist_ok=True)
     lv_rows = level_rows(levels, a.game)
     hid = hidden_rows(levels, a.audit)
@@ -221,6 +276,31 @@ def main() -> int:
     print(f'levels {len(lv_rows)}  hidden {len(hid)} {dict(st)}  wires {len(wires)} (skipped uncertain {skipped})  fsm {len(fsms)}  '
           f'subscenes {len(areas)}  savepoints {len(points)}')
     return 0
+
+
+def main() -> int:
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError, OSError):
+            pass
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--index', type=Path, required=True, help='folder with the level index files <file>__<scene>.jsonl')
+    ap.add_argument('--audit', type=Path, required=True, help='folder with the audit tables (tools/atlas/README.md)')
+    ap.add_argument('--game', type=Path, required=True, help='the game folder (for the level file sizes)')
+    ap.add_argument('--out', type=Path, required=True, help='folder for the six .tsv tables')
+    a = ap.parse_args()
+    try:
+        return build(a)
+    except AtlasError as e:
+        print(f'make_atlas: {e}', file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f'make_atlas: {type(e).__name__}: {e}', file=sys.stderr)
+        return 2
+    except KeyError as e:
+        print(f'make_atlas: an audit table lacks the column {e}', file=sys.stderr)
+        return 2
 
 
 if __name__ == '__main__':

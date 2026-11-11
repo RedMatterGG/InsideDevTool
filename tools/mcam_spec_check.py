@@ -1,8 +1,13 @@
 # MultiCam v2 spec checker (offline). Reads the schema from src/InsideDev/Runtime/MultiCamTypes.cs and ReplayTypes.cs, binds
 # the JSON exactly like SpecBind, then runs the offline lint of MULTICAM_DESIGN.md 4.13 (plus the replay lint of
 # REPLAY_DESIGN.md 3.2 for specs with a `replay` block), the segment table, a cost and disk estimate, compose checks and an
-# optional object lookup in the level index. --schema-md prints the schema tables for docs/MULTICAM.md.
-# Usage: python -I tools/mcam_spec_check.py <spec.json>... [--types FILE...] [--replay|--v2] [--schema-md] [--quiet] [--json] [--index]
+# optional object lookup in the level index. --schema-md prints the schema tables for docs/MULTICAM.md. The tables the lint
+# needs (keys per camera mode, eases, points, operators ...) are read from MultiCamRig.cs, MultiCamTargets.cs and MultiCam.cs
+# next to the schema sources on every run, so they cannot drift from the game; the copies below are the fallback. The capture
+# size comes from --res, else session.res, else run.json "screen" of the take given with --poses / --rehearsal; without one
+# the pixel checks and the disk estimate are skipped with a note. Exit 0 no errors, 1 errors, 2 unreadable spec / schema / usage.
+# Usage: python -I tools/mcam_spec_check.py <spec.json>... [--types FILE...] [--replay|--v2] [--res WxH] [--schema-md] [--quiet]
+#        [--json | --json-list] [--compare GAME_REPORT.json] [--strict] [--index]
 from __future__ import annotations
 
 import argparse
@@ -27,30 +32,30 @@ SCHEMA_END = "<!-- schema:end -->"
 
 GAME_FOV = 50.987
 LEGACY_FOV = 40.0
-CAPTURE_W, CAPTURE_H = 2560, 1440
-JPEG_MB_1440P = 1.0
+MAX_FOV = 170.0
+JPEG_MB_PER_MEGAPIXEL = 0.2713
+PIPE_MB_PER_MEGAPIXEL = 0.05
+DEFAULT_ASPECT = 16 / 9
 NVENC_SESSIONS = 8
+ORBIT_YAW_WARN = 60.0
 
-COMMON_CAM_KEYS = {"name", "mode", "label", "enabled", "fov", "near", "focus", "playerSide", "zMax", "render", "post", "hide", "clamp", "view",
-                   "motion", "backfaces", "feedForward"}
+COMMON_CAM_KEYS = {"name", "mode", "label", "enabled", "fov", "near", "focus", "roll", "playerSide", "zMax", "render", "post", "shake", "hide",
+                   "backfaces", "feedForward", "clamp", "view", "motion"}
 MODE_KEYS = {
-    "game": {"offset", "fovScale", "clean", "roll", "shake"},
-    "static": {"pos", "yaw", "pitch", "roll", "look", "lookOffset", "lookSmooth", "target", "point", "screen", "shake"},
+    "game": {"offset", "fovScale", "clean"},
+    "static": {"pos", "yaw", "pitch", "look", "lookOffset", "lookSmooth", "target", "point", "screen"},
     "follow": {"target", "point", "offset", "local", "smooth", "lookSmooth", "lag", "lead", "planar", "start", "look",
-               "lookOffset", "yaw", "pitch", "roll", "screen", "shake"},
-    "keys": {"keys", "interp", "ease", "start", "look", "lookOffset", "lookSmooth", "target", "point", "screen", "roll", "shake"},
-    "rail": {"path", "duration", "start", "ease", "interp", "look", "lookOffset", "lookSmooth", "yaw", "pitch", "target", "point",
-             "screen", "roll", "shake"},
+               "lookOffset", "yaw", "pitch", "screen"},
+    "keys": {"keys", "interp", "ease", "start", "look", "lookOffset", "lookSmooth", "target", "point", "screen"},
+    "rail": {"path", "duration", "start", "ease", "interp", "look", "lookOffset", "lookSmooth", "yaw", "pitch", "target", "point", "screen"},
     "orbit": {"target", "point", "offset", "radius", "height", "azimuth", "duration", "start", "ease", "look", "lookOffset",
-              "lookSmooth", "yaw", "pitch", "screen", "roll", "shake"},
-    "gamerel": {"orbitYaw", "orbitPitch", "dist", "distScale", "shift", "keepSize", "clean", "roll", "shake"},
-    "gamelike": {"target", "point", "box", "camOffset", "aimOffset", "extrapolate", "lag", "planar", "smooth", "lookOffset",
-                 "roll", "shake"},
-    "frame": {"target", "point", "screen", "size", "subjectHeight", "crop", "smooth", "lead", "yaw", "pitch", "roll", "shake"},
+              "lookSmooth", "yaw", "pitch", "screen"},
+    "gamerel": {"orbitYaw", "orbitPitch", "dist", "distScale", "shift", "keepSize", "clean"},
+    "gamelike": {"target", "point", "box", "camOffset", "aimOffset", "extrapolate", "lag", "planar", "smooth", "lookOffset"},
+    "frame": {"target", "point", "screen", "size", "subjectHeight", "crop", "smooth", "lead", "yaw", "pitch"},
     "director": {"shots", "cutAngle", "cutDistance", "minHold"},
-    "overview": {"target", "point", "pos", "yaw", "pitch", "roll", "offset", "smooth", "lead", "pans", "start", "shake"},
-    "events": {"beats", "target", "point", "offset", "offsets", "lookOffset", "lookSmooth", "smooth", "hold", "move", "late", "ease",
-               "start", "roll", "shake"},
+    "overview": {"target", "point", "pos", "yaw", "pitch", "offset", "smooth", "lead", "pans", "start"},
+    "events": {"beats", "target", "point", "offset", "offsets", "lookOffset", "lookSmooth", "smooth", "hold", "move", "late", "ease", "start"},
 }
 EASES = {"keys": {"ends", "keys", "each", "linear"}, "rail": {"ends", "linear"}, "orbit": {"ends", "linear"},
          "events": {"ends", "smooth", "smoother", "linear", "sine"}}
@@ -68,9 +73,14 @@ GROUP_MODES = {"centroid", "weighted", "bounds", "nearest", "fastest"}
 COND_PROPS = {"x", "y", "z", "vx", "vy", "vz", "speed", "dist"}
 OPS = {"<", "<=", ">", ">=", "==", "!="}
 BASES = {"boy", "huddle", "main", "game", "gameaim", "probe", "none", "self"}
-BOY_POINTS = {"torso", "head", "neck", "root", "pos3", "bounds", "probe"}
-HUDDLE_POINTS = {"visual", "centre", "top", "bottom", "bounds"}
+BOY_POINTS = {"torso", "head", "neck", "root", "pos3", "pivot", "bounds", "top", "bottom", "probe"}
+HUDDLE_POINTS = {"visual", "centre", "center", "pos3", "pivot", "bounds", "top", "bottom", "probe"}
 OBJECT_POINTS = {"pivot", "bounds", "com", "rb", "collider", "top", "bottom"}
+GROUP_POINTS = {"pivot", "bounds", "com", "rb", "collider", "top", "bottom"}
+POINTLESS_BASES = {"game", "gameaim", "probe", "none", "self"}
+PIPE_CODECS = {"hevc_nvenc", "libx265", "auto"}
+RESERVED_NAMES = {"con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+                  "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"}
 EDGE_POINTS = {"bounds", "top", "bottom"}
 EDGE_POINT_WARN = ("{} follows the renderer bounds, which shift whenever the object turns or its silhouette changes; "
                    "track one point instead: com (objects with a Rigidbody, the default), pivot, bone:<name>, or torso/head for the boy")
@@ -104,6 +114,8 @@ OBJECT_COMMANDS = {"call", "signal", "signalin", "fsm", "setactive", "enable", "
 COMPOSE_KEYS = {"fps", "blur", "grade", "labels", "angles", "layouts", "edit", "encode", "review"}
 TRANSITIONS = {"cut", "dissolve", "dip"}
 PRESETS = {"16x9_3": (956, 3, 480), "16x9_2": (716, 2, 720)}
+PRESET_WIDTH = 2560
+TABLE_NOTES: list[str] = []
 REPLAY_MS = "40:60"
 SIDE_ANGLE = 65.0
 TOP_DOWN_PITCH = 60.0
@@ -146,9 +158,40 @@ def cs_double(s: str) -> float | None:
 
 def cs_number_text(v: float) -> str:
     d = float(v)
+    if not math.isfinite(d):
+        return "NaN" if math.isnan(d) else ("Infinity" if d > 0 else "-Infinity")
     if d == int(d) and abs(d) < 1e15:
         return str(int(d))
-    return repr(d)
+    return format(d, ".15g").replace("e", "E")
+
+
+def finite_float(text: str) -> float:
+    v = float(text)
+    if not math.isfinite(v):
+        raise ValueError(f"number {text} is out of range (the game parser rejects it)")
+    return v
+
+
+def parse_res(text: str) -> tuple[int, int]:
+    m = re.fullmatch(r"\s*(\d+)\s*[xX*,:]\s*(\d+)\s*", text or "")
+    if not m or int(m.group(1)) <= 0 or int(m.group(2)) <= 0:
+        raise argparse.ArgumentTypeError(f"'{text}' is not WIDTHxHEIGHT (e.g. 1920x1080)")
+    return int(m.group(1)), int(m.group(2))
+
+
+def parse_ms(text: str) -> tuple[float, float]:
+    parts = (text or "").split(":")
+    try:
+        vals = [float(x) for x in parts]
+    except ValueError:
+        vals = []
+    if len(vals) not in (1, 2) or not all(math.isfinite(v) and v > 0 for v in vals) or vals[0] > vals[-1]:
+        raise argparse.ArgumentTypeError(f"'{text}' is not milliseconds 'lo:hi' (e.g. 25:40) or one number")
+    return vals[0], vals[-1]
+
+
+def wrap_angle(a: float) -> float:
+    return (a + 180.0) % 360.0 - 180.0
 
 
 def levenshtein(a: str, b: str) -> int:
@@ -250,9 +293,8 @@ def hide_box_error(name: str) -> str | None:
         parts = box.split(",")
         if len(parts) != 6:
             return tag + "needs 6 numbers x0,y0,z0,x1,y1,z1 (several boxes: separate them with ';')"
-        try:
-            v = [float(x) for x in parts]
-        except ValueError:
+        v = [cs_double(x) for x in parts]
+        if None in v:
             return f"{tag}'{box}' has a value that is not a number"
         if any(v[i] == v[i + 3] for i in range(3)):
             return tag + "has zero size on an axis"
@@ -614,6 +656,112 @@ class Schema:
     def nested_type(self, ctype: str) -> tuple[str, bool]:
         m = re.fullmatch(r"List<(.+)>", ctype)
         return (m.group(1), True) if m else (ctype, False)
+
+
+# ---------------------------------------------------------------------------------------------------- tables from C#
+
+STRING_ARRAY_RE = re.compile(r"\bstatic\s+readonly\s+string\[\]\s+(\w+)\s*=\s*(?:new\s*(?:string)?\s*\[\]\s*)?\{([^{};]*)\}\s*;")
+STRING_MAP_RE = re.compile(r"\bstatic\s+readonly\s+Dictionary<\s*string\s*,\s*string\[\]\s*>\s+(\w+)\s*=\s*new\s+Dictionary<[^>]*>\s*(?:\(\s*\))?\s*\{(.*?)\}\s*;", re.S)
+MAP_ENTRY_RE = re.compile(r"\{\s*\"([^\"]*)\"\s*,\s*new\s*(?:string)?\s*\[\]\s*\{([^{}]*)\}\s*\}")
+LOCAL_ARRAY_RE = re.compile(r"\bstring\[\]\s+(\w+)\s*=\s*\{([^{};]*)\}\s*;")
+INT_CONST_RE = re.compile(r"\bconst\s+int\s+(\w+)\s*=\s*(\d+)\s*;")
+
+
+def cs_tables(path: Path) -> tuple[dict, dict, dict, dict]:
+    text = mask_code(path.read_text(encoding="utf-8-sig"), strings=False)
+
+    def strs(block: str) -> list[str]:
+        return re.findall(r'"((?:[^"\\]|\\.)*)"', block)
+
+    arrays = {m.group(1): strs(m.group(2)) for m in STRING_ARRAY_RE.finditer(text)}
+    maps = {m.group(1): {k: strs(v) for k, v in MAP_ENTRY_RE.findall(m.group(2))} for m in STRING_MAP_RE.finditer(text)}
+    local = {m.group(1): strs(m.group(2)) for m in LOCAL_ARRAY_RE.finditer(text)}
+    ints = {m.group(1): int(m.group(2)) for m in INT_CONST_RE.finditer(text)}
+    return arrays, maps, local, ints
+
+
+def load_tables(folder: Path) -> list[str]:
+    """Replace the built-in lint tables by the ones of the game's sources in `folder`; returns what could not be read."""
+    global COMMON_CAM_KEYS, MODE_KEYS, EASES, SHOT_EASES, SHOT_TRANSITIONS, CLOCKS, LAGS, INTERPS, BOY_POINTS, HUDDLE_POINTS, OBJECT_POINTS
+    global GROUP_POINTS, GROUP_MODES, COND_PROPS, OPS, MAX_HIDE_BOXES, PRESETS, PRESET_WIDTH, PIPE_CODECS, RESERVED_NAMES
+    missing: list[str] = []
+
+    def read(name: str) -> tuple[dict, dict, dict, dict]:
+        f = folder / name
+        if not f.is_file():
+            return {}, {}, {}, {}
+        try:
+            return cs_tables(f)
+        except (OSError, UnicodeDecodeError, re.error) as e:
+            missing.append(f"{name}: unreadable ({e})")
+            return {}, {}, {}, {}
+
+    def take(src: tuple, kind: int, key: str, name: str, drop_empty: bool = True):
+        if not any(src):
+            return None
+        v = src[kind].get(key)
+        if not v:
+            missing.append(f"{name}: table {key} not found")
+            return None
+        return {x for x in v if x or not drop_empty} if kind != 1 else {k: set(x) for k, x in v.items()}
+
+    rig, targets, plan, types = read("MultiCamRig.cs"), read("MultiCamTargets.cs"), read("MultiCam.cs"), read("MultiCamTypes.cs")
+    v = take(rig, 0, "Common", "MultiCamRig.cs")
+    COMMON_CAM_KEYS = v or COMMON_CAM_KEYS
+    v = take(rig, 1, "ModeKeys", "MultiCamRig.cs")
+    MODE_KEYS = v or MODE_KEYS
+    eases = dict(EASES)
+    for mode, key in (("keys", "KeyEases"), ("rail", "PathEases"), ("orbit", "PathEases"), ("events", "BeatEases")):
+        v = take(rig, 0, key, "MultiCamRig.cs")
+        eases[mode] = v or eases[mode]
+    EASES = eases
+    SHOT_EASES = take(rig, 0, "ShotEases", "MultiCamRig.cs") or SHOT_EASES
+    SHOT_TRANSITIONS = take(rig, 0, "Transitions", "MultiCamRig.cs") or SHOT_TRANSITIONS
+    CLOCKS = take(rig, 0, "Clocks", "MultiCamRig.cs") or CLOCKS
+    LAGS = take(rig, 0, "Lags", "MultiCamRig.cs") or LAGS
+    INTERPS = take(rig, 0, "Interps", "MultiCamRig.cs") or INTERPS
+    BOY_POINTS = take(targets, 0, "BoyPoints", "MultiCamTargets.cs") or BOY_POINTS
+    HUDDLE_POINTS = take(targets, 0, "HuddlePoints", "MultiCamTargets.cs") or HUDDLE_POINTS
+    OBJECT_POINTS = take(targets, 0, "Points", "MultiCamTargets.cs") or OBJECT_POINTS
+    if any(targets):
+        GROUP_POINTS = {x for x in targets[2].get("pts") or targets[0].get("GroupPoints") or [] if x} or OBJECT_POINTS
+        GROUP_MODES = set(targets[2].get("modes") or targets[0].get("GroupModes") or []) or GROUP_MODES
+    COND_PROPS = take(plan, 0, "CondProps", "MultiCam.cs") or COND_PROPS
+    OPS = take(plan, 0, "Ops", "MultiCam.cs") or OPS
+    if any(types):
+        MAX_HIDE_BOXES = types[3].get("MaxBoxes") or MAX_HIDE_BOXES
+    for name, key in (("McaXFfmpeg.cs", "CodecList"), ("McaXTake.cs", "Reserved")):
+        f = folder / name
+        if not f.is_file():
+            continue
+        try:
+            text = mask_code(f.read_text(encoding="utf-8-sig"), strings=False)
+        except (OSError, UnicodeDecodeError):
+            continue
+        if key == "CodecList":
+            m = re.search(r'const\s+string\s+CodecList\s*=\s*"([^"]*)"', text)
+            got = {x.strip().lower() for x in m.group(1).split(",") if x.strip()} if m else set()
+            PIPE_CODECS = got or PIPE_CODECS
+        else:
+            m = STRING_ARRAY_RE.search(text[max(0, text.find("string[] Reserved") - 40):])
+            got = {x.lower() for x in re.findall(r'"([^"]*)"', m.group(2))} if m and m.group(1) == "Reserved" else set()
+            RESERVED_NAMES = got or RESERVED_NAMES
+        if not got:
+            missing.append(f"{name}: table {key} not found")
+    comp = Path(__file__).resolve().parent / "mcam_compose.py"
+    try:
+        text = comp.read_text(encoding="utf-8")
+        m = re.search(r"^PRESET_WIDTH\s*=\s*(\d+)\s*$", text, re.M)
+        PRESET_WIDTH = int(m.group(1)) if m else PRESET_WIDTH
+        m = re.search(r"^PRESETS\s*=\s*(\{[^\n]*\})\s*$", text, re.M)
+        if m:
+            import ast
+            v = ast.literal_eval(m.group(1))
+            if isinstance(v, dict) and all(isinstance(x, tuple) and len(x) == 3 for x in v.values()):
+                PRESETS = v
+    except (OSError, ValueError, SyntaxError):
+        pass
+    return missing
 
 
 # ---------------------------------------------------------------------------------------------------- values
@@ -1143,7 +1291,9 @@ class Check:
         self.predicted: dict[str, tuple[float, str]] = {}
         self.refs: dict[str, list[str]] = {}
         self.end_t = 0.0
-        self.res = (CAPTURE_W, CAPTURE_H)
+        self.res: tuple[int, int] | None = getattr(opts, "res", None)
+        self.res_source = "--res" if self.res else ""
+        self.merged_points: list[CamInfo] = []
         self.root: dict = {}
         self.replay = False
 
@@ -1155,9 +1305,14 @@ class Check:
             self.result.bad_input = True
             return self.result
         try:
-            root = json.loads(text, object_pairs_hook=JObj, strict=False, parse_constant=self._bad_constant)
+            root = json.loads(text, object_pairs_hook=JObj, strict=False, parse_constant=self._bad_constant, parse_float=finite_float)
         except ValueError as e:
-            self.report.error(str(self.path), f"JSON: {e}")
+            self.report.error(str(self.path), f"JSON: {e} (strict JSON is needed here; the game's own parser also takes +5, .5, 5. and "
+                                              "unknown escapes, which hides typos)")
+            self.result.bad_input = True
+            return self.result
+        except RecursionError:
+            self.report.error(str(self.path), "JSON: nested too deep (the game stops at 128 levels)")
             self.result.bad_input = True
             return self.result
         if not isinstance(root, dict):
@@ -1176,6 +1331,8 @@ class Check:
         if self.opts.bind_only:
             return self.result
         self.report.stage = "lint"
+        for text in TABLE_NOTES:
+            self.report.warn("schema", text + ": the built-in copy is used, the offline result may differ from mcam check in the game")
         self.legacy_mapping()
         self.build_cameras()
         self.collect_refs()
@@ -1207,6 +1364,23 @@ class Check:
 
     def w(self, base: str, key: str) -> str:
         return f"{base}.{key}" if base else key
+
+    def take_screen(self, folder: Path | None, what: str) -> None:
+        if self.res is not None or folder is None:
+            return
+        folder = folder if folder.is_dir() else folder.parent
+        try:
+            sc = json.loads((folder / "run.json").read_text(encoding="utf-8-sig")).get("screen")
+        except (OSError, ValueError, AttributeError):
+            return
+        if isinstance(sc, list) and len(sc) == 2 and all(is_num(v) and v > 0 for v in sc):
+            self.res, self.res_source = (int(sc[0]), int(sc[1])), f"run.json of {what}"
+
+    def aspect(self) -> float:
+        return self.res[0] / max(1, self.res[1]) if self.res else DEFAULT_ASPECT
+
+    def megapixels(self) -> float | None:
+        return self.res[0] * self.res[1] / 1e6 if self.res else None
 
     # -------------------------------------------------------------------------------- legacy mapping (design 4.12)
 
@@ -1267,12 +1441,15 @@ class Check:
                 fov = LEGACY_FOV
             if fov <= 0:
                 fov = self.schema.game_fov
-            if eff.has("point") and eff.target is not None and not eff.target.v.get("point"):
+            info = CamInfo(i, raw, eff, render, post, shake, fov)
+            if eff.point and eff.target is not None and not eff.target.v.get("point") and eff.target.v.get("group") is None \
+                    and not eff.target.has("pos"):
                 t = overlay(self.schema, eff.target, None, "TargetRef")
                 t.v["point"] = eff.point
                 t.given.append("point")
                 eff.v["target"] = t
-            self.cams.append(CamInfo(i, raw, eff, render, post, shake, fov))
+                self.merged_points.append(info)
+            self.cams.append(info)
 
     def cam(self, name: str) -> CamInfo | None:
         for c in self.cams:
@@ -1337,10 +1514,10 @@ class Check:
         blocks = [("compose.grade.default", grade.get("default"))]
         cams = grade.get("cams") if isinstance(grade.get("cams"), dict) else {}
         blocks += [(f"compose.grade.cams.{k}", v) for k, v in cams.items()]
-        for li, lay in enumerate(comp.get("layouts") or []):
+        for li, lay in enumerate(comp.get("layouts") if isinstance(comp.get("layouts"), list) else []):
             if not isinstance(lay, dict):
                 continue
-            for ri, row in enumerate(lay.get("rows") or []):
+            for ri, row in enumerate(lay.get("rows") if isinstance(lay.get("rows"), list) else []):
                 for ci, cell in enumerate(row if isinstance(row, list) else [row]):
                     if isinstance(cell, dict):
                         blocks.append((f"compose.layouts[{li}].rows[{ri}][{ci}].grade", cell.get("grade")))
@@ -1353,13 +1530,21 @@ class Check:
 
     def load_predictions(self) -> None:
         rehearsal: dict[str, float] = {}
+        self.take_screen(getattr(self.opts, "poses", None), "the --poses take")
         rpath = self.opts.rehearsal or (Path(self.spec.rehearsal) if self.spec.rehearsal else None)
         if rpath is not None:
-            cands = [rpath] if rpath.is_absolute() else [self.path.parent / rpath, REPO / rpath, REPO / "out" / rpath]
+            if self.opts.rehearsal or rpath.is_absolute():
+                cands = [rpath]
+            else:
+                cands = [self.path.parent / rpath, REPO / rpath, REPO / "out" / rpath]
             folder = next((c for c in cands if (c / "events.csv").exists()), None)
             if folder is None:
                 self.report.warn("rehearsal", f"no events.csv under '{rpath}' (predictions fall back to expect)")
             else:
+                if folder is not cands[0]:
+                    self.report.warn("rehearsal", f"found as {folder}, but the game resolves a relative rehearsal folder next to the spec only "
+                                                  f"({cands[0]}): there it has no rehearsal times")
+                self.take_screen(folder, "the rehearsal take")
                 with (folder / "events.csv").open(encoding="utf-8", newline="") as fh:
                     for row in csv.DictReader(fh):
                         if row.get("kind") == "event" and row.get("name") and row["name"] not in rehearsal:
@@ -1399,6 +1584,8 @@ class Check:
             self.report.warn("seed", "use -1 (no seeding) or a value >= 0")
         if not s.cameras:
             self.report.error("cameras", "no cameras")
+        elif not any(c.eff.enabled for c in self.cams):
+            self.report.error("cameras", "no enabled camera")
         o = self.output
         if o.format not in FORMATS:
             self.report.error("output.format", f"'{o.format}' is not one of {sorted(FORMATS)}")
@@ -1407,32 +1594,41 @@ class Check:
         if o.queue < 1:
             self.report.error("output.queue", "must be >= 1")
         if o.flushEvery < 1:
-            self.report.warn("output.flushEvery", "must be >= 1")
+            self.report.error("output.flushEvery", "must be >= 1")
         if o.format == "pipe":
             n = sum(1 for c in self.cams if c.eff.enabled)
             if n > NVENC_SESSIONS:
                 self.report.error("output.format", f"pipe mode needs one encoder per camera: {n} enabled cameras > {NVENC_SESSIONS} NVENC sessions")
-            if "hevc" not in o.pipeCodec and "265" not in o.pipeCodec:
-                self.report.error("output.pipeCodec", f"'{o.pipeCodec}' is not an H.265 encoder (H.265 only)")
+            if o.pipeCodec.strip().lower() not in PIPE_CODECS:
+                self.report.error("output.pipeCodec", f"'{o.pipeCodec}' is not one of {', '.join(sorted(PIPE_CODECS))} (H.265 only)")
+        if (o.format == "pipe" or o.has("ffmpeg")) and o.ffmpeg:
             if not Path(o.ffmpeg).exists() and not (Path(o.ffmpeg).name == o.ffmpeg and shutil.which(o.ffmpeg)):
-                self.report.warn("output.ffmpeg", f"'{o.ffmpeg}' not found on this machine (full path, or a program on PATH)")
+                self.report.warn("output.ffmpeg", f"'{o.ffmpeg}' not found on this machine (full path, or a program on PATH; the game also "
+                                                  "looks at editor.cfg ffmpeg.path, env INSIDEDEV_FFMPEG and <game>/_mod/ffmpeg)")
+        if o.v.get("stallSeconds", 0) < 0:
+            self.report.error("output.stallSeconds", "must be >= 0 (0 = wait for a writer without a limit)")
         if o.readback not in ("auto", "native", "readpixels"):
             self.report.error("output.readback", f"'{o.readback}' is not one of auto, native, readpixels")
-        elif o.readback == "native" and o.format != "pipe":
+        elif o.readback == "native" and o.format != "pipe" and not self.replay:
             self.report.warn("output.readback", "native readback is used only with output.format 'pipe'")
         se = s.session
         if se.realTime not in REAL_TIMES:
             self.report.error("session.realTime", f"'{se.realTime}' is not one of {sorted(REAL_TIMES)}")
         if se.res != (0.0, 0.0):
             w_, h_ = se.res
-            if w_ <= 0 or h_ <= 0 or w_ != int(w_) or h_ != int(h_):
-                self.report.error("session.res", "use whole positive [width, height] or [0, 0]")
+            if (w_ > 0) != (h_ > 0) or w_ < 0 or h_ < 0:
+                self.report.error("session.res", "[width, height] or [0, 0] expected")
             else:
-                self.res = (int(w_), int(h_))
+                if w_ != int(w_) or h_ != int(h_):
+                    self.report.warn("session.res", "use whole numbers for [width, height]")
+                if not getattr(self.opts, "res", None):
+                    self.res, self.res_source = (max(1, int(w_)), max(1, int(h_))), "session.res"
                 if int(w_) % 2 or int(h_) % 2:
                     self.report.warn("session.res", "odd sizes cannot be encoded as yuv420")
         if se.gcSteps < 0:
-            self.report.warn("session.gcSteps", "must be >= 0")
+            self.report.error("session.gcSteps", "must be >= 0")
+        if se.v.get("stopAfterErrors", 0) < 0:
+            self.report.error("session.stopAfterErrors", "must be >= 0 (0 = never stop a take for repeated errors)")
         if not se.lockInput:
             self.report.warn("session.lockInput", "keyboard and mouse can move the camera during the capture")
         st = s.stream
@@ -1491,15 +1687,15 @@ class Check:
                     level = "warn" if e.type == "time" else "error"
                     self.report.add(level, w, f"event type '{e.type}' needs '{k}'")
             if e.type == "fsm":
-                edge = e.edge if e.has("edge") else ("event" if e.fsmEvent and not e.state else "enter")
-                if edge == "event" and not e.fsmEvent:
-                    self.report.error(w, "fsm edge 'event' needs 'fsmEvent'")
-                if edge in ("enter", "exit") and not e.state:
-                    self.report.error(w, f"fsm edge '{edge}' needs 'state'")
-            if e.has("edge"):
-                ok_edges = {"enter", "exit", "event"} if e.type == "fsm" else {"enter", "exit"}
-                if e.edge not in ok_edges:
-                    self.report.error(self.w(w, "edge"), f"'{e.edge}' is not one of {sorted(ok_edges)} for type '{e.type}'")
+                if e.edge == "event" and not e.fsmEvent:
+                    self.report.error(self.w(w, "fsmEvent"), "fsm edge 'event' needs 'fsmEvent'")
+                if e.edge != "event" and not e.state:
+                    self.report.error(self.w(w, "state"), f"fsm edge '{e.edge}' needs 'state'"
+                                      + (" (an fsmEvent is only watched with edge 'event')" if e.fsmEvent else ""))
+            if e.edge not in ("enter", "exit", "event"):
+                self.report.error(self.w(w, "edge"), f"'{e.edge}' is not one of ['enter', 'event', 'exit']")
+            elif e.edge == "event" and e.type != "fsm" and e.has("edge"):
+                self.report.warn(self.w(w, "edge"), f"edge 'event' is an fsm edge; type '{e.type}' has enter / exit")
             if e.type == "cond":
                 if e.prop and e.prop not in COND_PROPS:
                     self.report.error(self.w(w, "prop"), f"'{e.prop}' is not one of {sorted(COND_PROPS)}")
@@ -1509,8 +1705,11 @@ class Check:
                 self.report.error(self.w(w, "op"), f"'{e.op}' is not one of {sorted(OPS)}")
             if e.type == "field" and not e.op and not e.match:
                 self.report.error(w, "field watch needs 'op' + 'value' or 'match'")
-            if e.type == "box" and e.has("size") and min(abs(x) for x in e.size) <= 0:
-                self.report.error(self.w(w, "size"), "box size must be positive on every axis")
+            if e.type == "box" and e.has("size"):
+                if all(x == 0 for x in e.size):
+                    self.report.error(self.w(w, "size"), "box needs a size")
+                elif min(abs(x) for x in e.size) <= 0:
+                    self.report.warn(self.w(w, "size"), "box size is zero on an axis: nothing can be inside it")
             if e.type == "impact" and e.min <= 0:
                 self.report.warn(self.w(w, "min"), "impact min 0 fires on the smallest contact")
             if e.count < 1:
@@ -1571,7 +1770,10 @@ class Check:
 
     def lint_timing(self) -> None:
         s = self.spec
-        if self.fps <= 0:
+        if not math.isfinite(self.fps) or self.fps > 1e6:
+            self.report.error("timing.fps", "not a frame rate")
+            self.fps = 30.0
+        elif self.fps <= 0:
             self.report.error("timing.fps", "must be > 0")
             self.fps = 30.0
         elif abs(self.fps - round(self.fps)) > 1e-6:
@@ -1591,7 +1793,7 @@ class Check:
                     self.report.warn(self.w(g.where, "shutter"), "ignored: with an explicit rate every sub-step is captured")
         elif s.rates:
             for i, r in enumerate(s.rates):
-                segs.append(Segment(i, "", r.v["from"], None, 1.0, int(r.group), 360.0, float(r.rate), True, r.where or f"rates[{i}]"))
+                segs.append(Segment(i, "", r.v["from"], None, 1.0, max(1, int(r.group)), 360.0, float(r.rate), True, r.where or f"rates[{i}]"))
         else:
             segs.append(Segment(0, "", TimeVal(None, 0.0), None, 1.0, 1, 180.0, 0.0, False, "timing"))
         for g in segs:
@@ -1758,12 +1960,11 @@ class Check:
                 self.report.error(where, f"'{c}' is a runner primitive for setup only")
                 return c
             if c == "wait":
-                if len(a) != 2 or cs_double(a[1]) is None or float(a[1]) < 0:
+                if len(a) < 2 or cs_double(a[1]) is None or float(a[1]) < 0:
                     self.report.error(where, "usage: wait <real seconds>")
             else:
                 sub = a[1].lower() if len(a) > 1 else ""
-                ok = (sub in ("loaded", "streaming") and len(a) == 2) or (sub in ("savepoint", "event") and len(a) == 3)
-                if not ok:
+                if sub not in ("loaded", "streaming", "savepoint", "event") or (sub == "event" and len(a) < 3):
                     self.report.error(where, "usage: waitfor loaded | streaming | savepoint <name> | event <name>")
             return c
         if c == "mcam":
@@ -1806,15 +2007,18 @@ class Check:
                 self.report.error(self.w(w, "name"), f"'{c.name}' is also a folder name: use [A-Za-z0-9_-]")
             elif c.name in seen:
                 self.report.error(self.w(w, "name"), f"duplicate camera name '{c.name}'")
+            elif c.name.split(".")[0].lower() in RESERVED_NAMES:
+                self.report.error(self.w(w, "name"), f"'{c.name}' is a Windows device name: no folder or file can have it")
             elif c.name == "cut":
                 self.report.warn(self.w(w, "name"), "'cut' is the compositor's name for the edit")
             seen.setdefault(c.name, c.index)
             if c.mode not in self.schema.modes:
                 self.report.error(self.w(w, "mode"), f"unknown mode '{c.mode}' (one of {', '.join(self.schema.modes)})")
                 continue
-            allowed = COMMON_CAM_KEYS | MODE_KEYS.get(c.mode, set())
+            allowed = set(COMMON_CAM_KEYS) | set(MODE_KEYS.get(c.mode, ()))
+            dflt = self.spec.defaults
             for k in c.raw.given:
-                if k not in allowed:
+                if k not in allowed and not (dflt is not None and dflt.has(k)):
                     self.report.warn(self.w(w, k), f"ignored by mode '{c.mode}'")
             self.lint_camera_common(c, w)
             getattr(self, "lint_events_mode" if c.mode == "events" else f"lint_{c.mode}", lambda *_: None)(c, w)
@@ -1822,7 +2026,9 @@ class Check:
 
     def lint_camera_common(self, c: CamInfo, w: str) -> None:
         e = c.eff
-        if e.fov > 60:
+        if e.fov >= MAX_FOV:
+            self.report.error(self.w(w, "fov"), f"{fnum(e.fov)} deg must be below {fnum(MAX_FOV)}")
+        elif e.fov > 60:
             self.report.warn(self.w(w, "fov"), f"{fnum(e.fov)} deg is wide (the game is {fnum(self.schema.game_fov, 2)}): edges stretch")
         elif 0 < e.fov < 15:
             self.report.warn(self.w(w, "fov"), f"{fnum(e.fov)} deg is a long telephoto: TAA jitter and fog read differently")
@@ -1862,14 +2068,19 @@ class Check:
                 err = hide_box_error(h)
                 if err:
                     self.report.error(f"{w}.{key}[{i}]", err if key == "hide" else err.replace("box hide", "box backfaces entry"))
-        if e.lag not in LAGS:
-            self.report.error(self.w(w, "lag"), f"'{e.lag}' is not one of {sorted(LAGS)}")
-        if e.interp not in INTERPS:
+        lag = e.lag if c.mode != "gamelike" or e.has("lag") else "game"
+        if c.mode in ("follow", "gamelike") and lag not in LAGS:
+            self.report.error(self.w(w, "lag"), f"'{lag}' is not one of {sorted(LAGS)}")
+        if c.mode in ("keys", "rail") and e.interp not in INTERPS:
             self.report.error(self.w(w, "interp"), f"'{e.interp}' is not one of {sorted(INTERPS)}")
         if c.mode in EASES and e.ease not in EASES[c.mode]:
             self.report.error(self.w(w, "ease"), f"'{e.ease}' is not one of {sorted(EASES[c.mode])} for mode '{c.mode}'")
-        if e.smooth < 0 or e.lookSmooth < 0:
+        if c.mode == "follow" and (e.smooth < 0 or e.lookSmooth < 0):
             self.report.error(w, "smooth / lookSmooth must be >= 0")
+        elif c.mode == "events" and e.smooth < 0:
+            self.report.error(self.w(w, "smooth"), "must be >= 0")
+        elif c.mode not in ("follow", "events", "overview") and (e.smooth < 0 or e.lookSmooth < 0):
+            self.report.warn(w, "smooth / lookSmooth below 0")
         k = e.clamp
         if k is not None:
             if not k.has("left") and not k.has("right"):
@@ -1902,8 +2113,8 @@ class Check:
         back = e.playerSide and fz < -0.05 and pitch < 60
         if back:
             self.report.add("error" if strict else "warn", where, f"{what} looks back toward the screen (forward z {fnum(fz, 2)}); sets have no back side")
-        elif abs(yaw) > 40:
-            self.report.warn(where, f"{what} yaw {fnum(yaw, 1)}: more than 40 deg off the set axis shows set edges")
+        elif abs(wrap_angle(yaw)) > 40:
+            self.report.warn(where, f"{what} yaw {fnum(wrap_angle(yaw), 1)}: more than 40 deg off the set axis shows set edges")
         if pitch < -20 or pitch > 35:
             self.report.warn(where, f"{what} pitch {fnum(pitch, 1)} is outside -20..35 (positive pitch looks down)")
         if not e.playerSide:
@@ -1925,20 +2136,17 @@ class Check:
     def lint_static(self, c: CamInfo, w: str) -> None:
         e = c.eff
         if not e.has("pos"):
-            self.report.error(w, "static camera needs 'pos'")
-            return
-        look = e.look
-        if look is None or look.v.get("of") == "none":
+            self.report.warn(w, "static camera without 'pos': it sits at the world origin")
+        if not self.has_look(e):
             self.euler_rules(w, e.yaw, e.pitch, e.pos[2], c, "static", True)
             return
         if e.has("yaw") or e.has("pitch"):
             self.report.note(w, "yaw / pitch are ignored while 'look' is set")
-        lp = self.fixed_point(look)
+        lp = self.fixed_look(e.target if e.look.v.get("of") == "self" else e.look, e.lookOffset)
         if lp is None:
             if e.pos[2] > e.zMax and e.playerSide:
                 self.report.warn(w, f"static z {fnum(e.pos[2], 2)} is behind the player-side line; allowed only when looking down > 45 deg")
             return
-        lp = tuple(a + b for a, b in zip(lp, e.lookOffset))
         v = tuple(a - b for a, b in zip(lp, e.pos))
         dist = math.sqrt(sum(x * x for x in v))
         if dist < 1.5 and not e.has("near"):
@@ -1982,16 +2190,22 @@ class Check:
         for i, k in enumerate(e.keys):
             kw = f"{w}.keys[{i}]"
             if not k.has("pos"):
-                self.report.error(kw, "key needs 'pos'")
-            if prev is not None and k.t <= prev:
-                self.report.error(self.w(kw, "t"), f"keys must be sorted by strictly increasing t ({fnum(k.t)} after {fnum(prev)})")
+                self.report.warn(kw, "key without 'pos': it sits at the world origin")
+            if prev is not None and k.t < prev:
+                self.report.error(self.w(kw, "t"), f"keys must be sorted by t ({fnum(k.t)} after {fnum(prev)})")
+            elif prev is not None and k.t == prev:
+                self.report.warn(self.w(kw, "t"), f"two keys at t {fnum(k.t)}")
             prev = k.t
             if k.t < 0:
                 self.report.warn(self.w(kw, "t"), "negative key time on the camera clock")
-            if k.fov > 60:
+            if k.fov >= MAX_FOV:
+                self.report.error(self.w(kw, "fov"), f"{fnum(k.fov)} deg must be below {fnum(MAX_FOV)}")
+            elif k.fov > 60:
                 self.report.warn(self.w(kw, "fov"), f"{fnum(k.fov)} deg is wide")
-            lp = self.fixed_point(k.look) if k.look is not None else None
-            if k.look is not None and k.look.v.get("of") not in (None, "none") and lp is None:
+            key_look = k.look.v.get("of") != "none" if k.look is not None else self.has_look(e)
+            own = (e.target if k.look.v.get("of") == "self" else k.look) if k.look is not None else None
+            lp = self.fixed_point(own) if own is not None else None
+            if key_look and lp is None:
                 if k.pos[2] > e.zMax and e.playerSide:
                     self.report.warn(kw, f"key z {fnum(k.pos[2], 2)} is behind the player-side line")
                 continue
@@ -2021,7 +2235,7 @@ class Check:
         for i, p in enumerate(e.path):
             if p[2] > e.zMax and e.playerSide:
                 self.report.warn(f"{w}.path[{i}]", f"rail point z {fnum(p[2], 2)} is behind the player-side line")
-        if e.look is None or e.look.v.get("of") == "none":
+        if not self.has_look(e):
             self.euler_rules(w, e.yaw, e.pitch, None, c, "rail", True)
 
     def lint_orbit(self, c: CamInfo, w: str) -> None:
@@ -2046,7 +2260,7 @@ class Check:
 
     def lint_gamerel(self, c: CamInfo, w: str) -> None:
         e = c.eff
-        if abs(e.orbitYaw) > 40:
+        if abs(e.orbitYaw) > ORBIT_YAW_WARN:
             self.report.warn(self.w(w, "orbitYaw"), f"{fnum(e.orbitYaw)} deg off the game axis shows set edges")
         if e.orbitPitch < -20 or e.orbitPitch > 45:
             self.report.warn(self.w(w, "orbitPitch"), f"{fnum(e.orbitPitch)} deg is outside -20..45")
@@ -2069,17 +2283,30 @@ class Check:
             return
         u, v = e.screen
         if not (0 <= u <= 1 and 0 <= v <= 1):
-            self.report.error(self.w(w, "screen"), "screen point must be inside [0, 1] x [0, 1]")
-        if not 0 < e.size <= 1:
-            self.report.error(self.w(w, "size"), "subject size is a fraction of the frame height in (0, 1]")
+            self.report.warn(self.w(w, "screen"), "screen point outside [0, 1] x [0, 1]")
+        if e.size <= 0:
+            self.report.error(self.w(w, "size"), "subject size must be > 0 (a fraction of the frame height)")
+        elif e.size > 1:
+            self.report.warn(self.w(w, "size"), "size > 1: the subject is taller than the frame")
         if e.crop is not None:
-            if len(e.crop) != 4:
-                self.report.error(self.w(w, "crop"), "crop is [x, y, w, h] in capture pixels")
+            if len(e.crop) != 4 or e.crop[2] <= 0 or e.crop[3] <= 0:
+                self.report.error(self.w(w, "crop"), "crop is [x, y, w, h] in capture pixels with w, h > 0")
             else:
-                x, y, cw, ch = e.crop
-                if cw <= 0 or ch <= 0 or x < 0 or y < 0 or x + cw > self.res[0] or y + ch > self.res[1]:
-                    self.report.error(self.w(w, "crop"), f"crop [{', '.join(fnum(q) for q in e.crop)}] is outside the {self.res[0]}x{self.res[1]} capture")
+                self.crop_fits(self.w(w, "crop"), e.crop)
         self.euler_rules(w, e.yaw, e.pitch, None, c, "frame", True)
+
+    def crop_fits(self, where: str, crop: list) -> None:
+        x, y, cw, ch = crop
+        text = f"crop [{', '.join(fnum(q) for q in crop)}]"
+        if x < 0 or y < 0:
+            self.report.warn(where, f"{text} starts outside the frame")
+        elif self.res is None:
+            if not getattr(self, "_crop_noted", False):
+                self._crop_noted = True
+                self.report.note(where, "the capture size is not known offline, so crops are not checked against the frame (give --res WxH, "
+                                        "session.res, or a take with --poses)")
+        elif x + cw > self.res[0] or y + ch > self.res[1]:
+            self.report.warn(where, f"{text} is outside the {self.res[0]}x{self.res[1]} capture ({self.res_source})")
 
     def lint_director(self, c: CamInfo, w: str) -> None:
         e = c.eff
@@ -2321,7 +2548,7 @@ class Check:
 
     def frame_aspect(self, e: Node) -> float:
         k = e.clamp
-        return k.aspect if k is not None and k.aspect > 0.1 else self.res[0] / max(1, self.res[1])
+        return k.aspect if k is not None and k.aspect > 0.1 else self.aspect()
 
     def lint_overview(self, c: CamInfo, w: str) -> None:
         e = c.eff
@@ -2389,11 +2616,18 @@ class Check:
             for o in offs:
                 ang = look_angles(tuple(lo - oo for lo, oo in zip(bt.lookOffset if bt.has("lookOffset") else e.lookOffset, o)))
                 if ang and e.playerSide and euler_forward(ang[0], ang[1])[2] < -0.05 and ang[1] < 60:
-                    self.report.error(self.w(bw, "offsets"), f"offset ({', '.join(fnum(q) for q in o)}) looks back toward the screen; "
-                                                             "sets have no back side")
+                    self.report.warn(self.w(bw, "offsets"), f"offset ({', '.join(fnum(q) for q in o)}) looks back toward the screen; "
+                                                            "sets have no back side")
                     break
+            point = bt.v.get("point") or ""
+            if point and bt.target is None:
+                self.report.warn(self.w(bw, "point"), "ignored: a beat's point belongs to the beat's own target (the camera's target takes the camera's point)")
+            elif point and bt.target.v.get("group") is None and not bt.target.has("pos"):
+                self.lint_point(bt.target.v.get("of") or "", point, self.w(bw, "point"))
             fov = bt.fov if bt.fov > 0 else e.fov
-            if fov > 60:
+            if bt.fov >= MAX_FOV:
+                self.report.error(self.w(bw, "fov"), f"{fnum(bt.fov)} deg must be below {fnum(MAX_FOV)}")
+            elif fov > 60:
                 self.report.warn(self.w(bw, "fov"), f"{fnum(fov)} deg is wide")
 
     def lint_director_graph(self) -> None:
@@ -2420,15 +2654,17 @@ class Check:
             if isinstance(node, Node) and node.cls == "TargetRef":
                 self.lint_target(node, node.where or where)
         walk(self.schema, self.spec, "", visit)
+        for c in self.merged_points:
+            self.lint_point(c.eff.target.v.get("of") or "", c.eff.point, self.w(c.where or f"cameras[{c.index}]", "point"))
 
     def lint_target(self, t: Node, where: str) -> None:
         g = t.v.get("group")
         if g is not None:
             n = sum(1 for k in ("of", "find", "list") if (g.v.get(k) if k != "of" else g.of))
-            if n == 0:
-                self.report.error(self.w(where, "group"), "group needs 'of', 'find' or 'list'")
-            elif n > 1:
-                self.report.warn(self.w(where, "group"), "use one of 'of', 'find', 'list'")
+            if n != 1:
+                self.report.error(self.w(where, "group"), "group needs exactly one of 'of', 'find', 'list'")
+            if (g.point or "").strip() and g.point.strip() not in GROUP_POINTS:
+                self.report.error(self.w(where, "group.point"), f"unknown group member point '{g.point}' ({', '.join(sorted(GROUP_POINTS))})")
             if g.mode not in GROUP_MODES:
                 self.report.error(self.w(where, "group.mode"), f"'{g.mode}' is not one of {sorted(GROUP_MODES)}")
             elif g.mode == "bounds":
@@ -2463,19 +2699,27 @@ class Check:
             if point:
                 self.report.warn(self.w(where, "point"), f"'{of}' has no points")
             return
-        if not point or point.startswith("bone:"):
-            if point.startswith("bone:") and len(point) <= 5:
-                self.report.error(self.w(where, "point"), "bone:<name> needs a bone name")
-            return
-        allowed = BOY_POINTS if of == "boy" else HUDDLE_POINTS if of == "huddle" else (BOY_POINTS | HUDDLE_POINTS) if of == "main" else OBJECT_POINTS
-        if point not in allowed:
-            self.report.warn(self.w(where, "point"), f"'{point}' is not a known point of '{base}' ({', '.join(sorted(allowed))}, bone:<name>)")
-        elif point in EDGE_POINTS:
-            self.report.warn(self.w(where, "point"), EDGE_POINT_WARN.format(f"point '{point}'"))
+        self.lint_point(of, point, self.w(where, "point"))
         if "::" in of and not re.fullmatch(r"[^:]+::\w+(\[\d+\])?", of):
             self.report.error(where, "component selector is '<path>::<Component>'")
         if of.startswith("/") or of.endswith("/"):
             self.report.error(where, "paths have no leading or trailing '/'")
+
+    def lint_point(self, of: str, point: str, where: str) -> None:
+        point = (point or "").strip()
+        of = (of or "").strip()
+        if not point or of in POINTLESS_BASES:
+            return
+        if point.startswith("bone:"):
+            if len(point) <= 5:
+                self.report.error(where, "bone:<name> needs a bone name")
+            return
+        kind = "boy" if of == "boy" else "huddle" if of == "huddle" else "character" if of == "main" else "object"
+        allowed = BOY_POINTS if of == "boy" else HUDDLE_POINTS if of == "huddle" else (BOY_POINTS | HUDDLE_POINTS) if of == "main" else OBJECT_POINTS
+        if point not in allowed:
+            self.report.error(where, f"unknown {kind} point '{point}' ({', '.join(sorted(allowed))}, bone:<name>)")
+        elif point in EDGE_POINTS:
+            self.report.warn(where, EDGE_POINT_WARN.format(f"point '{point}'"))
 
     # -------------------------------------------------------------------------------- render budgets
 
@@ -2874,7 +3118,7 @@ class Check:
             if not is_num(cq) or not 0 <= cq <= 51:
                 self.report.error("compose.encode.cq", "0..51")
             if codec == "x265":
-                self.report.note("compose.encode.codec", "x265 final encodes run at 1.4-5 fps at 2560x1440 (R12: 65 min for one take); nvenc is the default")
+                self.report.note("compose.encode.codec", "x265 final encodes run at 1.4-5 fps at 1440p (R12: 65 min for one take); nvenc is the default")
 
     def compose_cam_ok(self, cam: Any, where: str, names: set[str], disabled: set[str]) -> bool:
         if not isinstance(cam, str) or not cam:
@@ -2901,7 +3145,9 @@ class Check:
                         self.report.warn(f"{where}.{key}.{k}", f"unknown camera '{k}'")
             elif isinstance(v, list):
                 for i, k in enumerate(v):
-                    if k not in names and k != "cut":
+                    if not isinstance(k, str):
+                        self.report.error(f"{where}.{key}[{i}]", "camera name expected")
+                    elif k not in names and k != "cut":
                         self.report.warn(f"{where}.{key}[{i}]", f"unknown camera '{k}'")
         auto = sec.get("auto")
         if isinstance(auto, dict):
@@ -2911,8 +3157,15 @@ class Check:
         if not isinstance(lay, dict):
             self.report.error(where, "layout object expected")
             return
-        W, g = lay.get("width", CAPTURE_W), lay.get("gap", 4)
-        if not is_num(W) or W <= 0 or int(W) % 2:
+        W, g = lay.get("width"), lay.get("gap", 4)
+        if W is None:
+            if self.res is None:
+                self.report.note(f"{where}.width", "no width: the compositor takes the widest source of the layout's cells; the capture size is "
+                                                   "not known offline, so the layout size is not worked out (give --res WxH)")
+                W = 0
+            else:
+                W = even(self.res[0])
+        elif not is_num(W) or W <= 0 or int(W) % 2:
             self.report.error(f"{where}.width", "even positive width expected")
             return
         if not is_num(g) or g < 0:
@@ -2920,9 +3173,10 @@ class Check:
             return
         W, g = int(W), int(g)
         preset = lay.get("preset")
-        if preset is not None and preset not in PRESETS:
+        if preset is not None and (not isinstance(preset, str) or preset not in PRESETS):
             self.report.error(f"{where}.preset", f"unknown preset '{preset}' ({', '.join(PRESETS)})")
             return
+        ps = W / PRESET_WIDTH
         rows = lay.get("rows")
         if not rows and preset and isinstance(lay.get("cams"), list) and lay["cams"]:
             rows = [[{"cam": lay["cams"][0]}], [{"cam": c} for c in lay["cams"][1:]]]
@@ -2944,9 +3198,7 @@ class Check:
                     if not (isinstance(crop, list) and len(crop) == 4 and all(is_num(x) for x in crop)) or crop[2] <= 0 or crop[3] <= 0:
                         self.report.error(f"{rw}[{ci}].crop", "crop is [x, y, w, h] in source pixels")
                         return
-                    x, cy, cw, ch = crop
-                    if x < 0 or cy < 0 or x + cw > self.res[0] or cy + ch > self.res[1]:
-                        self.report.error(f"{rw}[{ci}].crop", f"crop {crop} is outside the {self.res[0]}x{self.res[1]} capture")
+                    self.crop_fits(f"{rw}[{ci}].crop", crop)
                 pan = cell.get("pan")
                 if pan is not None and not (isinstance(pan, list) and all(isinstance(k, list) and len(k) == 3 and all(is_num(q) for q in k) for k in pan)):
                     self.report.error(f"{rw}[{ci}].pan", "pan is [[game_t, x, y], ...]")
@@ -2954,9 +3206,11 @@ class Check:
                     self.report.error(f"{rw}[{ci}].height", "height must be > 0")
                     return
             first = row[0]
+            if W <= 0:
+                continue
             if len(row) == 1 and (first.get("crop") is not None or (preset and ri == 0)):
-                crop = first.get("crop") or [0, 0, self.res[0], self.res[1]]
-                h = PRESETS[preset][0] if preset and ri == 0 else even(crop[3] * W / crop[2])
+                crop = first.get("crop") or [0, 0, self.aspect(), 1.0]
+                h = even(PRESETS[preset][0] * ps) if preset and ri == 0 else even(crop[3] * W / crop[2])
                 if first.get("height"):
                     h = even(float(first["height"]))
                 desc.append(f"{first.get('cam')} band {W}x{h}" + (f" from crop {crop}" if first.get("crop") is not None else ""))
@@ -2965,7 +3219,7 @@ class Check:
                 inner = W - (n - 1) * g
                 widths = [inner // n + (1 if i < inner % n else 0) for i in range(n)]
                 if preset and ri == 1 and n == PRESETS[preset][1]:
-                    h = PRESETS[preset][2]
+                    h = even(PRESETS[preset][2] * ps)
                 else:
                     given = next((c.get("height") for c in row if c.get("height")), None) or heights_map.get(str(ri))
                     h = even(float(given)) if is_num(given) else 2 * math.ceil(max(widths) * 9 / 32)
@@ -2974,6 +3228,8 @@ class Check:
                     return
                 desc.append(f"{n} cells {'/'.join(map(str, widths))} x {h}")
             y += h + (g if ri < len(rows) - 1 else 0)
+        if W <= 0:
+            return
         total = y if y % 2 == 0 else y + 1
         name = lay.get("name", f"layout{len(self.result.tables['layouts'])}")
         self.result.tables["layouts"].append({"name": name, "size": [W, total], "rows": desc})
@@ -3035,8 +3291,9 @@ class Check:
             ttype, dur = "cut", 0.0
             if isinstance(tr, dict):
                 ttype = tr.get("type", "cut")
-                if ttype not in TRANSITIONS:
+                if not isinstance(ttype, str) or ttype not in TRANSITIONS:
                     self.report.error(f"{sw}.in.type", f"'{ttype}' is not one of {sorted(TRANSITIONS)}")
+                    ttype = "cut"
                 dur = tr.get("dur", 0.0 if ttype == "cut" else 1.0)
                 if not is_num(dur) or dur < 0:
                     self.report.error(f"{sw}.in.dur", "seconds >= 0 expected")
@@ -3154,31 +3411,32 @@ class Check:
         tab["cameras"] = cam_rows
         frames = steps + pre_steps + renders
         lo, hi = self.ms_range("25:40")
-        px = self.res[0] * self.res[1]
         fmt = self.output.format
-        per_image = JPEG_MB_1440P * px / (CAPTURE_W * CAPTURE_H) if fmt == "jpg" else px * 4 / 1e6 if fmt == "raw" else 0.0
+        per_image = self.per_image_mb()
+        disk_gb = images * per_image / 1000 if per_image is not None else None
         out_s = sum(r["out_s"] for r in seg_rows)
         tab["estimate"] = {"game_s": self.end_t, "output_s": out_s, "frames_out": out_s * self.fps, "steps": steps,
                            "preroll_steps": pre_steps, "captured_steps": captured, "renders": renders, "engine_frames": frames,
                            "real_s": [frames * lo / 1000, frames * hi / 1000], "ms": [lo, hi], "images": images,
-                           "disk_gb": images * per_image / 1000, "format": fmt, "res": list(self.res)}
+                           "disk_gb": disk_gb, "format": fmt, "res": list(self.res) if self.res else None, "res_source": self.res_source}
         tab["events"] = [{"name": e.name, "type": e.type, "predicted": self.predicted.get(e.name, (None, ""))[0],
                           "source": self.predicted.get(e.name, (None, ""))[1], "refs": len(self.refs.get(e.name, []))}
                          for e in self.spec.events]
-        if images * per_image / 1000 > 50:
-            self.report.warn("output", f"about {fnum(images * per_image / 1000, 1)} GB of frames: check the free disk space")
+        if disk_gb is not None and disk_gb > 50:
+            self.report.warn("output", f"about {fnum(disk_gb, 1)} GB of frames: check the free disk space")
         if frames * hi / 1000 > 4 * 3600:
             self.report.warn("render", f"up to {fnum(frames * hi / 3600000, 1)} h of capture: lower samples or cameras for a draft")
 
     def ms_range(self, default: str) -> tuple[float, float]:
-        ms = self.opts.ms or default
-        lo, hi = (float(x) for x in ms.split(":")) if ":" in ms else (float(ms),) * 2
-        return lo, hi
+        ms = getattr(self.opts, "ms", None)
+        return tuple(ms) if isinstance(ms, (tuple, list)) else parse_ms(ms or default)
 
-    def per_image_mb(self) -> float:
-        px = self.res[0] * self.res[1]
+    def per_image_mb(self) -> float | None:
+        mp = self.megapixels()
+        if mp is None:
+            return None
         fmt = self.output.format
-        return JPEG_MB_1440P * px / (CAPTURE_W * CAPTURE_H) if fmt == "jpg" else px * 4 / 1e6 if fmt == "raw" else 0.0
+        return JPEG_MB_PER_MEGAPIXEL * mp if fmt == "jpg" else 4 * mp if fmt == "raw" else PIPE_MB_PER_MEGAPIXEL * mp
 
     def estimate_replay(self) -> None:
         tab = self.result.tables
@@ -3223,16 +3481,18 @@ class Check:
         record_s = self.end_t + float(self.spec.preroll)
         out_s = sum(r["out_s"] for r in seg_rows)
         per_image = self.per_image_mb()
+        disk_gb = images * per_image / 1000 if per_image is not None else None
         tab["replay"] = self.replay_line()
         tab["estimate"] = {"mode": "replay", "game_s": self.end_t, "record_s": record_s, "record_res": list(rec.res), "output_s": out_s,
                            "frames_out": frames, "captured_steps": captured, "renders": renders, "look": play.look, "warmup": warm,
                            "real_s": [record_s + renders * lo / 1000, record_s + renders * hi / 1000], "ms": [lo, hi], "images": images,
-                           "disk_gb": images * per_image / 1000, "format": self.output.format, "res": list(self.res)}
+                           "disk_gb": disk_gb, "format": self.output.format, "res": list(self.res) if self.res else None,
+                           "res_source": self.res_source}
         tab["events"] = [{"name": e.name, "type": e.type, "predicted": self.predicted.get(e.name, (None, ""))[0],
                           "source": self.predicted.get(e.name, (None, ""))[1], "refs": len(self.refs.get(e.name, []))}
                          for e in self.spec.events]
-        if images * per_image / 1000 > 50:
-            self.report.warn("output", f"about {fnum(images * per_image / 1000, 1)} GB of frames: check the free disk space")
+        if disk_gb is not None and disk_gb > 50:
+            self.report.warn("output", f"about {fnum(disk_gb, 1)} GB of frames: check the free disk space")
         if renders * hi / 1000 > 4 * 3600:
             self.report.warn("render", f"up to {fnum(renders * hi / 3600000, 1)} h of replay passes: fewer cameras (replay.play.cams) for a draft")
 
@@ -3336,6 +3596,13 @@ def fdur(seconds: float) -> str:
     return f"{seconds / 3600:.1f} h"
 
 
+def disk_line(e: dict) -> str:
+    what = f"{e['images']:.0f} frames into per-camera ffmpeg pipes" if e["format"] == "pipe" else f"{e['images']:.0f} images"
+    if not e.get("res") or e.get("disk_gb") is None:
+        return f"  disk: {what}; size not estimated, the capture size is not known offline (give --res WxH)"
+    return f"  disk: {what} ~ {e['disk_gb']:.1f} GB ({e['format']} at {e['res'][0]}x{e['res'][1]} from {e.get('res_source') or 'the spec'})"
+
+
 def print_events(t: dict) -> None:
     if t.get("events"):
         print("  events:")
@@ -3366,10 +3633,7 @@ def print_replay(t: dict) -> None:
         print(f"  record pass: {e['record_s']:.1f} s real time incl. preroll at {fnum(e['record_res'][0])}x{fnum(e['record_res'][1])} (plus setup)")
         print(f"  replay passes: {e['renders']:.0f} renders (look {e['look']}, warmup {e['warmup']} per pass and director run) -> with the record "
               f"pass {fdur(e['real_s'][0])} to {fdur(e['real_s'][1])} at {fnum(e['ms'][0])}-{fnum(e['ms'][1])} ms per render")
-        if e["format"] == "pipe":
-            print(f"  disk: {e['images']:.0f} frames into per-camera ffmpeg pipes")
-        else:
-            print(f"  disk: {e['images']:.0f} images ~ {e['disk_gb']:.1f} GB ({e['format']} at {e['res'][0]}x{e['res'][1]}) plus the recording")
+        print(disk_line(e) + (" plus the recording" if e["format"] != "pipe" else ""))
 
 
 def print_result(r: Result, quiet: bool) -> None:
@@ -3406,10 +3670,7 @@ def print_result(r: Result, quiet: bool) -> None:
               f"steps {e['steps']:.0f} (captured {e['captured_steps']:.0f}, preroll {e['preroll_steps']:.0f})")
         print(f"  cost: {e['renders']:.0f} visit renders + {e['steps'] + e['preroll_steps']:.0f} step frames = {e['engine_frames']:.0f} frames "
               f"-> {fdur(e['real_s'][0])} to {fdur(e['real_s'][1])} at {fnum(e['ms'][0])}-{fnum(e['ms'][1])} ms per frame")
-        if e["format"] == "pipe":
-            print(f"  disk: {e['images']:.0f} frames into per-camera ffmpeg pipes")
-        else:
-            print(f"  disk: {e['images']:.0f} images ~ {e['disk_gb']:.1f} GB ({e['format']} at {e['res'][0]}x{e['res'][1]})")
+        print(disk_line(e))
     for lay in t.get("layouts", []):
         print(f"  layout '{lay['name']}': {lay['size'][0]}x{lay['size'][1]}  ({'; '.join(lay['rows'])})")
     for ed in t.get("edits", []):
@@ -3419,31 +3680,67 @@ def print_result(r: Result, quiet: bool) -> None:
                   f"hold {row['hold']:>5.2f}  in {row['type']}{' ' + fnum(row['dur']) if row['type'] != 'cut' else ''}")
 
 
+def json_safe(o: Any) -> Any:
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {str(k): json_safe(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [json_safe(v) for v in o]
+    if isinstance(o, TimeVal):
+        return o.text()
+    if o is None or isinstance(o, (str, int, bool)):
+        return o
+    return str(o)
+
+
 def result_json(r: Result) -> dict:
     rep = r.report
-    return {"spec": str(r.path), "ok": rep.ok and not r.bad_input, "bad_input": r.bad_input, "replay": r.replay,
-            "errors": [m.line() for m in rep.of("error")], "warnings": [m.line() for m in rep.of("warn")],
-            "notes": [m.line() for m in rep.of("note")],
-            "messages": [{"level": m.level, "where": m.where, "text": m.text, "stage": m.stage} for m in rep.msgs],
-            "tables": r.tables}
+    return json_safe({"spec": str(r.path), "ok": rep.ok and not r.bad_input, "bad_input": r.bad_input, "replay": r.replay,
+                      "errors": [m.line() for m in rep.of("error")], "warnings": [m.line() for m in rep.of("warn")],
+                      "notes": [m.line() for m in rep.of("note")],
+                      "messages": [{"level": m.level, "where": m.where, "text": m.text, "stage": m.stage} for m in rep.msgs],
+                      "tables": r.tables})
+
+
+def compare_with_game(r: Result, path: Path) -> list[str]:
+    """Differences between this report and the JSON of `mcam check <spec> json` of the game, by place and level."""
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as e:
+        return [f"compare: cannot read {path}: {e}"]
+    if not isinstance(doc, dict):
+        return [f"compare: {path} is not the JSON of mcam check"]
+    out: list[str] = []
+    for level, key, name in (("error", "errors", "error"), ("warn", "warnings", "warning")):
+        game = {str(x).split(": ", 1)[0] for x in doc.get(key) or [] if isinstance(x, str)}
+        mine = {m.where for m in r.report.of(level) if m.stage not in ("compose", "estimate", "index", "schema")}
+        out += [f"compare: {name} only offline: {w}" for w in sorted(mine - game)]
+        out += [f"compare: {name} only in the game: {w}" for w in sorted(game - mine)]
+    if bool(doc.get("ok")) != r.report.ok:
+        out.append(f"compare: the game says {'OK' if doc.get('ok') else 'FAILED'}, the offline check {'OK' if r.report.ok else 'FAILED'}")
+    return out
 
 
 # ---------------------------------------------------------------------------------------------------- schema markdown
 
 
 SCHEMA_ORDER = ["MultiCamSpec", "TimingSpec", "SegmentSpec", "RateSpec", "CueSpec", "EventSpec", "RenderSpec", "OutputSpec",
-                "SessionSpec", "PostSpec", "StreamSpec", "CamSpec", "KeySpec", "ShotSpec", "ShakeSpec", "ClampSpec", "PanSpec", "BeatSpec",
+                "SessionSpec", "PostSpec", "StreamSpec", "CamSpec", "KeySpec", "ShotSpec", "ShakeSpec", "MotionSpec", "ClampSpec", "PanSpec",
+                "BeatSpec",
                 "ViewSpec", "TargetRef", "GroupSpec",
                 "GroupFilter", "ReplaySpec", "RecordSpec", "BoxSpec", "PlaySpec", "AudioCapSpec"]
 SCHEMA_TITLES = {"MultiCamSpec": "Root", "TimingSpec": "timing", "SegmentSpec": "timing.segments[]", "RateSpec": "rates[] (v1)",
                  "CueSpec": "cues[]", "EventSpec": "events[]", "RenderSpec": "render (root, defaults.render, camera render)",
                  "OutputSpec": "output", "SessionSpec": "session", "PostSpec": "post (root, defaults.post, camera post)",
                  "StreamSpec": "stream", "CamSpec": "cameras[] and defaults", "KeySpec": "cameras[].keys[]",
-                 "ShotSpec": "cameras[].shots[] (director)", "ShakeSpec": "cameras[].shake", "ClampSpec": "cameras[].clamp",
+                 "ShotSpec": "cameras[].shots[] (director)", "ShakeSpec": "cameras[].shake", "MotionSpec": "cameras[].motion",
+                 "ClampSpec": "cameras[].clamp",
                  "PanSpec": "cameras[].pans[] (overview)", "BeatSpec": "cameras[].beats[] (events)", "ViewSpec": "cameras[].view",
                  "TargetRef": "target object form",
                  "GroupSpec": "target group", "GroupFilter": "group filter", "ReplaySpec": "replay", "RecordSpec": "replay.record",
                  "BoxSpec": "replay.record.box", "PlaySpec": "replay.play", "AudioCapSpec": "replay.audio"}
+PIPE_RE = re.compile(r"(?<!\\)[|]")
 CLASS_SWITCH = re.compile(r"^`[\w.]+` \(`(\w+)`\):\s*$")
 DEFAULT_TEXT = {"TargetRef.of": "null", "TargetRef.point": "null", "PlaySpec.range": "null"}
 EXTRA_MEANINGS = {
@@ -3558,7 +3855,8 @@ def schema_md(schema: Schema, design: Path | list[Path]) -> tuple[str, list[str]
     sources = " and ".join(f"`{p.name}`" for p in schema.paths)
     lines = [f"Generated by `python -I tools/mcam_spec_check.py --schema-md` from {sources}; meanings from the design docs.", ""]
     diffs: list[str] = []
-    for cname in SCHEMA_ORDER:
+    extra = [c for c in schema.classes if c not in SCHEMA_ORDER and schema.is_node(c) and schema.fields(c)]
+    for cname in SCHEMA_ORDER + extra:
         if cname not in schema.classes:
             continue
         lines += [f"#### {SCHEMA_TITLES.get(cname, cname)} (`{cname}`)", "", "| Key | Type | Default | Meaning |", "|---|---|---|---|"]
@@ -3567,7 +3865,8 @@ def schema_md(schema: Schema, design: Path | list[Path]) -> tuple[str, list[str]
             key = f"{cname}.{f.name}"
             doc_default, meaning = meanings.get(key, ("", EXTRA_MEANINGS.get(key, "")))
             dt = DEFAULT_TEXT.get(key) or default_text(inst.v.get(f.name))
-            lines.append(f"| {f.name} | {type_name(schema, f.ctype)} | {dt} | {re.sub(r'(?<!\\)[|]', '/', meaning)} |")
+            cell = PIPE_RE.sub("/", meaning)
+            lines.append(f"| {f.name} | {type_name(schema, f.ctype)} | {dt} | {cell} |")
             if not meaning:
                 diffs.append(f"{key}: no meaning in the design doc")
             elif doc_default and key in meanings:
@@ -3616,14 +3915,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--schema-md", action="store_true", help="print the schema tables as Markdown")
     ap.add_argument("--update-doc", type=Path, help="replace the schema block of this Markdown file")
     ap.add_argument("--quiet", action="store_true", help="summary, errors and warnings only")
-    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--json", action="store_true", help="machine-readable output (one object for one spec, a list for several)")
+    ap.add_argument("--json-list", action="store_true", help="machine-readable output, always a list")
+    ap.add_argument("--res", type=parse_res, default=None,
+                    help="capture size WIDTHxHEIGHT for the crop checks and the disk estimate (default: session.res of the spec, else "
+                         "run.json of the take given with --poses / --rehearsal; unknown otherwise)")
+    ap.add_argument("--compare", type=Path, help="JSON of the game's `mcam check <spec> json` for the same spec: list what only one side reports")
+    ap.add_argument("--strict", action="store_true", help="exit 1 also for --compare differences and --schema-md doc differences")
     ap.add_argument("--bind-only", action="store_true", help="only the SpecBind messages (cross-check with the C# binder)")
     ap.add_argument("--index", action="store_true", help="look object paths up in the level index (JSONL)")
     ap.add_argument("--index-dir", type=Path, default=DEFAULT_INDEX, help="level index folder for --index (default: env INSIDE_LEVEL_INDEX)")
     ap.add_argument("--levels", default="", help="with --index: only index files whose name contains this text")
     ap.add_argument("--rehearsal", type=Path, help="rehearsal take folder (overrides the spec's rehearsal)")
     ap.add_argument("--poses", type=Path, help="take folder (poses.csv, meta.csv, events.csv): check its camera moves against the motion limits")
-    ap.add_argument("--ms", default=None, help="engine milliseconds per frame (v2) or per replay render for the time estimate, "
+    ap.add_argument("--ms", type=parse_ms, default=None, help="engine milliseconds per frame (v2) or per replay render for the time estimate, "
                                                f"'lo:hi' (default 25:40 for v2, {REPLAY_MS} for replay)")
     opts = ap.parse_args(argv)
     opts.specs += [p for p in opts.types or [] if p.suffix.lower() == ".json"]
@@ -3633,8 +3938,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         schema = Schema(opts.types)
     except (OSError, ValueError) as e:
-        print(f"cannot read the schema: {e}", file=sys.stderr)
+        print(f"cannot read the schema: {e}\n(the checker reads the game's C# sources: run it inside the repository, or give "
+              "--types <MultiCamTypes.cs> <ReplayTypes.cs>)", file=sys.stderr)
         return 2
+    TABLE_NOTES[:] = load_tables(schema.path.resolve().parent)
+    doc_diffs = False
     if opts.schema_md or opts.update_doc:
         md, diffs = schema_md(schema, opts.design)
         if opts.update_doc:
@@ -3646,14 +3954,29 @@ def main(argv: list[str] | None = None) -> int:
             print(md)
         for d in diffs:
             print(f"doc check: {d}", file=sys.stderr)
+        doc_diffs = bool(diffs) and opts.strict
         if not opts.specs:
-            return 0
+            return 1 if doc_diffs else 0
     if not opts.specs:
         ap.print_usage(sys.stderr)
         return 2
     commands = load_commands(schema.path)
     checks = [Check(p, schema, opts, commands) for p in opts.specs]
-    results = [c.run() for c in checks]
+    results = []
+    for c in checks:
+        try:
+            results.append(c.run())
+        except Exception as e:
+            c.report.add("error", str(c.path), f"internal error in stage {c.report.stage}: {type(e).__name__}: {e} "
+                                               "(the spec has a shape the checker does not expect; please report it)", "internal")
+            c.result.bad_input = True
+            results.append(c.result)
+    differences: list[str] = []
+    if opts.compare:
+        if len(results) != 1:
+            print("--compare takes one spec", file=sys.stderr)
+            return 2
+        differences = compare_with_game(results[0], opts.compare)
     if opts.index and not opts.bind_only:
         index_lookup(checks, opts.index_dir, opts.levels)
     if opts.bind_only:
@@ -3663,17 +3986,25 @@ def main(argv: list[str] | None = None) -> int:
                 for m in r.report.msgs:
                     if m.stage == "bind" and m.level == level:
                         print(f"{level}: {m.line()}")
-    elif opts.json:
+    elif opts.json or opts.json_list:
         out = [result_json(r) for r in results]
-        print(json.dumps(out if len(out) > 1 else out[0], indent=1, default=lambda o: o.text() if isinstance(o, TimeVal) else str(o)))
+        if opts.compare:
+            out[0]["compare"] = differences
+        print(json.dumps(out if len(out) > 1 or opts.json_list else out[0], indent=1, allow_nan=False))
     else:
         for i, r in enumerate(results):
             if i:
                 print()
             print_result(r, opts.quiet)
+        for d in differences:
+            print(d)
+        if opts.compare and not differences:
+            print("compare: the game and the offline check report the same places")
     if any(r.bad_input for r in results):
         return 2
-    return 0 if all(r.report.ok for r in results) else 1
+    if not all(r.report.ok for r in results):
+        return 1
+    return 1 if opts.strict and (differences or doc_diffs) else 0
 
 
 if __name__ == "__main__":
