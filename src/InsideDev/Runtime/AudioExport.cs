@@ -69,7 +69,7 @@ namespace InsideDev
                     int nodesN, edgesN; WriteGraph(dir, nm, refs, out nodesN, out edgesN);
                     WriteTimeline(dir, plays);
                     WriteReadme(dir, evs.Count, refs.Count, plays.Count, nodesN, edgesN);
-                    status = "exported " + evs.Count + " events, " + refs.Count + " game references, " + nodesN + " graph nodes / " + edgesN + " edges, " + plays.Count + " playing ids to " + dir + " (snapshot " + snapMs.ToString("0") + " ms, write " + tw.ElapsedMilliseconds + " ms on a worker thread)";
+                    status = "exported " + evs.Count + " events, " + refs.Count + " game references, " + nodesN + " graph nodes / " + edgesN + " edges, " + plays.Count + " playing ids to " + dir + " (snapshot " + Fmt.F(snapMs, "0") + " ms, write " + tw.ElapsedMilliseconds + " ms on a worker thread)";
                 }
                 catch (Exception e) { status = "export failed: " + e.Message; }
                 busy = false;

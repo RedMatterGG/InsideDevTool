@@ -56,9 +56,68 @@ namespace InsideDev
         public static readonly Dictionary<string, List<KeyValuePair<MInfo, Effect>>> uses = new Dictionary<string, List<KeyValuePair<MInfo, Effect>>>();  // "Type::member" -> accesses
         public static readonly Dictionary<Type, List<MInfo>> byType = new Dictionary<Type, List<MInfo>>();
         public static readonly Dictionary<string, MInfo> signalInputs = new Dictionary<string, MInfo>();   // "Type::signalName" -> handler
-        public static bool done; public static int scannedMethods, effectsCount; static int qi;
+        // set after the indexes are complete (behind a memory barrier): readers on the main thread test it before they
+        // touch them. Not volatile: that would change the field's signature for modules built against 0.10.0.
+        public static bool done;
+        public static int scannedMethods, effectsCount; static int qi;
         static List<MethodBase> queue;
-        static readonly Dictionary<short, OpCode> ops = new Dictionary<short, OpCode>();
+
+        // what the stack simulation does with an opcode, decided once per opcode instead of by comparing its name
+        // for every instruction of the game
+        enum K : byte { Other, LdArg, LdLoc, StLoc, LdcI4, LdcR4, LdStr, LdNull, LdFld, StFld, Call, LdFtn, CondBranch, Flow, Cmp, Dup, Pass }
+        sealed class Op
+        {
+            public OpCode oc; public K k;
+            public int n = -1;          // LdArg / LdLoc / StLoc: index in the name (-1 = operand); LdcI4: the constant
+            public int sub;             // LdcI4: 0 constant n, 1 int operand, 2 sbyte operand; CondBranch: 0 compare, 1 brfalse, 2 brtrue, 3 switch
+            public bool stat, newobj, virt;
+            public string text;         // Cmp: " == " / " > " / " < "; CondBranch compare: the inverted relation
+            public int pops, pushes;
+        }
+        static readonly Dictionary<short, Op> ops = new Dictionary<short, Op>();
+
+        static bool Starts(string s, string p) { return s.StartsWith(p, StringComparison.Ordinal); }
+
+        static Op Classify(OpCode oc)
+        {
+            var o = new Op { oc = oc, k = K.Other };
+            string name = oc.Name;
+            if (Starts(name, "ldarg") || Starts(name, "ldloc") || Starts(name, "stloc"))
+            {
+                o.k = Starts(name, "ldarg") ? K.LdArg : Starts(name, "ldloc") ? K.LdLoc : K.StLoc;
+                char last = name[name.Length - 1];
+                if (name.Length == 7 && name[5] == '.' && last >= '0' && last <= '3') o.n = last - '0';
+            }
+            else if (Starts(name, "ldc.i4"))
+            {
+                o.k = K.LdcI4;
+                if (name == "ldc.i4") o.sub = 1;
+                else if (name == "ldc.i4.s") o.sub = 2;
+                else if (name == "ldc.i4.m1") o.n = -1;
+                else o.n = name[name.Length - 1] - '0';
+            }
+            else if (name == "ldc.r4") o.k = K.LdcR4;
+            else if (name == "ldstr") o.k = K.LdStr;
+            else if (name == "ldnull") o.k = K.LdNull;
+            else if (name == "ldsfld" || name == "ldfld" || name == "ldflda" || name == "ldsflda") { o.k = K.LdFld; o.stat = Starts(name, "lds"); }
+            else if (name == "stfld" || name == "stsfld") { o.k = K.StFld; o.stat = name == "stsfld"; }
+            else if (oc.FlowControl == FlowControl.Call && oc.OperandType == OperandType.InlineMethod) { o.k = K.Call; o.newobj = name == "newobj"; }
+            else if (name == "ldftn" || name == "ldvirtftn") { o.k = K.LdFtn; o.virt = name == "ldvirtftn"; }
+            else if (oc.FlowControl == FlowControl.Cond_Branch)
+            {
+                o.k = K.CondBranch;
+                if (Starts(name, "brfalse")) o.sub = 1;
+                else if (Starts(name, "brtrue")) o.sub = 2;
+                else if (oc.OperandType == OperandType.InlineSwitch) o.sub = 3;
+                else o.text = Inv(name);
+            }
+            else if (oc.FlowControl == FlowControl.Branch || oc.FlowControl == FlowControl.Return || oc.FlowControl == FlowControl.Throw) o.k = K.Flow;
+            else if (name == "ceq" || name == "cgt" || name == "clt" || name == "cgt.un" || name == "clt.un") { o.k = K.Cmp; o.text = name == "ceq" ? " == " : Starts(name, "cgt") ? " > " : " < "; }
+            else if (name == "dup") o.k = K.Dup;
+            else if (name == "isinst" || name == "castclass" || name == "box" || name == "unbox.any" || Starts(name, "conv")) o.k = K.Pass;
+            else { o.pops = Pops(oc.StackBehaviourPop); o.pushes = Pushes(oc.StackBehaviourPush); }
+            return o;
+        }
         public static Type ComponentType, GameObjectType, BehaviourType, UObjType;
 
         static readonly HashSet<string> unityMessages = new HashSet<string> {
@@ -67,20 +126,32 @@ namespace InsideDev
             "OnLevelWasLoaded","OnApplicationQuit","OnApplicationFocus","OnApplicationPause","OnPreRender","OnPostRender","OnRenderObject","OnWillRenderObject","Reset","OnValidate" };
 
         // ---------------------------------------------------------------- scanning (budgeted)
+        // The scan reads the IL of the whole game once and allocates a lot while it does (Mono's collector stops every
+        // thread, the game's too): it starts when the tool is used for the first time (Background.InUse) or somebody
+        // asks with Want(), and then runs to the end. Until then the worker that calls Step just naps.
+        static volatile bool wanted;
+        public static void Want() { wanted = true; }
+        public static bool Started { get { return wanted; } }
+
         public static void Step(double budgetMs)
         {
             if (done) return;
+            if (!wanted)
+            {
+                if (Background.InUse) wanted = true;
+                else { System.Threading.Thread.Sleep(200); return; }
+            }
             if (queue == null) Init();
             var sw = System.Diagnostics.Stopwatch.StartNew();
             while (qi < queue.Count && sw.Elapsed.TotalMilliseconds < budgetMs) { try { Scan(queue[qi]); } catch { } qi++; scannedMethods++; }
-            if (qi >= queue.Count) { done = true; queue = null; Finish(); pool.Clear(); }
+            if (qi >= queue.Count) { queue = null; Finish(); pool.Clear(); System.Threading.Thread.MemoryBarrier(); done = true; }
         }
         public static int Pending { get { return queue == null ? 0 : queue.Count - qi; } }
 
         static void Init()
         {
             foreach (var f in typeof(OpCodes).GetFields(BindingFlags.Public | BindingFlags.Static))
-            { var o = f.GetValue(null); if (o is OpCode) { var oc = (OpCode)o; ops[oc.Value] = oc; } }
+            { var o = f.GetValue(null); if (o is OpCode) { var oc = (OpCode)o; ops[oc.Value] = Classify(oc); } }
             queue = new List<MethodBase>();
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
@@ -194,110 +265,121 @@ namespace InsideDev
             while (p < il.Length)
             {
                 int at = p;
-                if (guards.RemoveAll(g => at >= g.Key) > 0) guardDirty = true;
+                if (guards.Count > 0)
+                    for (int gi = guards.Count - 1; gi >= 0; gi--) if (at >= guards[gi].Key) { guards.RemoveAt(gi); guardDirty = true; }
                 short v = il[p];
                 if (v == 0xFE && p + 1 < il.Length) { v = (short)(0xFE00 | il[p + 1]); p += 2; } else p += 1;
-                OpCode oc;
-                if (!ops.TryGetValue(v, out oc)) return;
+                Op op;
+                if (!ops.TryGetValue(v, out op)) return;
+                OpCode oc = op.oc;
                 int size = OperandSize(oc.OperandType, il, p);
                 int tok = size == 4 ? BitConverter.ToInt32(il, p) : 0;
-                string name = oc.Name;
                 // nested conditions all hold: "if A && B" (the compiler turns "if (a && b)" into two branches)
                 if (guardDirty) { guardDirty = false; guardText = guards.Count == 0 ? null : guards.Count == 1 ? guards[0].Value : JoinGuards(guards); }
                 string guard = guardText;
                 try
                 {
-                    if (name.StartsWith("ldarg"))
+                    switch (op.k)
                     {
-                        int idx = name == "ldarg.0" ? 0 : name == "ldarg.1" ? 1 : name == "ldarg.2" ? 2 : name == "ldarg.3" ? 3 : size == 1 ? il[p] : size == 2 ? BitConverter.ToInt16(il, p) : 0;
-                        if (!m.IsStatic) { if (idx == 0) { stack.Add(new V("this", m.DeclaringType)); p += size; continue; } idx--; }
-                        stack.Add(idx < ps.Length ? new V(ps[idx].Name, ps[idx].ParameterType) : new V("arg", null));
-                    }
-                    else if (name.StartsWith("ldloc"))
-                    {
-                        int idx = name == "ldloc.0" ? 0 : name == "ldloc.1" ? 1 : name == "ldloc.2" ? 2 : name == "ldloc.3" ? 3 : size == 1 ? il[p] : size == 2 ? BitConverter.ToInt16(il, p) : 0;
-                        Type lt = null; try { if (idx < locals.Count) lt = locals[idx].LocalType; } catch { }
-                        string lv; if (localText.TryGetValue(idx, out lv)) stack.Add(new V(lv, lt));
-                        else stack.Add(new V(lt != null ? "(" + lt.Name + " local)" : "(local)", lt));
-                    }
-                    else if (name.StartsWith("stloc"))
-                    {
-                        int idx = name == "stloc.0" ? 0 : name == "stloc.1" ? 1 : name == "stloc.2" ? 2 : name == "stloc.3" ? 3 : size == 1 ? il[p] : size == 2 ? BitConverter.ToInt16(il, p) : 0;
-                        var val = Pop(stack);
-                        // remember readable values only (method results, fields, constants); loop counters etc. stay "(local)"
-                        if (val.text != null && val.text.Length > 0 && val.text.Length < 90 && val.text != "≈" && !val.text.StartsWith("(")) localText[idx] = val.text; else localText.Remove(idx);
-                    }
-                    else if (name.StartsWith("ldc.i4")) { int k = name == "ldc.i4" ? tok : name == "ldc.i4.s" ? (sbyte)il[p] : name == "ldc.i4.m1" ? -1 : name[name.Length - 1] - '0'; stack.Add(new V(k.ToString(), typeof(int))); }
-                    else if (name == "ldc.r4") { stack.Add(new V(BitConverter.ToSingle(il, p).ToString("0.###", System.Globalization.CultureInfo.InvariantCulture), typeof(float))); }
-                    else if (name == "ldstr") { string s = null; try { s = mod.ResolveString(tok); } catch { } stack.Add(new V("\"" + s + "\"", typeof(string))); }
-                    else if (name == "ldnull") stack.Add(new V("null", null));
-                    else if (name == "ldsfld" || name == "ldfld" || name == "ldflda" || name == "ldsflda")
-                    {
-                        var f = mod.ResolveField(tok, targs, margs);
-                        V recv = name.StartsWith("lds") ? new V(f.DeclaringType.Name, f.DeclaringType) : Pop(stack);
-                        string txt = (recv.text == "this" && !name.StartsWith("lds") ? "this" : recv.text) + "." + f.Name;
-                        if (!name.StartsWith("lds") && recv.text == "this") txt = "this." + f.Name;
-                        if (IsGameType(f.DeclaringType) && f.DeclaringType != ot && !f.DeclaringType.Name.StartsWith("<"))
-                            Add(info, new Effect { kind = "read", type = f.DeclaringType, member = f.Name, recv = name.StartsWith("lds") ? f.DeclaringType.Name : recv.text, guard = guard });
-                        stack.Add(new V(txt, f.FieldType));
-                    }
-                    else if (name == "stfld" || name == "stsfld")
-                    {
-                        var f = mod.ResolveField(tok, targs, margs);
-                        V val = Pop(stack); V recv = name == "stfld" ? Pop(stack) : new V(f.DeclaringType.Name, f.DeclaringType);
-                        if (IsGameType(f.DeclaringType) && !f.DeclaringType.Name.StartsWith("<"))
-                            Add(info, new Effect { kind = "write", type = f.DeclaringType, member = f.Name, recv = recv.text, args = Trim(val.text), guard = guard });
-                    }
-                    else if (oc.FlowControl == FlowControl.Call && oc.OperandType == OperandType.InlineMethod)
-                    {
-                        var mb = mod.ResolveMethod(tok, targs, margs);
-                        var pars = mb.GetParameters();
-                        var args = new List<V>();
-                        for (int i = 0; i < pars.Length; i++) args.Insert(0, Pop(stack));
-                        for (int i = 0; i < pars.Length && i < args.Count; i++)
-                        {
-                            int iv; var pt = pars[i].ParameterType;
-                            if (pt.IsEnum && int.TryParse(args[i].text, out iv)) { string en = null; try { en = Enum.GetName(pt, iv); } catch { } if (en != null) args[i] = new V(pt.Name + "." + en, pt); }
-                        }
-                        V recv = (!mb.IsStatic && name != "newobj") ? Pop(stack) : new V(mb.DeclaringType.Name, mb.DeclaringType);
-                        string argText = Args(args);
-                        Type ret = mb is MethodInfo ? ((MethodInfo)mb).ReturnType : mb.DeclaringType;
-                        CallEffect(info, mb, recv, args, argText, guard, name);
-                        if (name == "newobj" && typeof(Delegate).IsAssignableFrom(mb.DeclaringType) && args.Count >= 2 && args[1].text.StartsWith("&"))
-                            stack.Add(new V(args[1].text, mb.DeclaringType));
-                        else if (name == "newobj" || (ret != null && ret != typeof(void)))
-                        {
-                            string mname = mb.Name.StartsWith("get_") ? mb.Name.Substring(4) : mb.Name;
-                            string t = name == "newobj" ? "new " + mb.DeclaringType.Name + "(" + argText + ")" : (recv.text + "." + mname + (mb.Name.StartsWith("get_") ? "" : "(" + argText + ")"));
-                            stack.Add(new V(t, ret));
-                        }
-                    }
-                    else if (name == "ldftn" || name == "ldvirtftn")
-                    {
-                        var mb = mod.ResolveMethod(tok, targs, margs);
-                        if (name == "ldvirtftn") Pop(stack);
-                        stack.Add(new V("&" + mb.Name, null));
-                    }
-                    else if (oc.FlowControl == FlowControl.Cond_Branch)
-                    {
-                        int target = p + size + (size == 1 ? (sbyte)il[p] : tok);
-                        string cond = null;
-                        if (name.StartsWith("brfalse")) cond = Pop(stack).text;                    // fallthrough runs when cond is true
-                        else if (name.StartsWith("brtrue")) cond = "!" + Pop(stack).text;
-                        else if (oc.OperandType != OperandType.InlineSwitch) { var b = Pop(stack); var a = Pop(stack); cond = a.text + Inv(name) + b.text; }
-                        else Pop(stack);
-                        if (cond != null && target > p + size) { guards.Add(new KeyValuePair<int, string>(target, Trim(cond))); guardDirty = true; }
-                    }
-                    else if (oc.FlowControl == FlowControl.Branch || oc.FlowControl == FlowControl.Return || oc.FlowControl == FlowControl.Throw) stack.Clear();
-                    else if (name == "ceq" || name == "cgt" || name == "clt" || name == "cgt.un" || name == "clt.un")
-                    { var b = Pop(stack); var a = Pop(stack); stack.Add(new V("(" + a.text + (name == "ceq" ? " == " : name.StartsWith("cgt") ? " > " : " < ") + b.text + ")", typeof(bool))); }
-                    else if (name == "dup") { var t = Pop(stack); stack.Add(t); stack.Add(t); }
-                    else if (name == "isinst" || name == "castclass" || name == "box" || name == "unbox.any" || name.StartsWith("conv")) { var t = Pop(stack); stack.Add(t); }
-                    else
-                    {
-                        int np = Pops(oc.StackBehaviourPop), nu = Pushes(oc.StackBehaviourPush);
-                        for (int i = 0; i < np; i++) Pop(stack);
-                        for (int i = 0; i < nu; i++) stack.Add(new V("≈", null));
+                        case K.LdArg:
+                            {
+                                int idx = op.n >= 0 ? op.n : size == 1 ? il[p] : size == 2 ? BitConverter.ToInt16(il, p) : 0;
+                                if (!m.IsStatic) { if (idx == 0) { stack.Add(new V("this", m.DeclaringType)); break; } idx--; }
+                                stack.Add(idx < ps.Length ? new V(ps[idx].Name, ps[idx].ParameterType) : new V("arg", null));
+                                break;
+                            }
+                        case K.LdLoc:
+                            {
+                                int idx = op.n >= 0 ? op.n : size == 1 ? il[p] : size == 2 ? BitConverter.ToInt16(il, p) : 0;
+                                Type lt = null; try { if (idx < locals.Count) lt = locals[idx].LocalType; } catch { }
+                                string lv; if (localText.TryGetValue(idx, out lv)) stack.Add(new V(lv, lt));
+                                else stack.Add(new V(lt != null ? "(" + lt.Name + " local)" : "(local)", lt));
+                                break;
+                            }
+                        case K.StLoc:
+                            {
+                                int idx = op.n >= 0 ? op.n : size == 1 ? il[p] : size == 2 ? BitConverter.ToInt16(il, p) : 0;
+                                var val = Pop(stack);
+                                // remember readable values only (method results, fields, constants); loop counters etc. stay "(local)"
+                                if (val.text != null && val.text.Length > 0 && val.text.Length < 90 && val.text != "≈" && val.text[0] != '(') localText[idx] = val.text; else localText.Remove(idx);
+                                break;
+                            }
+                        case K.LdcI4: { int k = op.sub == 1 ? tok : op.sub == 2 ? (sbyte)il[p] : op.n; stack.Add(new V(k.ToString(System.Globalization.CultureInfo.InvariantCulture), typeof(int))); break; }
+                        case K.LdcR4: stack.Add(new V(BitConverter.ToSingle(il, p).ToString("0.###", System.Globalization.CultureInfo.InvariantCulture), typeof(float))); break;
+                        case K.LdStr: { string s = null; try { s = mod.ResolveString(tok); } catch { } stack.Add(new V("\"" + s + "\"", typeof(string))); break; }
+                        case K.LdNull: stack.Add(new V("null", null)); break;
+                        case K.LdFld:
+                            {
+                                var f = mod.ResolveField(tok, targs, margs);
+                                V recv = op.stat ? new V(f.DeclaringType.Name, f.DeclaringType) : Pop(stack);
+                                string txt = recv.text + "." + f.Name;
+                                if (IsGameType(f.DeclaringType) && f.DeclaringType != ot && !Starts(f.DeclaringType.Name, "<"))
+                                    Add(info, new Effect { kind = "read", type = f.DeclaringType, member = f.Name, recv = op.stat ? f.DeclaringType.Name : recv.text, guard = guard });
+                                stack.Add(new V(txt, f.FieldType));
+                                break;
+                            }
+                        case K.StFld:
+                            {
+                                var f = mod.ResolveField(tok, targs, margs);
+                                V val = Pop(stack); V recv = !op.stat ? Pop(stack) : new V(f.DeclaringType.Name, f.DeclaringType);
+                                if (IsGameType(f.DeclaringType) && !Starts(f.DeclaringType.Name, "<"))
+                                    Add(info, new Effect { kind = "write", type = f.DeclaringType, member = f.Name, recv = recv.text, args = Trim(val.text), guard = guard });
+                                break;
+                            }
+                        case K.Call:
+                            {
+                                var mb = mod.ResolveMethod(tok, targs, margs);
+                                var pars = mb.GetParameters();
+                                var args = new List<V>(pars.Length);
+                                for (int i = 0; i < pars.Length; i++) args.Insert(0, Pop(stack));
+                                for (int i = 0; i < pars.Length && i < args.Count; i++)
+                                {
+                                    int iv; var pt = pars[i].ParameterType;
+                                    if (pt.IsEnum && int.TryParse(args[i].text, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out iv)) { string en = null; try { en = Enum.GetName(pt, iv); } catch { } if (en != null) args[i] = new V(pt.Name + "." + en, pt); }
+                                }
+                                V recv = (!mb.IsStatic && !op.newobj) ? Pop(stack) : new V(mb.DeclaringType.Name, mb.DeclaringType);
+                                string argText = Args(args);
+                                Type ret = mb is MethodInfo ? ((MethodInfo)mb).ReturnType : mb.DeclaringType;
+                                CallEffect(info, mb, recv, args, argText, guard, op.newobj ? "newobj" : "call");
+                                if (op.newobj && typeof(Delegate).IsAssignableFrom(mb.DeclaringType) && args.Count >= 2 && Starts(args[1].text, "&"))
+                                    stack.Add(new V(args[1].text, mb.DeclaringType));
+                                else if (op.newobj || (ret != null && ret != typeof(void)))
+                                {
+                                    bool getter = Starts(mb.Name, "get_");
+                                    string mname = getter ? mb.Name.Substring(4) : mb.Name;
+                                    string t = op.newobj ? "new " + mb.DeclaringType.Name + "(" + argText + ")" : (recv.text + "." + mname + (getter ? "" : "(" + argText + ")"));
+                                    stack.Add(new V(t, ret));
+                                }
+                                break;
+                            }
+                        case K.LdFtn:
+                            {
+                                var mb = mod.ResolveMethod(tok, targs, margs);
+                                if (op.virt) Pop(stack);
+                                stack.Add(new V("&" + mb.Name, null));
+                                break;
+                            }
+                        case K.CondBranch:
+                            {
+                                int target = p + size + (size == 1 ? (sbyte)il[p] : tok);
+                                string cond = null;
+                                if (op.sub == 1) cond = Pop(stack).text;                    // fallthrough runs when cond is true
+                                else if (op.sub == 2) cond = "!" + Pop(stack).text;
+                                else if (op.sub == 0) { var b = Pop(stack); var a = Pop(stack); cond = a.text + op.text + b.text; }
+                                else Pop(stack);
+                                if (cond != null && target > p + size) { guards.Add(new KeyValuePair<int, string>(target, Trim(cond))); guardDirty = true; }
+                                break;
+                            }
+                        case K.Flow: stack.Clear(); break;
+                        case K.Cmp: { var b = Pop(stack); var a = Pop(stack); stack.Add(new V("(" + a.text + op.text + b.text + ")", typeof(bool))); break; }
+                        case K.Dup: { var t = Pop(stack); stack.Add(t); stack.Add(t); break; }
+                        case K.Pass: if (stack.Count == 0) stack.Add(new V("≈", null)); break;   // the value stays as it is
+                        default:
+                            {
+                                for (int i = 0; i < op.pops; i++) Pop(stack);
+                                for (int i = 0; i < op.pushes; i++) stack.Add(new V("≈", null));
+                                break;
+                            }
                     }
                 }
                 catch { stack.Clear(); }
@@ -315,8 +397,8 @@ namespace InsideDev
         static string Inv(string br)
         {
             // branch jumps away when the relation holds, so the guarded fallthrough runs when it does not
-            if (br.StartsWith("beq")) return " != "; if (br.StartsWith("bne")) return " == ";
-            if (br.StartsWith("bge")) return " < "; if (br.StartsWith("bgt")) return " <= "; if (br.StartsWith("ble")) return " > "; if (br.StartsWith("blt")) return " >= ";
+            if (Starts(br, "beq")) return " != "; if (Starts(br, "bne")) return " == ";
+            if (Starts(br, "bge")) return " < "; if (Starts(br, "bgt")) return " <= "; if (Starts(br, "ble")) return " > "; if (Starts(br, "blt")) return " >= ";
             return " ? ";
         }
 
@@ -565,7 +647,9 @@ namespace InsideDev
 
         public static Type FindType(string name)
         {
-            foreach (var t in byType.Keys) if (t.Name == name || t.FullName == name) return t;
+            // byType is filled by the scan thread until done is set: only read it afterwards (the assembly lookup
+            // below finds a full name at any time)
+            if (done) foreach (var t in byType.Keys) if (t.Name == name || t.FullName == name) return t;
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
                 string n = asm.GetName().Name;

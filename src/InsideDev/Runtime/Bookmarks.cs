@@ -13,24 +13,57 @@ namespace InsideDev
         public static readonly List<Mark> marks = new List<Mark>();
         static string PathJ { get { return Path.Combine(Path.Combine(Path.GetDirectoryName(Application.dataPath), "_mod"), "bookmarks.json"); } }
 
+        // entries of the file that could not be read as a bookmark: written back as they are, never dropped
+        static readonly List<object> unreadable = new List<object>();
+        static bool keepBadFile;   // the file on disk could not be parsed: it is copied to bookmarks.json.bad before the first save
+        public static string loadProblem;
+
+        static bool ReadFile(string path, out Json.Obj root, out string error)
+        {
+            root = null; error = null;
+            object parsed;
+            if (!Json.TryParse(File.ReadAllText(path), out parsed, out error)) return false;
+            root = parsed as Json.Obj;
+            if (root == null) { error = "not a JSON object"; return false; }
+            return true;
+        }
+
         public static void Load()
         {
-            marks.Clear();
+            marks.Clear(); unreadable.Clear(); keepBadFile = false; loadProblem = null;
             try
             {
-                if (!File.Exists(PathJ)) return;
-                var root = Json.Parse(File.ReadAllText(PathJ)) as Json.Obj;
+                if (!File.Exists(PathJ) && !File.Exists(PathJ + ".bak")) return;
+                Json.Obj root = null; string err = null;
+                if (File.Exists(PathJ) && !ReadFile(PathJ, out root, out err))
+                {
+                    keepBadFile = true;
+                    loadProblem = "bookmarks.json could not be read (" + err + ")";
+                    string bak = PathJ + ".bak"; string berr;
+                    if (File.Exists(bak) && ReadFile(bak, out root, out berr)) loadProblem += ": the previous version (bookmarks.json.bak) is used; the unreadable file is kept as bookmarks.json.bad at the next save";
+                    else { root = null; loadProblem += ": no bookmarks loaded; the file is kept as bookmarks.json.bad at the next save"; }
+                    DevLog.Write("[bookmark] " + loadProblem);
+                }
+                else if (root == null) { string berr; if (!ReadFile(PathJ + ".bak", out root, out berr)) root = null; }
                 if (root == null) return;
+                int n = 0;
                 foreach (var x in root.Arr("bookmarks"))
                 {
-                    var j = x as Json.Obj; if (j == null) continue;
-                    var m = new Mark { name = j.Str("name"), selector = j.Str("selector"), note = j.Str("note", ""), area = j.Str("area", ""), created = j.Str("created", ""), component = j.Str("component", ""), method = j.Str("method", "") };
-                    var p = j.Arr("pos");
-                    if (p.Count == 3) { m.hasPos = true; m.pos = new Vector3((float)(double)p[0], (float)(double)p[1], (float)(double)p[2]); }
-                    marks.Add(m);
+                    n++;
+                    try
+                    {
+                        var j = x as Json.Obj;
+                        if (j == null || string.IsNullOrEmpty(j.Str("selector"))) { unreadable.Add(x); continue; }
+                        var m = new Mark { name = j.Str("name") ?? "", selector = j.Str("selector"), note = j.Str("note", ""), area = j.Str("area", ""), created = j.Str("created", ""), component = j.Str("component", ""), method = j.Str("method", "") };
+                        var p = j.Arr("pos");
+                        if (p.Count == 3 && p[0] is double && p[1] is double && p[2] is double) { m.hasPos = true; m.pos = new Vector3((float)(double)p[0], (float)(double)p[1], (float)(double)p[2]); }
+                        marks.Add(m);
+                    }
+                    catch (Exception e) { unreadable.Add(x); DevLog.Write("[bookmark] entry " + n + " skipped (kept in the file): " + e.Message); }
                 }
+                if (unreadable.Count > 0) DevLog.Write("[bookmark] " + unreadable.Count + " entr" + (unreadable.Count == 1 ? "y" : "ies") + " of bookmarks.json not understood: kept in the file as they are");
             }
-            catch (Exception e) { DevLog.Error("bookmarks load", e); }
+            catch (Exception e) { keepBadFile = File.Exists(PathJ); loadProblem = "bookmarks.json could not be read (" + e.Message + ")"; DevLog.Error("bookmarks load", e); }
         }
 
         public static void Save()
@@ -46,8 +79,15 @@ namespace InsideDev
                     if (m.hasPos) j["pos"] = new List<object> { (double)m.pos.x, (double)m.pos.y, (double)m.pos.z };
                     arr.Add(j);
                 }
+                foreach (var x in unreadable) arr.Add(x);
                 var root = new Json.Obj(); root["format"] = "insidedev-bookmarks"; root["bookmarks"] = arr;
-                File.WriteAllText(PathJ, Json.Write(root) + "\n");
+                if (keepBadFile)
+                {
+                    // the user's unreadable file is never replaced without a copy
+                    File.Copy(PathJ, PathJ + ".bad", true);
+                    keepBadFile = false;
+                }
+                SafeFile.WriteAllText(PathJ, Json.Write(root) + "\n", true);
             }
             catch (Exception e) { DevLog.Error("bookmarks save", e); }
         }
@@ -55,7 +95,7 @@ namespace InsideDev
         public static Mark Add(GameObject go, string name = null, string note = null)
         {
             if (go == null) return null;
-            var m = new Mark { name = name ?? go.name, selector = ObjectSelector.From(go).ToString(), note = note ?? "", hasPos = true, pos = go.transform.position, created = DateTime.Now.ToString("yyyy-MM-dd HH:mm") };
+            var m = new Mark { name = name ?? go.name, selector = ObjectSelector.From(go).ToString(), note = note ?? "", hasPos = true, pos = go.transform.position, created = DateTime.Now.ToString("yyyy-MM-dd HH:mm", Fmt.IC) };
             try { m.area = AudioCatalog.AreaOf(go); } catch { }
             marks.Add(m);
             Save();
@@ -92,7 +132,7 @@ namespace InsideDev
             var old = FindMethod(go, component, method);
             if (old != null) { Remove(old); DevLog.Write("[bookmark] - " + old.name); return; }
             var m = new Mark { name = go.name + "  " + component + "." + method + "()", selector = ObjectSelector.From(go).ToString(), note = "", hasPos = true, pos = go.transform.position,
-                created = DateTime.Now.ToString("yyyy-MM-dd HH:mm"), component = component, method = method };
+                created = DateTime.Now.ToString("yyyy-MM-dd HH:mm", Fmt.IC), component = component, method = method };
             try { m.area = AudioCatalog.AreaOf(go); } catch { }
             marks.Add(m); Save();
             DevLog.Write("[bookmark] + " + m.name);
@@ -108,7 +148,7 @@ namespace InsideDev
                 if (c == null || c.GetType().Name != m.component) continue;
                 var mi = c.GetType().GetMethod(m.method, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic, null, Type.EmptyTypes, null);
                 if (mi == null) return "no method " + m.method + " on " + m.component;
-                try { var r = mi.Invoke(c, null); DevLog.Write("[call] " + m.component + "." + m.method + "() on " + c.name + " (bookmark)"); return "called " + m.name + (mi.ReturnType != typeof(void) ? " -> " + r : ""); }
+                try { var r = mi.Invoke(c, null); DevLog.Write("[call] " + m.component + "." + m.method + "() on " + c.name + " (bookmark)"); return "called " + m.name + (mi.ReturnType != typeof(void) ? " -> " + Fmt.Any(r) : "") + (l.Count > 1 ? " (" + l.Count + " objects match, the first was taken)" : ""); }
                 catch (Exception e) { return m.method + " failed: " + (e.InnerException ?? e).Message; }
             }
             return "component " + m.component + " not found on " + l[0].name;

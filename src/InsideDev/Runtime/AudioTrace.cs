@@ -14,6 +14,8 @@ namespace InsideDev
         public const int POST = 1, EXEC = 3, SEEK = 4, STOPALL = 5, STOPPID = 6, RTPC = 7, RTPCPID = 8, RTPCRESET = 9, SWITCH = 10,
             TRIGGER = 12, STATE = 13, REGISTER = 15, UNREGISTER = 16, SETPOS = 17, LISTENER = 18, LOADBANK = 19, UNLOADBANK = 20,
             PREPARE = 21, CANCELCB = 22, CALLBACK = 23, CBINIT = 24, IDSTR = 26, PREPSYNC = 27;
+        // a row written by this class, not by the tracer: the trace slept (text in Rec.name)
+        public const int GAP = 30;
 
         public enum Cat { Event, Switch, State, Rtpc, Bank, Object, Callback, Id, Other }
         public static Cat CategoryOf(int t)
@@ -81,14 +83,82 @@ namespace InsideDev
         public static uint follow;          // FOLLOW PLAYING ID (0 = off)
 
         // ---------------------------------------------------------------- tick
-        static bool started;
+        // The trace runs while an audio tool is in use (Background.WantedOrInUse(Background.Audio): the editor is open,
+        // a command or client was active in the last seconds, a panel asked) or editor.cfg audio.trace = 1. Otherwise
+        // the native tracer is set to "count only" and nothing is drained, named or kept; calls made in that time are
+        // not in the timeline and switch / state / bank changes of that time are not known (Status says so).
+        public const string ConfigKey = "audio.trace";
+        static bool started, awake, keyOn, keyRead;
+        static float keyReadAt = -100f, sleptAt = -1f;
+        public static int gaps; public static float sleptSeconds;
+        public static bool Awake { get { return awake; } }
+
+        static bool ShouldRun()
+        {
+            float now = Time.realtimeSinceStartup;
+            if (!keyRead || now - keyReadAt >= 1f) { keyRead = true; keyReadAt = now; try { keyOn = EditorState.Get(ConfigKey, false); } catch { } }
+            return keyOn || Background.WantedOrInUse(Background.Audio);
+        }
+
+        // main thread: a panel or command reads the trace (keeps it running for the next seconds)
+        public static void Want(float seconds) { Background.Want(Background.Audio, seconds); }
+
         public static void Tick()
         {
-            if (!started) { started = true; WwiseNative.Init(); LoadNames(); }
+            bool want = ShouldRun();
+            if (!started)
+            {
+                // once at start, wanted or not: what the game did before this frame (banks loaded, objects registered,
+                // names hashed) goes into the state tables, not into the timeline
+                started = true; bootFrame = Time.frameCount;
+                WwiseNative.Init();
+                stateOnly = true;
+                try { WwiseNative.Tick(sinkAction); } finally { stateOnly = false; }
+                if (!want) { WwiseNative.SetTracing(false); sleptAt = Time.realtimeSinceStartup; return; }
+            }
+            if (!want) { if (awake) Sleep(); return; }
+            if (!awake) WakeUp();
             RefreshGameNames();
             SaveNamesMaybe();
             WwiseNative.Tick(sinkAction);
         }
+
+        static void Sleep()
+        {
+            awake = false; sleptAt = Time.realtimeSinceStartup;
+            WwiseNative.SetTracing(false);
+            if (namesLoaded) { namesSaveAt = 0; SaveNamesMaybe(); }
+            lastByKey.Clear();
+            PruneObjects();
+        }
+
+        static void WakeUp()
+        {
+            awake = true;
+            LoadNames();
+            WwiseNative.SetTracing(true);
+            if (Time.frameCount == bootFrame) return;   // running from the first frame: nothing was missed
+            float now = Time.realtimeSinceStartup;
+            float slept = sleptAt >= 0 ? now - sleptAt : now;
+            gaps++; sleptSeconds += slept;
+            // what banks did while the trace slept is not known: a status from before the gap is not reported as now
+            foreach (var b in banks.Values) if (b.status != null && !b.status.StartsWith("?", StringComparison.Ordinal)) b.status = "? (" + b.status + " before a trace gap)";
+            if (WwiseNative.Available && !paused)
+                Add(new WwiseNative.Rec { type = GAP, frame = Time.frameCount, name = "trace slept " + Fmt.F(slept, "0.0") + " s (nobody used the audio tools; " + ConfigKey + "=1 keeps it on): calls in that time are not listed" }, now);
+        }
+
+        // Wwise objects that were unregistered long ago: ids are new after every load, the table would grow all session
+        static void PruneObjects()
+        {
+            if (objs.Count < 2000) return;
+            int frame = Time.frameCount;
+            pruneTmp.Clear();
+            foreach (var kv in objs) if (!kv.Value.registered && kv.Value.unregFrame >= 0 && frame - kv.Value.unregFrame > 3600) pruneTmp.Add(kv.Key);
+            foreach (var k in pruneTmp) objs.Remove(k);
+            pruneTmp.Clear();
+        }
+        static readonly List<uint> pruneTmp = new List<uint>();
+        static bool stateOnly; static int bootFrame = -1;
 
         static readonly Action<WwiseNative.Rec> sinkAction = Sink;
 
@@ -98,13 +168,14 @@ namespace InsideDev
             if (drainQpc == 0 || Time.frameCount != lastSinkFrame) { lastSinkFrame = Time.frameCount; drainQpc = WwiseNative.Now(); drainT = Time.realtimeSinceStartup; }
             float t = drainT - (float)WwiseNative.QpcToSeconds(drainQpc - r.qpc);
             Apply(r, t);
-            if (paused) return;
+            if (paused || stateOnly) return;
             // coalesce repeated RTPC writes to the same (object, rtpc) and repeated positions
             if (r.type == RTPC || r.type == SETPOS || r.type == LISTENER)
             {
                 long key = ((long)r.type << 56) ^ ((long)r.gameObj << 24) ^ r.groupId;
                 Ev last;
                 if (lastByKey.TryGetValue(key, out last) && t - last.t < 0.5f && Recent(last) && KeyOf(last.r) == key) { last.r = r; last.count++; last.text = null; coalesced++; return; }
+                if (lastByKey.Count > 8192) lastByKey.Clear();   // keys of objects that are long gone
                 var ev = Add(r, t); lastByKey[key] = ev; return;
             }
             Add(r, t);
@@ -175,7 +246,7 @@ namespace InsideDev
                         if (r.playingId != 0 && plays.TryGetValue(r.playingId, out p))
                         {
                             if (r.cbType == 1) { p.ended = true; p.endT = t; endOfEvents++; }
-                            if (p.callbacks.Count < 48) p.callbacks.Add(t.ToString("0.00") + "s " + CbName(r.cbType) + CbDetail(r));
+                            if (p.callbacks.Count < 48) p.callbacks.Add(Fmt.F(t, "0.00") + "s " + CbName(r.cbType) + CbDetail(r));
                         }
                         break;
                     }
@@ -218,7 +289,7 @@ namespace InsideDev
         {
             var sb = new StringBuilder();
             foreach (var kv in o.switches) sb.Append("switch ").Append(Name(kv.Key)).Append('=').Append(Name(kv.Value)).Append("; ");
-            foreach (var kv in o.rtpcs) sb.Append("rtpc ").Append(Name(kv.Key)).Append('=').Append(kv.Value.ToString("0.##")).Append("; ");
+            foreach (var kv in o.rtpcs) sb.Append("rtpc ").Append(Name(kv.Key)).Append('=').AppendF(kv.Value, "0.##").Append("; ");
             int n = 0;
             foreach (var kv in states) { if (kv.Value == 0) continue; if (n++ > 24) { sb.Append("..."); break; } sb.Append("state ").Append(Name(kv.Key)).Append('=').Append(Name(kv.Value)).Append("; "); }
             return sb.ToString();
@@ -276,7 +347,7 @@ namespace InsideDev
         // ---------------------------------------------------------------- persisted names (_mod\wwise_names.tsv)
         // Names learned in any session (game references, runtime hashing, code strings) are kept so unloaded areas
         // and later sessions resolve the same ids. Only names whose FNV hash equals the id are ever stored.
-        static bool namesDirty, namesLoaded; static float namesSaveAt;
+        static bool namesDirty, namesLoaded, namesLoadFailed; static float namesSaveAt;
         static string NamesPath { get { return System.IO.Path.Combine(System.IO.Path.Combine(System.IO.Path.GetDirectoryName(Application.dataPath), "_mod"), "wwise_names.tsv"); } }
         public static void LoadNames()
         {
@@ -288,7 +359,7 @@ namespace InsideDev
                 foreach (var line in System.IO.File.ReadAllLines(NamesPath))
                 {
                     var p = line.Split('\t'); uint id;
-                    if (p.Length < 2 || !uint.TryParse(p[0], out id) || Hash(p[1]) != id) continue;
+                    if (p.Length < 2 || !uint.TryParse(p[0], System.Globalization.NumberStyles.Integer, Fmt.IC, out id) || Hash(p[1]) != id) continue;
                     IdSource src = IdSource.Persisted;
                     if (p.Length > 2) { try { src = (IdSource)Enum.Parse(typeof(IdSource), p[2]); } catch { } }
                     IdName cur;
@@ -296,17 +367,22 @@ namespace InsideDev
                 }
                 DevLog.Write("[audio] " + n + " names from wwise_names.tsv");
             }
-            catch (Exception e) { DevLog.Error("names load", e); }
+            catch (Exception e)
+            {
+                // the file stays as it is: a save now would keep only the names of this session
+                namesLoadFailed = true;
+                DevLog.Error("names load (wwise_names.tsv is left untouched for this session)", e);
+            }
         }
         static void SaveNamesMaybe()
         {
-            if (!namesDirty || Time.realtimeSinceStartup < namesSaveAt) return;
+            if (!namesDirty || !namesLoaded || namesLoadFailed || Time.realtimeSinceStartup < namesSaveAt) return;
             namesDirty = false; namesSaveAt = Time.realtimeSinceStartup + 30f;
             try
             {
-                var sb = new StringBuilder();
-                foreach (var kv in ids) if (Hash(kv.Value.name) == kv.Key) sb.Append(kv.Key).Append('\t').Append(kv.Value.name).Append('\t').Append(kv.Value.src).Append('\n');
-                System.IO.File.WriteAllText(NamesPath, sb.ToString());
+                var sb = new StringBuilder(ids.Count * 32);
+                foreach (var kv in ids) if (Hash(kv.Value.name) == kv.Key) sb.Append(kv.Key.ToString(Fmt.IC)).Append('\t').Append(kv.Value.name).Append('\t').Append(kv.Value.src).Append('\n');
+                SafeFile.WriteAllText(NamesPath, sb.ToString());
             }
             catch (Exception e) { DevLog.Error("names save", e); }
         }
@@ -341,7 +417,7 @@ namespace InsideDev
             return u != null ? u.name : "go#" + (int)id;
         }
         // Wwise game object id = Unity instance id. The object database only scans while the editor is open, so
-        // misses fall back to a map of live AkGameObj emitters, rebuilt at most every 5 s (or after streaming).
+        // misses fall back to a map of live AkGameObj emitters, rebuilt at most every 30 s (or after streaming).
         static readonly Dictionary<int, GameObject> emitters = new Dictionary<int, GameObject>();
         static float emittersAt = -100f; static int emittersStream = -1;
         public static GameObject Unity(uint id)
@@ -386,7 +462,7 @@ namespace InsideDev
             kindNames[RTPC] = "RTPC"; kindNames[RTPCPID] = "RTPC/PID"; kindNames[RTPCRESET] = "RTPC RESET"; kindNames[SWITCH] = "SWITCH"; kindNames[TRIGGER] = "WWISE TRIGGER";
             kindNames[STATE] = "STATE"; kindNames[REGISTER] = "REGISTER"; kindNames[UNREGISTER] = "UNREGISTER"; kindNames[SETPOS] = "POSITION"; kindNames[LISTENER] = "LISTENER";
             kindNames[LOADBANK] = "BANK LOAD"; kindNames[UNLOADBANK] = "BANK UNLOAD"; kindNames[PREPARE] = "PREPARE"; kindNames[CANCELCB] = "CANCEL CB"; kindNames[CALLBACK] = "CALLBACK";
-            kindNames[CBINIT] = "CB INIT"; kindNames[IDSTR] = "ID"; kindNames[PREPSYNC] = "PREPARE SYNCS";
+            kindNames[CBINIT] = "CB INIT"; kindNames[IDSTR] = "ID"; kindNames[PREPSYNC] = "PREPARE SYNCS"; kindNames[GAP] = "TRACE GAP";
         }
         public static string Kind(int t) { return t >= 0 && t < kindNames.Length && kindNames[t] != null ? kindNames[t] : "#" + t; }
 
@@ -394,6 +470,7 @@ namespace InsideDev
         {
             if (e.text != null && !raw) return e.text;
             var r = e.r; var sb = new StringBuilder();
+            if (r.type == GAP) { e.text = r.name ?? ""; return e.text; }
             string on = " on " + ObjName(r.gameObj) + (raw ? " [go " + r.gameObj + "]" : "");
             switch (r.type)
             {
@@ -403,17 +480,17 @@ namespace InsideDev
                     if (r.cbType != 0) sb.Append("  callbacks ").Append(CbFlags(r.cbType));
                     break;
                 case EXEC: sb.Append(r.name ?? Name(r.eventId)).Append(" action ").Append(r.groupId).Append(on).Append(" ").Append(r.i1).Append(" ms"); break;
-                case SEEK: sb.Append(r.name ?? Name(r.eventId)).Append(on).Append(" to ").Append(r.i1 != 0 ? r.i1 + " ms" : (r.fvalue * 100).ToString("0.#") + "%"); break;
+                case SEEK: sb.Append(r.name ?? Name(r.eventId)).Append(on).Append(" to ").Append(r.i1 != 0 ? r.i1 + " ms" : Fmt.F(r.fvalue * 100, "0.#") + "%"); break;
                 case STOPALL: sb.Append(r.gameObj != 0 || r.api == 0 ? ObjName(r.gameObj) : "everything"); break;
                 case STOPPID: sb.Append("playing ").Append(r.playingId).Append(PlayName(r.playingId)).Append(" fade ").Append(r.i1).Append(" ms"); break;
-                case RTPC: case RTPCRESET: sb.Append(r.name ?? Name(r.groupId)).Append(" = ").Append(r.type == RTPCRESET ? "default" : r.fvalue.ToString("0.###")).Append(r.gameObj != 0 ? on : " (global)"); if (r.i1 != 0) sb.Append(" over ").Append(r.i1).Append(" ms"); break;
-                case RTPCPID: sb.Append(r.name ?? Name(r.groupId)).Append(" = ").Append(r.fvalue.ToString("0.###")).Append(" for playing ").Append(r.playingId); break;
+                case RTPC: case RTPCRESET: sb.Append(r.name ?? Name(r.groupId)).Append(" = ").Append(r.type == RTPCRESET ? "default" : Fmt.F(r.fvalue, "0.###")).Append(r.gameObj != 0 ? on : " (global)"); if (r.i1 != 0) sb.Append(" over ").Append(r.i1).Append(" ms"); break;
+                case RTPCPID: sb.Append(r.name ?? Name(r.groupId)).Append(" = ").AppendF(r.fvalue, "0.###").Append(" for playing ").Append(r.playingId); break;
                 case SWITCH: sb.Append(r.name ?? (Name(r.groupId) + " = " + Name(r.valueId))).Append(on); break;
                 case TRIGGER: sb.Append(r.name ?? Name(r.groupId)).Append(on); break;
                 case STATE: sb.Append(r.name ?? (Name(r.groupId) + " = " + Name(r.valueId))); break;
                 case REGISTER: sb.Append(r.name ?? ObjName(r.gameObj)).Append(raw ? " [go " + r.gameObj + "]" : ""); break;
                 case UNREGISTER: sb.Append(ObjName(r.gameObj)); break;
-                case SETPOS: case LISTENER: sb.Append(ObjName(r.gameObj)).Append(" ").Append(r.pos.ToString("F1")); break;
+                case SETPOS: case LISTENER: sb.Append(ObjName(r.gameObj)).Append(" ").Append(Fmt.V3(r.pos, "F1")); break;
                 case LOADBANK: case UNLOADBANK: sb.Append(r.name ?? Name(r.bankId)).Append(r.bankId != 0 ? " (bank " + r.bankId + ")" : "").Append(" result ").Append(r.ret); break;
                 case PREPARE: case PREPSYNC: sb.Append(r.groupId == 0 ? "load " : "unload ").Append(r.i2).Append(" item(s)").Append(r.valueId != 0 ? " first " + Name(r.valueId) : "").Append(" result ").Append(r.ret); break;
                 case CALLBACK:
@@ -427,7 +504,7 @@ namespace InsideDev
                 default: sb.Append("type ").Append(r.type); break;
             }
             if (e.count > 1) sb.Append("   (x").Append(e.count).Append(')');
-            if (raw) sb.Append("   {api ").Append(r.api).Append(" thr ").Append(r.thread).Append(" ev ").Append(r.eventId).Append(" pid ").Append(r.playingId).Append(" grp ").Append(r.groupId).Append(" val ").Append(r.valueId).Append(" f ").Append(r.fvalue).Append(" ret ").Append(r.ret).Append(" cookie 0x").Append(r.cookie.ToString("X")).Append('}');
+            if (raw) sb.Append("   {api ").Append(r.api).Append(" thr ").Append(r.thread).Append(" ev ").Append(r.eventId).Append(" pid ").Append(r.playingId).Append(" grp ").Append(r.groupId).Append(" val ").Append(r.valueId).Append(" f ").Append(Fmt.F(r.fvalue, "R")).Append(" ret ").Append(r.ret).Append(" cookie 0x").Append(r.cookie.ToString("X")).Append('}');
             var s = sb.ToString();
             if (!raw) e.text = s;
             return s;
@@ -443,7 +520,22 @@ namespace InsideDev
         public static string Status()
         {
             if (!WwiseNative.Available) return "native tracer: " + (WwiseNative.Problem.Length > 0 ? WwiseNative.Problem : "not connected");
-            return posts + " posts (" + failedPosts + " failed), " + plays.Count + " playing ids tracked, " + callbacks + " callbacks, " + objs.Count + " game objects, " + banks.Count + " banks, " + KnownIds + " named ids, " + unknownIds.Count + " unknown ids";
+            bool wasAwake = awake;
+            if (!wasAwake) Want(30f);
+            string s = posts + " posts (" + failedPosts + " failed), " + plays.Count + " playing ids tracked, " + callbacks + " callbacks, " + objs.Count + " game objects, " + banks.Count + " banks, " + KnownIds + " named ids, " + unknownIds.Count + " unknown ids";
+            if (!wasAwake) s += "; the trace was asleep (nobody used the audio tools): collecting from now, try again in a moment";
+            else if (gaps > 0) s += "; slept " + gaps + " time(s), " + Fmt.F(sleptSeconds, "0") + " s in total: calls and switch / state / bank changes of that time were not seen (" + ConfigKey + "=1 keeps the trace on)";
+            return s;
+        }
+
+        // the same as one JSON line
+        public static string StatusJson()
+        {
+            bool wasAwake = awake;
+            if (!wasAwake && WwiseNative.Available) Want(30f);
+            return JsonLine.Obj("ok", WwiseNative.Available, "available", WwiseNative.Available, "problem", WwiseNative.Problem, "awake", wasAwake, "collecting", WwiseNative.Available && !wasAwake,
+                "always", keyOn, "level", WwiseNative.Level, "posts", posts, "failedPosts", failedPosts, "playingIds", plays.Count, "callbacks", callbacks, "objects", objs.Count,
+                "banks", banks.Count, "namedIds", KnownIds, "unknownIds", unknownIds.Count, "timeline", count, "gaps", gaps, "sleptSeconds", sleptSeconds);
         }
 
         public static string DescribePlay(uint pid)
@@ -455,8 +547,8 @@ namespace InsideDev
             IdName nm; if (TryName(p.eventId, out nm)) sb.Append("  name source: ").Append(nm.src);
             sb.Append("\n  emitter  ").Append(ObjName(p.gameObj)).Append(" [go ").Append((int)p.gameObj).Append("]");
             var u = Unity(p.gameObj); if (u != null) sb.Append("  ").Append(Inspector.PathOf(u.transform));
-            sb.Append("\n  posted   ").Append(p.t.ToString("0.00")).Append("s frame ").Append(p.frame);
-            sb.Append("\n  status   ").Append(p.ended ? "ENDED at " + p.endT.ToString("0.00") + "s (" + (p.endT - p.t).ToString("0.00") + " s)" : (p.cbFlags & 1) != 0 ? "PLAYING (no EndOfEvent yet)" : "POSTED (end not observable: no EndOfEvent callback requested)");
+            sb.Append("\n  posted   ").AppendF(p.t, "0.00").Append("s frame ").Append(p.frame);
+            sb.Append("\n  status   ").Append(p.ended ? "ENDED at " + Fmt.F(p.endT, "0.00") + "s (" + Fmt.F(p.endT - p.t, "0.00") + " s)" : (p.cbFlags & 1) != 0 ? "PLAYING (no EndOfEvent yet)" : "POSTED (end not observable: no EndOfEvent callback requested)");
             sb.Append("\n  caller   ").Append(p.caller ?? "unknown (no managed post seen on that frame)");
             if (p.callerProv != null) sb.Append("  [").Append(p.callerProv).Append(']');
             sb.Append("\n  context  ").Append(p.context.Length > 0 ? p.context : "(no switch/state/rtpc observed yet for this emitter)");

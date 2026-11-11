@@ -75,10 +75,15 @@ namespace InsideDev
         }
 
         // which of your edits / mods touched this property
+        static List<ChangeRecorder.Net> netNow;   // the net changes, read once per Compare
         static string Yours(GameObject go, Component comp, ChangeRecorder.PropKind kind)
         {
-            foreach (var n in ChangeRecorder.NetChanges())
-                if (n.prop.go == go && n.prop.kind == kind && (comp == null || n.prop.comp == comp)) return "CHANGED BY YOU (History)";
+            foreach (var n in netNow ?? ChangeRecorder.NetChanges())
+            {
+                // a move is recorded as position or as local position: both are the user's edit of where the object is
+                bool kindOk = n.prop.kind == kind || (kind == ChangeRecorder.PropKind.Position && n.prop.kind == ChangeRecorder.PropKind.LocalPosition);
+                if (n.prop.go == go && kindOk && (comp == null || n.prop.comp == comp)) return "CHANGED BY YOU (History)";
+            }
             int iid = go.GetInstanceID();
             foreach (var m in Mods.mods)
             {
@@ -97,6 +102,13 @@ namespace InsideDev
         }
 
         public static Result Compare(GameObject go, bool deep, bool wait)
+        {
+            netNow = ChangeRecorder.NetChanges();
+            try { return CompareNow(go, deep, wait); }
+            finally { netNow = null; }
+        }
+
+        static Result CompareNow(GameObject go, bool deep, bool wait)
         {
             var r = new Result();
             string lf, fp, why;
@@ -140,7 +152,7 @@ namespace InsideDev
             return r;
         }
 
-        static string V(Vector3 v) { return v.x.ToString("0.###") + ", " + v.y.ToString("0.###") + ", " + v.z.ToString("0.###"); }
+        static string V(Vector3 v) { return Fmt.F(v.x) + ", " + Fmt.F(v.y) + ", " + Fmt.F(v.z); }
 
         // every object below: active state against the file (the pod-lamp question: is the on/off pattern authored?)
         static void Subtree(Result r, GameObject go, LevelFile.Go fg, LevelFile.Level lv)

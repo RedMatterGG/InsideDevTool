@@ -81,7 +81,7 @@ namespace InsideDev
                     }
                 }
                 lock (infos) { foreach (var kv in map) infos[kv.Key] = kv.Value; }
-                status = map.Count + " sound files named (" + sw.Elapsed.TotalMilliseconds.ToString("0") + " ms)";
+                status = map.Count + " sound files named (" + Fmt.F(sw.Elapsed.TotalMilliseconds, "0") + " ms)";
                 state = 2;
             }
             catch (Exception e) { status = "failed: " + e.Message; state = 3; }
@@ -163,7 +163,7 @@ namespace InsideDev
             }
         }
 
-        public static string Size(long b) { return b < 0 ? "?" : b < 1024 ? b + " B" : b < 1048576 ? (b / 1024.0).ToString("0") + " KB" : (b / 1048576.0).ToString("0.0") + " MB"; }
+        public static string Size(long b) { return b < 0 ? "?" : b < 1024 ? b + " B" : b < 1048576 ? Fmt.F(b / 1024.0, "0") + " KB" : Fmt.F(b / 1048576.0, "0.0") + " MB"; }
 
         public static string Where(Info i)
         {
@@ -179,7 +179,7 @@ namespace InsideDev
         {
             var i = Get(id);
             var sb = new StringBuilder(i.File);
-            if (i.seconds >= 0) sb.Append(", ").Append(i.seconds.ToString("0.0")).Append(" s");
+            if (i.seconds >= 0) sb.Append(", ").Append(Fmt.F(i.seconds, "0.0")).Append(" s");
             sb.Append(" [").Append(i.fileMissing ? "MISSING" : i.inBank ? (i.prefetch ? "prefetch " : "bank ") + i.bank : "streamed").Append(", ").Append(Size(i.size)).Append(']');
             return sb.ToString();
         }
@@ -191,7 +191,7 @@ namespace InsideDev
             if (i.shortName != null) l.Add("    source file: " + i.shortName);
             if (i.wwisePath != null) l.Add("    Wwise object: " + i.wwisePath);
             l.Add("    " + Where(i) + ",  " + Size(i.size));
-            if (i.codec != null) l.Add("    " + i.codec + ", " + (i.channels == 1 ? "mono" : i.channels == 2 ? "stereo" : i.channels + " ch") + ", " + (i.rate / 1000.0).ToString("0.#") + " kHz" + (i.seconds >= 0 ? ", " + i.seconds.ToString("0.00") + " s" : ""));
+            if (i.codec != null) l.Add("    " + i.codec + ", " + (i.channels == 1 ? "mono" : i.channels == 2 ? "stereo" : i.channels + " ch") + ", " + Fmt.F(i.rate / 1000.0, "0.#") + " kHz" + (i.seconds >= 0 ? ", " + Fmt.F(i.seconds, "0.00") + " s" : ""));
             if (i.error != null) l.Add("    header: " + i.error);
             return l;
         }

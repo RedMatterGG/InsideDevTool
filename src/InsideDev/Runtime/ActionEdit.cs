@@ -102,6 +102,7 @@ namespace InsideDev
             string msg = f.gameObject.name + "/" + f.FsmName + " [" + state + "] " + a.GetType().Name + "." + field + " = " + Show(newVal) + "  (was " + Show(oldVal) + ")";
             DevLog.Write("[fsm] " + msg);
             ChangeRecorder.Action(f.gameObject, "fsmAction", f.FsmName, state + "|" + index + "|" + field + "|" + value, source);
+            Mods.actionOk = true;
             return msg;
         }
 
@@ -165,7 +166,7 @@ namespace InsideDev
         {
             var p = (arg ?? "").Split(new[] { '|' }, 4);
             if (p.Length < 4) return "bad action edit '" + arg + "' (want state|index|field|value)";
-            int idx; if (!int.TryParse(p[1], out idx)) return "bad action index " + p[1];
+            int idx; if (!Fmt.TryI(p[1], out idx)) return "bad action index " + p[1];
             return Set(f, p[0], idx, p[2], p[3], source);
         }
 

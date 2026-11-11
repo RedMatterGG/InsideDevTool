@@ -333,7 +333,7 @@ namespace InsideDev
             }
             return null;
         }
-        static string Pct(float v, bool rel) { return rel ? (v * 100f).ToString("0") + "%" : (v / 1000f).ToString("0.##") + " s"; }
+        static string Pct(float v, bool rel) { return rel ? Fmt.F(v * 100f, "0") + "%" : Fmt.F(v / 1000f, "0.##") + " s"; }
 
         public static IEnumerable<Node> ActionsOf(Node ev)
         {
@@ -407,7 +407,7 @@ namespace InsideDev
         public static string Summary()
         {
             var sb = new StringBuilder();
-            sb.Append(nodes.Count).Append(" objects in ").Append(banks.Count).Append(" banks (").Append(loadMs.ToString("0")).Append(" ms); ");
+            sb.Append(nodes.Count).Append(" objects in ").Append(banks.Count).Append(" banks (").Append(Fmt.F(loadMs, "0")).Append(" ms); ");
             int ev = 0, snd = 0, mus = 0; foreach (var n in nodes.Values) { if (n.type == HType.Event) ev++; else if (n.type == HType.Sound) snd++; else if (n.type >= HType.MusicSegment && n.type <= HType.MusicRanSeq) mus++; }
             sb.Append(ev).Append(" events, ").Append(snd).Append(" sounds, ").Append(mus).Append(" music nodes, ").Append(mediaUsers.Count).Append(" media ids, ")
               .Append(stateGroups.Count).Append(" state groups, ").Append(switchGroups.Count).Append(" switch groups, ").Append(rtpcs.Count).Append(" RTPCs");

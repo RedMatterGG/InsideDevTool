@@ -52,8 +52,30 @@ namespace InsideDev
         static volatile bool bankThreadDone; static bool started, built; static int streamSeen = -1;
         static Exception bankError;
 
+        // The audio scanners (this database, the sound library, the deep reference scan) work while an audio tool is in
+        // use: the editor is open, a command or client was active in the last seconds, or a panel / command asked with
+        // Use(). editor.cfg audio.scan = 1 keeps them on all the time (the references of every area you walk through
+        // are then recorded with the editor closed, as before 0.11.0).
+        public const string ConfigKey = "audio.scan";
+        static bool keyOn, keyRead; static float keyReadAt = -100f;
+        public static bool ScanWanted
+        {
+            get
+            {
+                float now = Time.realtimeSinceStartup;
+                if (!keyRead || now - keyReadAt >= 1f) { keyRead = true; keyReadAt = now; try { keyOn = EditorState.Get(ConfigKey, false); } catch { } }
+                return keyOn || Background.WantedOrInUse(Background.Audio);
+            }
+        }
+        public static bool Always { get { return keyOn; } }
+        // main thread: a panel or command reads the audio database (keeps the scanners running for a minute)
+        public static void Use() { Background.Want(Background.Audio, 60f); }
+        // true while the first data is still being collected (bank scan not finished)
+        public static bool Collecting { get { return !built; } }
+
         public static void Tick()
         {
+            if (!ScanWanted) return;
             if (!started)
             {
                 started = true;
@@ -77,9 +99,9 @@ namespace InsideDev
                 if (bankError == null) AudioMedia.EnsureStarted();
             }
             HarvestStep();
-            // new areas streamed in: give the object database (and with it the sound library) a pass so the game
-            // references of the new area get recorded even while the editor is closed
-            if (Levels.Changed(ref streamSeen, 2f)) ObjectDatabase.Demand(20f);
+            // new areas streamed in (also while the scanners slept): give the object database (and with it the sound
+            // library) a pass so the game references of the new area get recorded
+            if (Levels.Changed(ref streamSeen, 2f)) ObjectDatabase.DemandQuiet(20f);
             SyncRefs();
         }
 
@@ -137,7 +159,20 @@ namespace InsideDev
 
         // ---------------------------------------------------------------- game references (persisted per area)
         static string RefsPath { get { return Path.Combine(Path.Combine(Path.GetDirectoryName(Application.dataPath), "_mod"), "audio_refs.tsv"); } }
-        static bool refsDirty, needRebuild; static float refsSaveAt, lastRebuild; static int refsSeenVersion = -1; static float refsSyncAt;
+        static bool refsDirty, needRebuild, refsLoadFailed; static float refsSaveAt, lastRebuild; static int refsSeenVersion = -1; static float refsSyncAt;
+
+        // "animation event: clip 'x' @1,25s f()" written by a build that formatted the time with the Windows language:
+        // the same reference is "@1.25s" now, so old rows are read as that and do not come back as duplicates
+        static string NormalWhere(string w)
+        {
+            if (!w.StartsWith("animation event:", StringComparison.Ordinal)) return w;
+            int at = w.LastIndexOf("' @", StringComparison.Ordinal);
+            if (at < 0) return w;
+            int i = at + 3, comma = -1;
+            while (i < w.Length && (char.IsDigit(w[i]) || w[i] == ',' || w[i] == '.' || w[i] == '-')) { if (w[i] == ',') comma = comma < 0 ? i : -2; i++; }
+            if (comma < 0 || i >= w.Length || w[i] != 's') return w;
+            return w.Substring(0, comma) + "." + w.Substring(comma + 1);
+        }
 
         static void LoadRefs()
         {
@@ -148,13 +183,18 @@ namespace InsideDev
                 {
                     var p = line.Split('\t');
                     if (p.Length < 5) continue;
-                    var r = new Ref { area = p[0], path = p[1], where = p[2], prov = p[3], eventName = p[4], eventId = AudioTrace.Hash(p[4]) };
+                    var r = new Ref { area = p[0], path = p[1], where = NormalWhere(p[2]), prov = p[3], eventName = p[4], eventId = AudioTrace.Hash(p[4]) };
                     refs[Key(r.area, r.path, r.where, r.eventName)] = r;
                     AudioTrace.Learn(r.eventId, r.eventName, AudioTrace.IdSource.GameReference);
                 }
                 DevLog.Write("[audio db] " + refs.Count + " game references from audio_refs.tsv");
             }
-            catch (Exception e) { DevLog.Error("audio refs load", e); }
+            catch (Exception e)
+            {
+                // the file stays as it is: a save now would keep only what this session sees
+                refsLoadFailed = true;
+                DevLog.Error("audio refs load (audio_refs.tsv is left untouched for this session)", e);
+            }
         }
 
         // merge the live SoundLibrary into the persisted reference table (every 2 s at most)
@@ -162,7 +202,7 @@ namespace InsideDev
         {
             if (Time.realtimeSinceStartup < refsSyncAt) return;
             refsSyncAt = Time.realtimeSinceStartup + 2f;
-            int lv = SoundLibrary.defs.Count * 7919 + SoundLibrary.scannedObjects;
+            int lv = SoundLibrary.Version;
             bool changed = false;
             if (lv != refsSeenVersion)
             {
@@ -187,14 +227,14 @@ namespace InsideDev
             if (noteChanged) { noteChanged = false; changed = true; }
             if (changed) { refsDirty = true; needRebuild = true; }
             if (needRebuild && built && Time.realtimeSinceStartup - lastRebuild > 10f) { needRebuild = false; lastRebuild = Time.realtimeSinceStartup; Rebuild(); }
-            if (refsDirty && Time.realtimeSinceStartup > refsSaveAt)
+            if (refsDirty && !refsLoadFailed && Time.realtimeSinceStartup > refsSaveAt)
             {
                 refsDirty = false; refsSaveAt = Time.realtimeSinceStartup + 30f;
                 try
                 {
-                    var sb = new StringBuilder();
+                    var sb = new StringBuilder(refs.Count * 96);
                     foreach (var r in refs.Values) sb.Append(r.area).Append('\t').Append(r.path).Append('\t').Append(r.where).Append('\t').Append(r.prov).Append('\t').Append(r.eventName).Append('\n');
-                    File.WriteAllText(RefsPath, sb.ToString());
+                    SafeFile.WriteAllText(RefsPath, sb.ToString());
                 }
                 catch (Exception e) { DevLog.Error("audio refs save", e); }
             }
@@ -247,8 +287,7 @@ namespace InsideDev
                         {
                             if (t == null) continue;
                             const BindingFlags F = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
-                            foreach (var m in t.GetMethods(F)) harvestQueue.Add(m);
-                            foreach (var c in t.GetConstructors(F)) harvestQueue.Add(c);
+                            try { foreach (var m in t.GetMethods(F)) harvestQueue.Add(m); foreach (var c in t.GetConstructors(F)) harvestQueue.Add(c); } catch { }
                         }
                     }
                 }
@@ -308,7 +347,16 @@ namespace InsideDev
         public static bool BankLoaded(string bankName)
         {
             if (bankName == null) return false;
-            foreach (var b in AudioTrace.banks.Values) if ((b.name != null && b.name.StartsWith(bankName, StringComparison.OrdinalIgnoreCase)) || b.id == AudioTrace.Hash(bankName)) return b.status == "LOADED";
+            // by id first, then the exact name with or without ".bnk"; a bank whose name only starts the same is another bank
+            AudioTrace.Bank hit;
+            if (AudioTrace.banks.TryGetValue(AudioTrace.Hash(bankName), out hit)) return hit.status == "LOADED";
+            foreach (var b in AudioTrace.banks.Values)
+            {
+                if (b.name == null) continue;
+                if (string.Equals(b.name, bankName, StringComparison.OrdinalIgnoreCase) ||
+                    (b.name.Length == bankName.Length + 4 && b.name.StartsWith(bankName, StringComparison.OrdinalIgnoreCase) && b.name.EndsWith(".bnk", StringComparison.OrdinalIgnoreCase)))
+                    return b.status == "LOADED";
+            }
             return false;
         }
 
@@ -360,9 +408,10 @@ namespace InsideDev
 
         public static List<Rec> Query(Filter f, string text, int max)
         {
+            Use();
             var res = new List<Rec>();
             string q = (text ?? "").Trim().ToLowerInvariant();
-            uint qid; bool isId = uint.TryParse(q.TrimStart('#'), out qid);
+            uint qid; bool isId = uint.TryParse(q.TrimStart('#'), System.Globalization.NumberStyles.Integer, Fmt.IC, out qid);
             foreach (var r in recs)
             {
                 if (!Pass(r, f)) continue;
@@ -383,6 +432,7 @@ namespace InsideDev
         // ---------------------------------------------------------------- the three questions (spec 79-81)
         public static string Describe(Rec r)
         {
+            Use();
             var sb = new StringBuilder();
             IdName(sb, r);
             sb.Append("STATUS  ").Append(Status(r)).Append('\n');
@@ -557,16 +607,36 @@ namespace InsideDev
 
         public static Rec Find(string q)
         {
+            Use();
             uint id;
-            if (uint.TryParse(q.TrimStart('#'), out id)) { Rec r; if (byId.TryGetValue(id, out r)) return r; }
+            if (uint.TryParse(q.TrimStart('#'), System.Globalization.NumberStyles.Integer, Fmt.IC, out id)) { Rec r; if (byId.TryGetValue(id, out r)) return r; }
             uint h = AudioTrace.Hash(q);
             Rec x; if (byId.TryGetValue(h, out x)) return x;
             foreach (var r in recs) if (string.Equals(r.Name, q, StringComparison.OrdinalIgnoreCase)) return r;
             return null;
         }
 
+        // one JSON line with the counts of Stats()
+        public static string StatsJson()
+        {
+            Use();
+            int ev = 0, named = 0, withRefs = 0, posted = 0, missing = 0, unref = 0;
+            foreach (var r in recs)
+                if (r.kind == Kind.Event)
+                {
+                    ev++; AudioTrace.IdName nm; if (r.name != null || AudioTrace.TryName(r.id, out nm)) named++;
+                    if (r.refs.Count > 0) withRefs++; if (AudioTrace.evStats.ContainsKey(r.id)) posted++; if (r.node == null) missing++;
+                    if (Pass(r, Filter.Unreferenced)) unref++;
+                }
+            return JsonLine.Obj("ok", true, "built", built, "collecting", !built, "always", keyOn, "status", status, "records", recs.Count, "events", ev, "named", named, "withReferences", withRefs,
+                "posted", posted, "notInBanks", missing, "unreferenced", unref, "gameReferences", refs.Count, "loadedReferences", CountLoadedRefs(),
+                "refScanPasses", AudioRefScan.passes, "refScanStatus", AudioRefScan.status, "codeStringsDone", harvestDone, "codeStrings", harvested, "version", Version);
+        }
+
         public static string Stats()
         {
+            Use();
+            if (!built) return "AUDIO DB  " + status + "\n  collecting (the audio scanners only run while an audio tool is in use): try again in a moment";
             int ev = 0, named = 0, withRefs = 0, posted = 0, missing = 0;
             foreach (var r in recs)
                 if (r.kind == Kind.Event)

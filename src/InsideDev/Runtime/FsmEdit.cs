@@ -82,6 +82,7 @@ namespace InsideDev
             string msg = Label(f) + (global ? " global" : " [" + state + "]") + ": " + what;
             DevLog.Write("[fsm] " + msg);
             ChangeRecorder.Action(f.gameObject, "fsmWire", f.FsmName, state + "|" + ev + "|" + toState, source);
+            Mods.actionOk = true;
             return msg;
         }
 
@@ -92,15 +93,16 @@ namespace InsideDev
             FsmState st = null;
             if (!global) { st = State(f, state); if (st == null) return "FSM " + Label(f) + " has no state '" + state + "'"; }
             var arr = global ? f.FsmGlobalTransitions : st.Transitions;
-            if (arr == null) return "nothing to remove";
+            if (arr == null) { Mods.actionOk = true; return "nothing to remove"; }
             var list = new List<FsmTransition>(arr);
             int n = list.RemoveAll(t => t != null && t.EventName == ev);
-            if (n == 0) return (global ? "global" : "[" + state + "]") + " has no exit on '" + ev + "'";
+            if (n == 0) { Mods.actionOk = true; return (global ? "global" : "[" + state + "]") + " has no exit on '" + ev + "'"; }   // already as wanted
             Remember(f);
             if (global) f.Fsm.GlobalTransitions = list.ToArray(); else st.Transitions = list.ToArray();
             string msg = Label(f) + (global ? " global" : " [" + state + "]") + ": removed exit on '" + ev + "'";
             DevLog.Write("[fsm] " + msg);
             ChangeRecorder.Action(f.gameObject, "fsmWire", f.FsmName, state + "|" + ev + "|", source);
+            Mods.actionOk = true;
             return msg;
         }
 

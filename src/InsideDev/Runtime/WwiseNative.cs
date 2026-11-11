@@ -62,15 +62,20 @@ namespace InsideDev
                 pRuleClear = F<D_None>(GetProcAddress(m, "WT_RuleClear"));
                 pRuleAdd = F<D_Rule>(GetProcAddress(m, "WT_RuleAdd"));
                 pRuleStats = F<D_Buf>(GetProcAddress(m, "WT_RuleStats"));
+                // a version.dll of another build can have WT_Version and lack the rest: never call through a null entry
+                if (pSetFrame == null || pDrain == null || pStats == null) { Problem = "version.dll tracer is incomplete (files of two builds mixed - replace version.dll and restart)"; return false; }
                 NativeVersion = pVersion();
                 buf = Marshal.AllocHGlobal(RecSize * Batch);
                 sbuf = Marshal.AllocHGlobal(512);
                 info = Marshal.AllocHGlobal(64);
                 QueryPerformanceFrequency(out qpcFreq);
                 Available = true;
-                DevLog.Write("[WWISE] native tracer v" + NativeVersion + " connected; " + Stats().Summary());
+                string summary;
+                try { summary = Stats().Summary(); }
+                catch (Exception e) { Available = false; Problem = "version.dll tracer does not answer: " + e.Message; return false; }
+                DevLog.Write("[WWISE] native tracer v" + NativeVersion + " connected; " + summary);
             }
-            catch (Exception e) { Problem = e.Message; DevLog.Error("WwiseNative.Init", e); }
+            catch (Exception e) { Available = false; Problem = e.Message; DevLog.Error("WwiseNative.Init", e); }
             return Available;
         }
 
@@ -90,12 +95,36 @@ namespace InsideDev
             var v = new long[6];
             if (!Available || pRuleStats == null) return v;
             int n = pRuleStats(sbuf, 6);
-            Marshal.Copy(sbuf, v, 0, Math.Min(n, 6));
+            Marshal.Copy(sbuf, v, 0, Math.Max(0, Math.Min(n, 6)));
             return v;
         }
 
-        public static int SetLevel(int l) { return Available && pSetLevel != null ? pSetLevel(l) : -1; }
-        public static int Level { get { return Available ? (int)Stats().level : 0; } }
+        // Telemetry level of the tracer in version.dll: 0 counts only (a hooked call costs a compare), 1 normal,
+        // 2 + positions, 3 raw. While nobody reads the trace (SetTracing(false)) the native level is 0 and the level
+        // the user chose is kept here and put back when tracing resumes.
+        static bool tracing = true;
+        static int userLevel = -1;
+        public static bool Tracing { get { return tracing; } }
+
+        public static void SetTracing(bool on)
+        {
+            if (on == tracing) return;
+            tracing = on;
+            if (!Available || pSetLevel == null) return;
+            if (!on) { int was = pSetLevel(0); if (was >= 0 && was <= 3) userLevel = was; }
+            else pSetLevel(userLevel >= 0 ? userLevel : 1);
+        }
+
+        // returns the level that was set before
+        public static int SetLevel(int l)
+        {
+            if (!Available || pSetLevel == null) return -1;
+            if (tracing) return pSetLevel(l);
+            int old = userLevel >= 0 ? userLevel : 1;
+            if (l >= 0 && l <= 3) userLevel = l;
+            return old;
+        }
+        public static int Level { get { return !Available ? 0 : tracing ? (int)Stats().level : (userLevel >= 0 ? userLevel : 1); } }
 
         public struct NativeStats
         {
@@ -113,7 +142,7 @@ namespace InsideDev
             if (!Available) return s;
             int n = pStats(sbuf, 16);
             long[] v = new long[16];
-            Marshal.Copy(sbuf, v, 0, Math.Min(n, 16));
+            Marshal.Copy(sbuf, v, 0, Math.Max(0, Math.Min(n, 16)));
             s.total = v[0]; s.head = v[1]; s.tail = v[2]; s.dropped = v[3]; s.resolvedAll = v[4]; s.resolvedHooked = v[5]; s.level = v[6];
             s.akBase = v[7]; s.akSize = v[8]; s.akStamp = v[9]; s.akExports = v[10]; s.render = v[11]; s.cbItems = v[12]; s.cbBad = v[13]; s.hookCount = v[14]; s.enabled = v[15];
             return s;
@@ -121,7 +150,7 @@ namespace InsideDev
 
         public static string ModulePath()
         {
-            if (!Available) return "";
+            if (!Available || pPath == null) return "";
             pPath(sbuf, 512);
             return Marshal.PtrToStringAnsi(sbuf) ?? "";
         }
@@ -130,7 +159,7 @@ namespace InsideDev
         public static bool GetHook(int i, out HookInfo h)
         {
             h = new HookInfo();
-            if (!Available || pHook(i, sbuf, 512, info) == 0) return false;
+            if (!Available || pHook == null || pHook(i, sbuf, 512, info) == 0) return false;
             h.name = Marshal.PtrToStringAnsi(sbuf);
             h.resolved = Marshal.ReadInt64(info, 0) != 0; h.calls = Marshal.ReadInt64(info, 8);
             h.orig = Marshal.ReadInt64(info, 16); h.wrapper = Marshal.ReadInt64(info, 24);
@@ -139,7 +168,7 @@ namespace InsideDev
         public static bool GetExport(int i, out string name, out long addr)
         {
             name = null; addr = 0;
-            if (!Available || pExport(i, sbuf, 512, info) == 0) return false;
+            if (!Available || pExport == null || pExport(i, sbuf, 512, info) == 0) return false;
             name = Marshal.PtrToStringAnsi(sbuf); addr = Marshal.ReadInt64(info, 0);
             return true;
         }
@@ -196,7 +225,7 @@ namespace InsideDev
         {
             int len = 0, h = unchecked((int)2166136261);
             while (len < max && s[len] != '\0') { h = (h ^ s[len]) * 16777619; len++; }
-            if (len == max) return Marshal.PtrToStringUni(new IntPtr(s));
+            if (len == max) return new string(s, 0, max);   // no terminator inside the record's field: never read past it
             h = (h ^ len) * 16777619;
             string cached;
             if (nameCache.TryGetValue(h, out cached))

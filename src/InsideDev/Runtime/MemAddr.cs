@@ -145,7 +145,7 @@ namespace InsideDev
                 if (tr != null && b.native != 0)
                 {
                     int po = TransformPosOffset(tr);
-                    if (po >= 0) b.rows.Add(new Row { name = "localPosition (native)", ceType = "Float x3", value = tr.localPosition.ToString("F3"), addr = b.native + po, offset = po, size = 12 });
+                    if (po >= 0) b.rows.Add(new Row { name = "localPosition (native)", ceType = "Float x3", value = Fmt.V3(tr.localPosition, "F3"), addr = b.native + po, offset = po, size = 12 });
                     else b.rows.Add(new Row { name = "localPosition (native)", ceType = "-", value = "offset not found", addr = 0 });
                 }
                 res.Add(b);
@@ -181,6 +181,8 @@ namespace InsideDev
             owner = null;
             if (!Ready) return "memory addresses are off: " + status;
             string best = null; long bestDist = long.MaxValue;
+            // the Cheat Engine link works with the editor closed, when the database is asleep: one pass now
+            ObjectDatabase.EnsureFresh(5f);
             foreach (var r in ObjectDatabase.all)
             {
                 if (r.go == null) continue;

@@ -90,13 +90,14 @@ namespace InsideDev
             var sm = SM; if (sm == null) return "no SignalManager";
             if (f == null || sender == null) return "missing FSM or sender";
             if (string.IsNullOrEmpty(outName) || string.IsNullOrEmpty(inName)) return "missing signal name";
-            foreach (var c in Incoming(f)) if (c.signalOutGameObject == sender && c.signalOutName == outName && c.signalInName == inName) return "already connected: " + sender.name + "." + outName + " -> " + inName;
+            foreach (var c in Incoming(f)) if (c.signalOutGameObject == sender && c.signalOutName == outName && c.signalInName == inName) { Mods.actionOk = true; return "already connected: " + sender.name + "." + outName + " -> " + inName; }
             var con = sm.CreateConnection(sender, outName, f.gameObject, inName, f);
             if (con == null) return "the game refused the connection (connection table full?)";
             string msg = sender.name + "." + outName + " -> " + f.gameObject.name + "/" + f.FsmName + "." + inName + (con.isConnected ? "" : "  (waiting: " + sender.name + " has not created that signal yet - it links when the object wakes up)");
             DevLog.Write("[signal] connected " + msg);
             Note(f, true, sender, outName, inName);
             ChangeRecorder.Action(f.gameObject, "sigWire", f.FsmName, "+|" + inName + "|" + outName + "|" + ObjectSelector.From(sender), source);
+            Mods.actionOk = true;
             return "connected " + msg;
         }
 
@@ -120,6 +121,7 @@ namespace InsideDev
             DevLog.Write("[signal] disconnected " + msg);
             Note(f, false, sender, outName, inName);
             if (f != null && sender != null) ChangeRecorder.Action(f.gameObject, "sigWire", f.FsmName, "-|" + inName + "|" + outName + "|" + ObjectSelector.From(sender), source);
+            Mods.actionOk = true;
             return "disconnected " + msg;
         }
 
@@ -132,6 +134,7 @@ namespace InsideDev
             if (senders.Count == 0) return "sender not loaded: " + p[3];
             if (p[0] == "+") return Connect(f, senders[0], p[2], p[1], source);
             foreach (var c in Incoming(f)) if (c.signalOutGameObject == senders[0] && c.signalOutName == p[2] && c.signalInName == p[1]) return Disconnect(f, c, source);
+            Mods.actionOk = true;   // nothing to take away: already as the mod wants it
             return "no such connection";
         }
 

@@ -49,8 +49,13 @@ namespace InsideDev
 
         public static readonly Dictionary<string, Def> defs = new Dictionary<string, Def>(StringComparer.Ordinal);
         static readonly Dictionary<Type, FieldInfo[]> typeFields = new Dictionary<Type, FieldInfo[]>();
-        static int scannedPass = -1, cursor;
+        static int scannedPass = -1, cursor, seenChange = -1;
         static bool scanning;
+        static readonly HashSet<int> scanned = new HashSet<int>();   // GameObject ids whose fields and state machines were read
+        static float nextFullScan;
+        // moves when a binding is added or dropped (consumers merge only then)
+        public static int Version;
+        const float FullRescanEvery = 60f;
         public static float lastScanMs; static readonly System.Diagnostics.Stopwatch sw = new System.Diagnostics.Stopwatch();
         public static float budgetMs = 1f;
         public static int scannedObjects;
@@ -67,26 +72,40 @@ namespace InsideDev
         }
 
         // ---------------------------------------------------------------- scanning (incremental, frame budgeted)
+        // Each object is read once; a full pass over everything runs again once a minute (event names the game fills in
+        // after load), and nothing runs for a database pass that neither added nor removed an object.
         public static void Tick()
         {
+            if (!AudioDb.ScanWanted) return;
             if (!ObjectDatabase.Ready) return;
             if (!scanning && ObjectDatabase.completedPasses != scannedPass)
             {
                 scannedPass = ObjectDatabase.completedPasses;
+                float now = Time.realtimeSinceStartup;
+                bool full = now >= nextFullScan;
+                if (!full && ObjectDatabase.ChangeStamp == seenChange) return;
+                seenChange = ObjectDatabase.ChangeStamp;
+                if (full) { nextFullScan = now + FullRescanEvery; scanned.Clear(); }
+                else scanned.RemoveWhere(id => ObjectDatabase.Get(id) == null);
                 scanning = true; cursor = 0;
                 // drop static bindings of destroyed objects; observed ones stay as history
-                foreach (var d in defs.Values) d.bindings.RemoveAll(b => b.go == null || (b.prov != Prov.Observed && b.comp == null));
+                int dropped = 0;
+                foreach (var d in defs.Values) dropped += d.bindings.RemoveAll(b => b.go == null || (b.prov != Prov.Observed && b.comp == null));
+                if (dropped > 0) Version++;
+                if (overrides.Count > 0) overrides.RemoveAll(b => b.go == null || b.original == null);
             }
             if (!scanning) return;
             sw.Reset(); sw.Start();
             var all = ObjectDatabase.all;
-            while (cursor < all.Count && sw.Elapsed.TotalMilliseconds < budgetMs)
+            int n = 0;
+            while (cursor < all.Count)
             {
+                if ((++n & 31) == 0 && sw.Elapsed.TotalMilliseconds >= budgetMs) break;
                 var r = all[cursor++];
-                if (r.go == null) continue;
+                if (r.go == null || !scanned.Add(r.id)) continue;
                 try { ScanObject(r.go); } catch { }
-                scannedObjects = cursor;
             }
+            scannedObjects = scanned.Count;
             if (cursor >= all.Count) { scanning = false; lastScanMs = (float)sw.Elapsed.TotalMilliseconds; }
         }
 
@@ -107,10 +126,14 @@ namespace InsideDev
             return res;
         }
 
+        static readonly List<Component> scanTmp = new List<Component>(16);
         static void ScanObject(GameObject go)
         {
-            foreach (var c in go.GetComponents<MonoBehaviour>())
+            scanTmp.Clear();
+            go.GetComponents(typeof(MonoBehaviour), scanTmp);
+            for (int ci = 0; ci < scanTmp.Count; ci++)
             {
+                var c = scanTmp[ci] as MonoBehaviour;
                 if (c == null) continue;
                 var fsm = c as PlayMakerFSM;
                 if (fsm != null) { ScanFsm(fsm); continue; }
@@ -166,15 +189,19 @@ namespace InsideDev
         static void Bind(string ev, Prov prov, GameObject go, Component comp, string where, object holder, FieldInfo field, string state)
         {
             if (string.IsNullOrEmpty(ev)) return;
+            // an overridden binding now holds another event's name: it stays the binding of its original event
+            for (int i = 0; i < overrides.Count; i++) if (overrides[i].comp == comp && overrides[i].where == where) return;
             var d = Get(ev);
             foreach (var b in d.bindings) if (b.comp == comp && b.where == where) return;
             d.bindings.Add(new Binding { prov = prov, go = go, comp = comp, where = where, holder = holder, field = field, fsmState = state });
+            Version++;
         }
+        static readonly List<Binding> overrides = new List<Binding>();
 
         // ---------------------------------------------------------------- observed posts (from AudioSpy)
         public static void OnPosted(string ev, GameObject source)
         {
-            if (string.IsNullOrEmpty(ev)) return;
+            if (string.IsNullOrEmpty(ev) || !AudioDb.ScanWanted) return;
             var d = Get(ev);
             float now = Time.realtimeSinceStartup;
             d.posts++; d.lastPost = now; d.lastSource = source != null ? source.name : "global";
@@ -251,8 +278,10 @@ namespace InsideDev
         public static string Override(Binding b, string newEvent)
         {
             string cur = CurrentName(b);
-            if (b.original == null) b.original = cur;
-            if (!SetName(b, newEvent)) return "this binding can't be overridden";
+            bool first = b.original == null;
+            if (first) b.original = cur;
+            if (!SetName(b, newEvent)) { if (first) b.original = null; return "this binding can't be overridden"; }
+            if (first) overrides.Add(b);
             DevLog.Write("[audio] override " + b.go.name + " " + b.where + ": '" + cur + "' -> '" + newEvent + "'");
             return "now posts '" + newEvent + "' (was '" + b.original + "')";
         }
@@ -262,6 +291,7 @@ namespace InsideDev
             if (b.original == null) return "not overridden";
             SetName(b, b.original);
             string o = b.original; b.original = null;
+            overrides.Remove(b);
             return "reverted to '" + o + "'";
         }
 

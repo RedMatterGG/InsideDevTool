@@ -56,6 +56,7 @@ namespace InsideDev
 
         public static void Tick()
         {
+            if (!AudioDb.ScanWanted) return;   // a pass that was running waits and goes on when an audio tool is used again
             if (!AudioDb.Built || !ObjectDatabase.Ready) return;
             if (!running)
             {
@@ -68,7 +69,7 @@ namespace InsideDev
             where = "?";
             try { Step(sw); } catch (Exception e) { DevLog.Error("audio ref scan", e); End(); }
             float ms = (float)sw.Elapsed.TotalMilliseconds; passMs += ms;
-            if (ms > 8f && slowLogs++ < 20) DevLog.Write("[audio refs] slow step " + ms.ToString("0.0") + " ms in " + where + (cur != null && cur.type != null ? " (root " + cur.type.Name + ")" : ""));
+            if (ms > 8f && slowLogs++ < 20) DevLog.Write("[audio refs] slow step " + Fmt.F(ms, "0.0") + " ms in " + where + (cur != null && cur.type != null ? " (root " + cur.type.Name + ")" : ""));
         }
 
         static void Begin()
@@ -153,9 +154,24 @@ namespace InsideDev
             FinishRoot();
             running = false; passes++; lastMs = passMs;
             AudioDb.EndRefScan();
-            status = "pass " + passes + ": " + lastRefs + " references from " + lastRoots + " scripts / assets (" + lastWalked + " walked, rest cached) and " + lastClips + " clips (" + passMs.ToString("0") + " ms total, sliced)";
+            PruneCaches();
+            status = "pass " + passes + ": " + lastRefs + " references from " + lastRoots + " scripts / assets (" + lastWalked + " walked, rest cached) and " + lastClips + " clips (" + Fmt.F(passMs, "0") + " ms total, sliced)";
             DevLog.Write("[audio refs] " + status);
         }
+
+        // instance ids are new after every load: entries of scripts and clip owners that were not met for a while go
+        static void PruneCaches()
+        {
+            if (rootCache.Count > 4096)
+            {
+                pruneTmp.Clear();
+                foreach (var kv in rootCache) if (passes - kv.Value.pass > RewalkAfterPasses) pruneTmp.Add(kv.Key);
+                foreach (var k in pruneTmp) rootCache.Remove(k);
+                pruneTmp.Clear();
+            }
+            if (ownerClips.Count > 8192) ownerClips.Clear();
+        }
+        static readonly List<int> pruneTmp = new List<int>();
 
         static void FinishRoot()
         {
@@ -349,7 +365,7 @@ namespace InsideDev
                             var n = WwiseBanks.Get(h);
                             if (n == null || n.type != WwiseBanks.HType.Event) continue;
                             AudioTrace.Learn(h, s, AudioTrace.IdSource.GameReference);
-                            clipHits.Add(new Hit { id = h, ev = s, where = "animation event: clip '" + clip.name + "' @" + e.time.ToString("0.00") + "s " + e.functionName + "(" + (s == e.functionName ? "" : s) + ")" });
+                            clipHits.Add(new Hit { id = h, ev = s, where = "animation event: clip '" + clip.name + "' @" + Fmt.F(e.time, "0.00") + "s " + e.functionName + "(" + (s == e.functionName ? "" : s) + ")" });
                         }
                     }
                 clipCache[cid] = hits = clipHits.ToArray();

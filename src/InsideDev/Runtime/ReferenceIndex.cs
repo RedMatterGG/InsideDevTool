@@ -48,8 +48,11 @@ namespace InsideDev
         public static int Pending { get { return queue.Count; } }
 
         // ---------------------------------------------------------------- scheduling
+        // Runs while the tool is in use or the object features were asked for; a sleeping index catches up with the
+        // first database pass after it wakes (Sync compares pass numbers).
         public static void Tick()
         {
+            if (!Background.WantedOrInUse(Background.Objects)) return;
             try
             {
                 if (!ObjectDatabase.Ready) return;
@@ -64,16 +67,53 @@ namespace InsideDev
         }
 
         // enqueue new objects, drop edges of objects that left the database
+        static readonly List<int> goneTmp = new List<int>();
+        static readonly HashSet<int> goneSet = new HashSet<int>();
+        static int syncedChange = -1;
         static void Sync()
         {
             BuildSignalMap();
-            var gone = new List<int>();
+            if (ObjectDatabase.ChangeStamp == syncedChange && queue.Count == 0) return;   // the pass changed nothing
+            syncedChange = ObjectDatabase.ChangeStamp;
+            var gone = goneTmp; gone.Clear();
             foreach (var id in indexedPass.Keys) if (ObjectDatabase.Get(id) == null) gone.Add(id);
-            foreach (var id in gone) Remove(id);
+            if (gone.Count > 64) RemoveMany(gone);
+            else foreach (var id in gone) Remove(id);
+            gone.Clear();
             int before = queue.Count;
             foreach (var r in ObjectDatabase.all)
                 if (r.go != null && !indexedPass.ContainsKey(r.id) && queued.Add(r.id)) queue.Enqueue(r.id);
             if (before == 0 && queue.Count > 0) { runMs = 0; }
+        }
+
+        // a level went away: one sweep over the edge lists instead of a list search per edge (a hub object with
+        // thousands of referencers made that quadratic in one frame)
+        static readonly List<int> emptyKeys = new List<int>();
+        static void RemoveMany(List<int> owners)
+        {
+            goneSet.Clear();
+            foreach (var id in owners)
+            {
+                List<RefEdge> list;
+                if (owned.TryGetValue(id, out list)) { edges -= list.Count; owned.Remove(id); goneSet.Add(id); }
+                if (indexedPass.Remove(id)) indexedObjects--;
+            }
+            if (goneSet.Count == 0) return;
+            Sweep(fwd); Sweep(rev);
+            goneSet.Clear();
+        }
+        static void Sweep(Dictionary<int, List<RefEdge>> map)
+        {
+            emptyKeys.Clear();
+            foreach (var kv in map)
+            {
+                var l = kv.Value; int w = 0;
+                for (int i = 0; i < l.Count; i++) { var e = l[i]; if (!goneSet.Contains(e.ownerGo)) l[w++] = e; }
+                if (w < l.Count) l.RemoveRange(w, l.Count - w);
+                if (w == 0) emptyKeys.Add(kv.Key);
+            }
+            foreach (var k in emptyKeys) map.Remove(k);
+            emptyKeys.Clear();
         }
 
         static void Work(float budget)
@@ -93,7 +133,7 @@ namespace InsideDev
             if (queue.Count == 0)
             {
                 fullRuns++; lastFullMs = runMs;
-                DevLog.Write("[refs] index up to date: " + indexedObjects + " objects, " + edges + " edges, " + runMs.ToString("0") + " ms total work");
+                DevLog.Write("[refs] index up to date: " + indexedObjects + " objects, " + edges + " edges, " + Fmt.F(runMs, "0") + " ms total work");
             }
         }
 
@@ -101,15 +141,24 @@ namespace InsideDev
         public static void Refresh(GameObject g)
         {
             var r = ObjectDatabase.Get(g);
-            if (r != null) Index(r);
+            if (r == null) return;
+            runGetters = true;   // the user picked this object: its singleton links may ask the game
+            try { Index(r); } finally { runGetters = false; }
         }
+        static bool runGetters;
 
         // make sure the whole index is complete now (explicit user queries such as "find referencers")
+        static int signalMapCount = -1; static object signalMapOf;
         static void BuildSignalMap()
         {
-            var map = new Dictionary<int, List<SignalConnection>>();
             SignalManager sm = null;
             try { sm = PersistentBehaviour<SignalManager>.instance; } catch { }
+            // the game's connection table only changes with level loads: same table, same number of entries, same map
+            int n = -1;
+            if (sm != null && sm.connections != null) { n = 0; foreach (var c in sm.connections) if (c != null) n++; }
+            if (n == signalMapCount && ReferenceEquals(signalMapOf, sm) && ObjectDatabase.ChangeStamp == syncedChange) return;
+            signalMapCount = n; signalMapOf = sm;
+            var map = new Dictionary<int, List<SignalConnection>>();
             if (sm != null && sm.connections != null)
                 foreach (var c in sm.connections)
                 {
@@ -124,6 +173,7 @@ namespace InsideDev
 
         public static void EnsureComplete()
         {
+            Background.Want(Background.Objects, 30f);
             ObjectDatabase.EnsureFresh(5f);
             if (ObjectDatabase.completedPasses != lastDbPass) { lastDbPass = ObjectDatabase.completedPasses; Sync(); }
             if (queue.Count > 0) Work(100000f);
@@ -213,7 +263,7 @@ namespace InsideDev
             }
             foreach (var g in groups.Values)
             {
-                var target = CodeDeps.Resolve(g[0]);
+                var target = CodeDeps.Resolve(g[0], runGetters);
                 if (target == null) continue;
                 var members = new List<string>(); var methods = new List<string>();
                 foreach (var d in g)
@@ -278,8 +328,12 @@ namespace InsideDev
             return p;
         }
 
-        static bool Interesting(Type t)
+        // can a field of this type lead to a Unity object? (primitives, strings, vectors, delegates and collections of
+        // those cannot; shared with the passive hidden scanner)
+        internal static bool Interesting(Type t)
         {
+            if (t.IsArray) return t.GetArrayRank() == 1 && Interesting(t.GetElementType());
+            if (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(List<>)) return Interesting(t.GetGenericArguments()[0]);
             if (t.IsPrimitive || t.IsEnum || t == typeof(string) || t.IsPointer) return false;
             if (typeof(Delegate).IsAssignableFrom(t)) return false;
             if (t == typeof(Vector2) || t == typeof(Vector3) || t == typeof(Vector4) || t == typeof(Quaternion) || t == typeof(Color) || t == typeof(Rect) || t == typeof(Matrix4x4) || t == typeof(Bounds)) return false;
@@ -466,20 +520,27 @@ namespace InsideDev
         }
 
         // all simple paths a -> b (forward), bounded
+        // PathsTruncated: the last search stopped at its work limit, so more paths may exist
+        public static bool PathsTruncated;
+        const int MaxPathSteps = 200000;
+        static int pathSteps;
+
         public static List<List<RefEdge>> AllPaths(int a, int b, int maxDepth, int maxPaths)
         {
             var res = new List<List<RefEdge>>();
             var stack = new List<RefEdge>();
             var onPath = new HashSet<int> { a };
+            pathSteps = 0; PathsTruncated = false;
             Dfs(a, b, maxDepth, maxPaths, stack, onPath, res);
             return res;
         }
 
         static void Dfs(int n, int b, int maxDepth, int maxPaths, List<RefEdge> stack, HashSet<int> onPath, List<List<RefEdge>> res)
         {
-            if (res.Count >= maxPaths || stack.Count >= maxDepth) return;
+            if (res.Count >= maxPaths || stack.Count >= maxDepth || PathsTruncated) return;
             foreach (var nb in Next(n, true))
             {
+                if (++pathSteps > MaxPathSteps) { PathsTruncated = true; return; }
                 if (onPath.Contains(nb.Key)) continue;
                 stack.Add(nb.Value);
                 if (nb.Key == b) res.Add(new List<RefEdge>(stack));
@@ -492,7 +553,13 @@ namespace InsideDev
         public static string Stats()
         {
             return "indexed " + indexedObjects + " objects, " + edges + " edges, " + rev.Count + " referenced targets, " + truncatedObjects + " truncated, pending " + queue.Count +
-                   ", full runs " + fullRuns + " (last " + lastFullMs.ToString("0") + " ms), budget " + budgetMs.ToString("0.0") + " ms/frame";
+                   ", full runs " + fullRuns + " (last " + Fmt.F(lastFullMs, "0") + " ms), budget " + Fmt.F(budgetMs, "0.0") + " ms/frame";
+        }
+
+        public static string StatsJson()
+        {
+            return JsonLine.Obj("ok", true, "indexedObjects", indexedObjects, "edges", edges, "referencedTargets", rev.Count, "truncatedObjects", truncatedObjects, "pending", queue.Count,
+                "fullRuns", fullRuns, "lastFullMs", lastFullMs, "budgetMs", budgetMs, "upToDate", queue.Count == 0 && ObjectDatabase.completedPasses == lastDbPass);
         }
 
         public static string ProvLabel(Provenance p)

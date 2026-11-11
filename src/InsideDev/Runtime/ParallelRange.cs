@@ -38,14 +38,20 @@ namespace InsideDev
         public void Run(int n, Action<int, int> fn)
         {
             if (n <= 0) return;
-            if (threads.Length == 0 || n < 64) { fn(0, n); return; }
+            if (quit || threads.Length == 0 || n < 64) { fn(0, n); return; }
             body = fn; count = n; error = null;
             chunks = threads.Length + 1;
             pending = chunks;
             done.Reset();
             for (int i = 0; i < threads.Length; i++) go[i].Set();
             Chunk(0);
-            done.WaitOne();
+            // a worker that is gone (domain shutdown) would leave the caller waiting for ever
+            while (!done.WaitOne(2000))
+            {
+                bool dead = false;
+                for (int i = 0; i < threads.Length; i++) if (!threads[i].IsAlive) dead = true;
+                if (dead) { body = null; throw new Exception("parallel range: a worker thread ended while " + pending + " chunk(s) were still running"); }
+            }
             body = null;
             if (error != null) throw new Exception("parallel range: " + error);
         }
@@ -70,8 +76,15 @@ namespace InsideDev
 
         public void Dispose()
         {
+            if (quit) return;
             quit = true;
             for (int i = 0; i < threads.Length; i++) go[i].Set();
+            bool all = true;
+            for (int i = 0; i < threads.Length; i++)
+            {
+                try { if (threads[i].Join(200)) go[i].Close(); else all = false; } catch { all = false; }   // a worker that did not end keeps its event
+            }
+            if (all) { try { done.Close(); } catch { } }
         }
     }
 }

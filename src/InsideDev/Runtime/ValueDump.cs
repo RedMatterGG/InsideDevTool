@@ -81,7 +81,15 @@ namespace InsideDev
                 if (i > 0 && i <= 5) sb.Append(" }");
                 return Cut(sb.ToString(), max);
             }
-            string s; try { s = Convert.ToString(v, IC); } catch { s = "?"; }
+            // Unity's vectors, colours and rects print with the Windows language and one decimal on their own
+            string s;
+            try
+            {
+                if (v is Bounds) { var b = (Bounds)v; s = "center " + Fmt.V3(b.center, "0.###") + " size " + Fmt.V3(b.size, "0.###"); }
+                else if (v is Vector2 || v is Vector3 || v is Vector4 || v is Quaternion || v is Color || v is Rect) s = Fmt.Any(v);
+                else s = Convert.ToString(v, IC);
+            }
+            catch { s = "?"; }
             return Cut(s, max);
         }
 

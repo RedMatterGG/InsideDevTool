@@ -16,15 +16,23 @@ namespace InsideDev
         [System.Runtime.InteropServices.DllImport("kernel32", CharSet = System.Runtime.InteropServices.CharSet.Unicode)] static extern IntPtr GetModuleHandle(string name);
         static string dir; static bool exists; static float nextCheck, nextPoll;
         static int lastSel = int.MinValue, stamp;
+        static readonly int pid = System.Diagnostics.Process.GetCurrentProcess().Id;
         public static string lastAsk = "";
 
-        static string Dir { get { if (dir == null) dir = Path.Combine(Path.Combine(Path.GetDirectoryName(Application.dataPath), "_mod"), "ce"); return dir; } }
+        static string Dir { get { if (dir == null) { dir = Path.Combine(Path.Combine(Path.GetDirectoryName(Application.dataPath), "_mod"), "ce"); linkFile = Path.Combine(dir, ".link"); askFile = Path.Combine(dir, "ask.txt"); } return dir; } }
+        static string linkFile, askFile;
         public static bool Linked { get { return exists; } }
 
         public static void Update()
         {
             float now = Time.realtimeSinceStartup;
-            if (now >= nextCheck) { nextCheck = now + 2f; try { if (!Directory.Exists(Dir)) Directory.CreateDirectory(Dir); bool was = exists; exists = File.Exists(Path.Combine(Dir, ".link")); if (exists && !was) lastSel = int.MinValue; } catch { exists = false; } }
+            // inert until the Cheat Engine script makes _mod\ce\.link (it creates the folder itself): one File.Exists
+            // every two seconds, nothing is created here
+            if (now >= nextCheck)
+            {
+                nextCheck = now + 2f;
+                try { if (dir == null) { var d = Dir; } bool was = exists; exists = LinkAlive(); if (exists && !was) lastSel = int.MinValue; } catch { exists = false; }
+            }
             if (!exists || now < nextPoll) return;
             nextPoll = now + 0.25f;
             try
@@ -32,7 +40,7 @@ namespace InsideDev
                 var go = Selection.Current;
                 int id = go != null ? go.GetInstanceID() : 0;
                 if (id != lastSel) { lastSel = id; Export(go); }
-                string ask = Path.Combine(Dir, "ask.txt");
+                string ask = askFile;
                 if (File.Exists(ask))
                 {
                     string q = File.ReadAllText(ask).Trim(); File.Delete(ask);
@@ -43,6 +51,20 @@ namespace InsideDev
                 }
             }
             catch (Exception e) { DevLog.Error("ce link", e); nextPoll = now + 3f; }
+        }
+
+        // the 0.11.0 script rewrites .link every few seconds while Cheat Engine runs; a link older than 15 s is a closed
+        // Cheat Engine. The 0.10.0 script writes "cheat engine link" once and has no heartbeat.
+        static bool LinkAlive()
+        {
+            try
+            {
+                if (!File.Exists(linkFile)) return false;
+                string t = File.ReadAllText(linkFile).Trim();
+                if (t == "cheat engine link") return true;
+                return (DateTime.UtcNow - File.GetLastWriteTimeUtc(linkFile)).TotalSeconds < 15.0;
+            }
+            catch { return false; }
         }
 
         static string Answer(string q)
@@ -102,7 +124,7 @@ namespace InsideDev
         public static string Export(GameObject go)
         {
             var sb = new StringBuilder();
-            sb.Append("stamp|").Append(++stamp).Append('\n');
+            sb.Append("stamp|").Append(++stamp).Append('|').Append(pid).Append('\n');
             if (go == null) sb.Append("none|no selection\n");
             else if (!MemAddr.Ready) sb.Append("none|").Append(MemAddr.status).Append('\n');
             else

@@ -20,6 +20,7 @@ namespace InsideDev
         {
             public Type from, target; public string method, via, member, access;   // access: reads / writes / calls / uses
             public FieldInfo staticField; public PropertyInfo staticProp; public MethodInfo staticGetter;
+            internal bool backingSearched; internal FieldInfo backing;   // the static field behind an "instance" getter
         }
 
         static readonly Dictionary<Type, List<Dep>> byType = new Dictionary<Type, List<Dep>>();
@@ -38,9 +39,12 @@ namespace InsideDev
             return res;
         }
 
+        // The scan (about a millisecond per frame for some tens of seconds) starts and goes on only while the tool is
+        // in use or the code feature was asked for; it never runs for somebody who only plays.
         public static void Tick()
         {
             if (done) return;
+            if (!Background.WantedOrInUse(Background.Code)) return;
             try
             {
                 if (queue == null) Init();
@@ -73,7 +77,7 @@ namespace InsideDev
                 {
                     if (t == null || !typeof(Component).IsAssignableFrom(t)) continue;
                     const BindingFlags F = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
-                    foreach (var m in t.GetMethods(F)) queue.Add(m);
+                    try { foreach (var m in t.GetMethods(F)) queue.Add(m); } catch { }   // one unreadable type does not end the scan
                 }
             }
         }
@@ -142,7 +146,7 @@ namespace InsideDev
                 catch { }
                 if (found != null) { if (pending != null) Record(m, pending, via, null, "uses", pf, pp, pg); pending = found; via = foundVia; pf = ff; pp = fp; pg = fg; }
                 else if (pending != null && oc.Value != OpCodes.Nop.Value && oc.Value != OpCodes.Dup.Value && oc.OperandType != OperandType.InlineField && oc.OperandType != OperandType.InlineMethod
-                         && oc.Value != OpCodes.Ldc_I4_0.Value && oc.Value != OpCodes.Ldc_I4_1.Value && oc.Value != OpCodes.Ldnull.Value && !oc.Name.StartsWith("ldloc") && !oc.Name.StartsWith("ldarg"))
+                         && oc.Value != OpCodes.Ldc_I4_0.Value && oc.Value != OpCodes.Ldc_I4_1.Value && oc.Value != OpCodes.Ldnull.Value && !oc.Name.StartsWith("ldloc", StringComparison.Ordinal) && !oc.Name.StartsWith("ldarg", StringComparison.Ordinal))
                 { Record(m, pending, via, null, "uses", pf, pp, pg); pending = null; }
                 p += size;
             }
@@ -159,17 +163,65 @@ namespace InsideDev
             deps++;
         }
 
-        // live object behind a dependency (singleton value, or the first object of that type)
-        public static Component Resolve(Dep d)
+        // Live object behind a dependency (singleton value, or the first object of that type). The index build never
+        // runs game code for this: an "instance" property is answered from the static field behind it when there is
+        // one, and its getter is only called with runGetters (an explicit refresh of one object by the user). One
+        // FindObjectOfType per target type and database pass, whatever the number of scripts that ask.
+        public static Component Resolve(Dep d) { return Resolve(d, false); }
+
+        public static Component Resolve(Dep d, bool runGetters)
         {
             try
             {
                 if (d.staticField != null) return d.staticField.GetValue(null) as Component;
-                if (d.staticProp != null) return d.staticProp.GetValue(null, null) as Component;
-                if (d.staticGetter != null) return d.staticGetter.Invoke(null, null) as Component;
-                return UnityEngine.Object.FindObjectOfType(d.target) as Component;
+                if (d.staticProp != null || d.staticGetter != null)
+                {
+                    if (!d.backingSearched) { d.backingSearched = true; d.backing = BackingField(d); }
+                    if (d.backing != null) { var v = d.backing.GetValue(null) as Component; if (v != null || !runGetters) return v; }
+                    if (runGetters)
+                    {
+                        if (d.staticProp != null) return d.staticProp.GetValue(null, null) as Component;
+                        return d.staticGetter.Invoke(null, null) as Component;
+                    }
+                    // no field to read: the object of that type that exists now, without asking the game to make one
+                    return FindCached(d.target);
+                }
+                return FindCached(d.target);
             }
             catch { return null; }
+        }
+
+        static FieldInfo BackingField(Dep d)
+        {
+            Type decl = d.staticProp != null ? d.staticProp.DeclaringType : d.staticGetter.DeclaringType;
+            const BindingFlags F = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
+            FieldInfo found = null;
+            for (var t = decl; t != null && t != typeof(object) && t != typeof(MonoBehaviour); t = t.BaseType)
+            {
+                if (t.ContainsGenericParameters) break;
+                foreach (var f in t.GetFields(F))
+                {
+                    if (!d.target.IsAssignableFrom(f.FieldType) && !f.FieldType.IsAssignableFrom(d.target)) continue;
+                    if (!typeof(Component).IsAssignableFrom(f.FieldType)) continue;
+                    if (found != null) return null;   // two candidates: do not guess
+                    found = f;
+                }
+                if (found != null) return found;
+            }
+            return null;
+        }
+
+        static readonly Dictionary<Type, Component> findCache = new Dictionary<Type, Component>();
+        static int findPass = -1;
+        static Component FindCached(Type t)
+        {
+            // valid until the set of loaded objects changes
+            if (findPass != ObjectDatabase.ChangeStamp) { findPass = ObjectDatabase.ChangeStamp; findCache.Clear(); }
+            Component c;
+            if (findCache.TryGetValue(t, out c)) return c;
+            c = UnityEngine.Object.FindObjectOfType(t) as Component;
+            findCache[t] = c;
+            return c;
         }
 
         public static string Dump(string typeName)

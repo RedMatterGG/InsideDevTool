@@ -82,6 +82,9 @@ namespace InsideDev
         // raw write (History undo / redo, mods): no recording
         public static void Set(string key, string value)
         {
+            // a key or value that cannot be a rule never gets into the table (a bad entry would break every later sync)
+            string bad = key == null ? "no rule key" : Check(key, value);
+            if (bad != null) { DevLog.Write("[audio rules] refused " + key + (value != null ? " = " + value : "") + ": " + bad); return; }
             if (value == null) rules.Remove(key); else rules[key] = value;
             int c = key.IndexOf(':');
             string kind = key.Substring(0, c), name = key.Substring(c + 1);
@@ -148,15 +151,19 @@ namespace InsideDev
             if (!nativeEnforce) return;
             foreach (var kv in rules)
             {
-                int c = kv.Key.IndexOf(':'); string kind = kv.Key.Substring(0, c), name = kv.Key.Substring(c + 1); uint id = Id(name);
+                int c = kv.Key.IndexOf(':'); if (c <= 0) continue;
+                string kind = kv.Key.Substring(0, c), name = kv.Key.Substring(c + 1); uint id = Id(name);
+                float rv = 0f;
+                if (kind == "rtpc" && !float.TryParse(kv.Value, NumberStyles.Float, IC, out rv)) continue;
                 switch (kind)
                 {
-                    case "nuke": WwiseNative.RuleAdd(1, id, 1); break;
-                    case "mute": WwiseNative.RuleAdd(2, id, 1); break;
+                    // "false" switches a mute / nuke off on the managed side: the native side must agree
+                    case "nuke": if (kv.Value != "false") WwiseNative.RuleAdd(1, id, 1); break;
+                    case "mute": if (kv.Value != "false") WwiseNative.RuleAdd(2, id, 1); break;
                     case "replace": WwiseNative.RuleAdd(3, id, Id(kv.Value)); break;
                     case "switch": WwiseNative.RuleAdd(4, id, Id(kv.Value)); break;
                     case "state": WwiseNative.RuleAdd(5, id, Id(kv.Value)); break;
-                    case "rtpc": WwiseNative.RuleAdd(6, id, BitConverter.ToUInt32(BitConverter.GetBytes(float.Parse(kv.Value, NumberStyles.Float, IC)), 0)); break;
+                    case "rtpc": WwiseNative.RuleAdd(6, id, BitConverter.ToUInt32(BitConverter.GetBytes(rv), 0)); break;
                 }
             }
             WwiseNative.RuleEnforce(true);

@@ -112,7 +112,7 @@ namespace InsideDev
         }
 
         // bounds are recomputed at most every 0.25 s per object (GetComponentsInChildren on big hierarchies is not free)
-        sealed class Cached { public int id; public float at; public Bounds b; public bool has; }
+        sealed class Cached { public int id; public float at, keep = 0.25f; public Bounds b; public bool has; }
         static readonly Cached[] cache = { new Cached(), new Cached() };
 
         static void Measure(GameObject go, Cached k)
@@ -120,22 +120,29 @@ namespace InsideDev
             k.id = go.GetInstanceID(); k.at = Time.realtimeSinceStartup; k.has = false;
             k.b = new Bounds(go.transform.position, Vector3.zero);
             int n = 0;
-            foreach (var r in go.GetComponentsInChildren<Renderer>(true))
+            var rs = go.GetComponentsInChildren<Renderer>(true);
+            foreach (var r in rs)
             {
-                if (r == null || !r.gameObject.activeInHierarchy || ++n > 2000) continue;
+                if (r == null || !r.gameObject.activeInHierarchy) continue;
+                if (++n > 2000) break;
                 if (!k.has) { k.b = r.bounds; k.has = true; } else k.b.Encapsulate(r.bounds);
             }
-            foreach (var col in go.GetComponentsInChildren<Collider>(true))
+            var cols = go.GetComponentsInChildren<Collider>(true);
+            foreach (var col in cols)
             {
-                if (col == null || !col.gameObject.activeInHierarchy || !col.enabled || ++n > 4000) continue;
+                if (col == null || !col.gameObject.activeInHierarchy || !col.enabled) continue;
+                if (++n > 4000) break;
                 if (!k.has) { k.b = col.bounds; k.has = true; } else k.b.Encapsulate(col.bounds);
             }
+            // a level root has thousands of parts: its box is measured every two seconds, a small object four times a second
+            int parts = rs.Length + cols.Length;
+            k.keep = parts > 1000 ? 2f : parts > 200 ? 1f : 0.25f;
         }
 
         static void Mark(Draw d, GameObject go, Color c, bool label)
         {
             var k = label ? cache[0] : cache[1];
-            if (k.id != go.GetInstanceID() || Time.realtimeSinceStartup - k.at > 0.25f) Measure(go, k);
+            if (k.id != go.GetInstanceID() || Time.realtimeSinceStartup - k.at > k.keep) Measure(go, k);
             Bounds b = k.b; bool has = k.has;
             var p = go.transform.position;
             if (!has || b.size.sqrMagnitude < 1e-4f || b.size.magnitude > 400f)

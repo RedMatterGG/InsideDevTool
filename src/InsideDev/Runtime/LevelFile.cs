@@ -53,9 +53,23 @@ namespace InsideDev
             }
         }
 
-        FileStream batch;
-        public void BeginBatch() { if (batch == null) batch = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 65536); }
-        public void EndBatch() { if (batch != null) { batch.Dispose(); batch = null; } }
+        // one stream kept open while a level is parsed (thousands of small reads); counted, because two parses can
+        // share a file (a level and the shared assets file another level's materials live in)
+        FileStream batch; int batchUsers;
+        public void BeginBatch() { lock (this) { if (batchUsers++ == 0 && batch == null) batch = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 65536); } }
+        public void EndBatch() { lock (this) { if (batchUsers > 0 && --batchUsers == 0 && batch != null) { batch.Dispose(); batch = null; } } }
+        // names of objects of this file (materials), read once
+        readonly Dictionary<long, string> names = new Dictionary<long, string>();
+        public string NameOf(long pid)
+        {
+            string s;
+            lock (names) { if (names.TryGetValue(pid, out s)) return s; }
+            var d = Read(pid);
+            if (d == null) return null;
+            int p = 0; s = SFile.Str(d, ref p);
+            lock (names) names[pid] = s;
+            return s;
+        }
         public byte[] Read(long pid)
         {
             Obj o; if (!objs.TryGetValue(pid, out o)) return null;
@@ -125,9 +139,21 @@ namespace InsideDev
                 return null;
             }
         }
+        // the parsed level now, on the caller's thread; a parse that is already running on the worker is waited for
+        // (never a second parse of the same file at the same time)
         public static Level GetNow(string levelFile)
         {
-            lock (gate) { Level l; if (levels.TryGetValue(levelFile, out l)) return l; }
+            lock (gate)
+            {
+                Level l;
+                while (true)
+                {
+                    if (levels.TryGetValue(levelFile, out l)) return l;
+                    if (!loading.Contains(levelFile)) break;
+                    Monitor.Wait(gate, 250);
+                }
+                loading.Add(levelFile);
+            }
             Load(levelFile);
             lock (gate) { return levels[levelFile]; }
         }
@@ -136,10 +162,11 @@ namespace InsideDev
         {
             var lv = new Level { file = levelFile };
             var sw = System.Diagnostics.Stopwatch.StartNew();
+            var batched = new List<SFile>();
             try
             {
                 var sf = Open(levelFile); lv.sf = sf;
-                sf.BeginBatch();
+                sf.BeginBatch(); batched.Add(sf);
                 var gos = new Dictionary<long, Go>();
                 var tr = new Dictionary<long, long[]>();          // transform pid -> [go pid, father pid]
                 var kids = new Dictionary<long, List<long>>();    // transform pid -> child transform pids (level order)
@@ -188,7 +215,7 @@ namespace InsideDev
                         if ((c.cls == 23 || c.cls == 137 || c.cls == 199) && b.Length > 60)
                         {
                             int p = 56; int n = SFile.I32(b, p); p += 4;
-                            if (n >= 0 && n < 64) { c.materials = new List<string>(); for (int i = 0; i < n; i++) { c.materials.Add(MaterialName(sf, SFile.I32(b, p), SFile.I64(b, p + 4))); p += 12; } }
+                            if (n >= 0 && n < 64) { c.materials = new List<string>(); for (int i = 0; i < n; i++) { c.materials.Add(MaterialName(sf, SFile.I32(b, p), SFile.I64(b, p + 4), batched)); p += 12; } }
                         }
                     }
                 }
@@ -204,9 +231,16 @@ namespace InsideDev
                 }
             }
             catch (Exception e) { lv.error = e.GetType().Name + ": " + e.Message; }
-            finally { if (lv.sf != null) lv.sf.EndBatch(); }
+            finally { foreach (var f in batched) f.EndBatch(); }
             lv.ms = sw.Elapsed.TotalMilliseconds;
-            lock (gate) { levels[levelFile] = lv; loading.Remove(levelFile); }
+            lock (gate)
+            {
+                // a result with an error never replaces a good one
+                Level had;
+                if (lv.error == null || !levels.TryGetValue(levelFile, out had) || had.error != null) levels[levelFile] = lv;
+                loading.Remove(levelFile);
+                Monitor.PulseAll(gate);
+            }
         }
 
         static void Walk(Go g, long tpid, Dictionary<long, Go> gos, Dictionary<long, long[]> tr, Dictionary<long, List<long>> kids, Level lv)
@@ -224,7 +258,10 @@ namespace InsideDev
             }
         }
 
-        public static string MaterialName(SFile sf, int fid, long pid)
+        public static string MaterialName(SFile sf, int fid, long pid) { return MaterialName(sf, fid, pid, null); }
+
+        // batched: files this parse keeps open (an external file is opened once for all its materials, not once per slot)
+        static string MaterialName(SFile sf, int fid, long pid, List<SFile> batched)
         {
             if (pid == 0) return "(none)";
             try
@@ -236,9 +273,9 @@ namespace InsideDev
                     string ext = sf.externals[fid - 1];
                     if (ext.IndexOf("unity default resources", StringComparison.OrdinalIgnoreCase) >= 0 || ext.IndexOf("builtin", StringComparison.OrdinalIgnoreCase) >= 0) return "(built-in #" + pid + ")";
                     f = Open(Path.GetFileName(ext));
+                    if (batched != null && !batched.Contains(f)) { f.BeginBatch(); batched.Add(f); }
                 }
-                var d = f.Read(pid); if (d == null) return "? #" + pid;
-                int p = 0; return SFile.Str(d, ref p);
+                return f.NameOf(pid) ?? "? #" + pid;
             }
             catch { return "? #" + pid; }
         }

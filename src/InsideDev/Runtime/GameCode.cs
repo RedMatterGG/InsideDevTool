@@ -93,12 +93,22 @@ namespace InsideDev
         static readonly Color cWarn = new Color(1f, 0.55f, 0.3f, 1f);
 
         // Settings tab block
+        // what the Settings tab shows: files are looked at every five seconds, not every frame
+        static string[] drawLines = new string[0]; static bool[] drawWarn = new bool[0]; static float drawAt = -100f;
+
         public static void DrawSettings(UI ui)
         {
             ui.Label("Game code", UI.Dim);
             bool ok = Complete;
-            foreach (var f in CopiedFiles) ui.Label("   " + (Valid(Path.Combine(dir, f)) ? "[ok]       " : "[missing]  ") + f + "   (copied from INSIDE_Data\\Managed)", UI.Dim);
-            foreach (var f in UserFiles) { bool v = Valid(Path.Combine(dir, f)); ui.Label("   " + (v ? "[ok]       " : "[missing]  ") + f + "   (you supply this)", v ? UI.Dim : cWarn); }
+            if (Time.realtimeSinceStartup - drawAt > 5f)
+            {
+                drawAt = Time.realtimeSinceStartup;
+                var lines = new System.Collections.Generic.List<string>(); var warn = new System.Collections.Generic.List<bool>();
+                foreach (var f in CopiedFiles) { lines.Add("   " + (Valid(Path.Combine(dir, f)) ? "[ok]       " : "[missing]  ") + f + "   (copied from INSIDE_Data\\Managed)"); warn.Add(false); }
+                foreach (var f in UserFiles) { bool v = Valid(Path.Combine(dir, f)); lines.Add("   " + (v ? "[ok]       " : "[missing]  ") + f + "   (you supply this)"); warn.Add(!v); }
+                drawLines = lines.ToArray(); drawWarn = warn.ToArray();
+            }
+            for (int i = 0; i < drawLines.Length; i++) ui.Label(drawLines[i], drawWarn[i] ? cWarn : UI.Dim);
             if (!ok)
             {
                 ui.Label("   InsideDev does not extract the game's code. Dump " + missing + " yourself", cWarn);
@@ -107,7 +117,7 @@ namespace InsideDev
                 ui.Label("   Everything in this GUI works without them.", UI.Dim);
             }
             ui.BeginRow();
-            if (ui.Button("Check again")) { CopyShippedRefs(); Check(true); }
+            if (ui.Button("Check again")) { CopyShippedRefs(); Check(true); drawAt = -100f; }
             ui.EndRow();
         }
     }

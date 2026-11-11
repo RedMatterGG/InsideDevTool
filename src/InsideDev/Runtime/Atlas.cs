@@ -49,13 +49,13 @@ namespace InsideDev
                 if (!File.Exists(Path.Combine(Dir, "levels.tsv"))) { status = "not installed (no _mod\\atlas\\levels.tsv)"; return; }
                 Present = true;
                 if (!CheckBuild()) return;
-                foreach (var f in Rows("hidden.tsv"))
+                foreach (var f in Rows("hidden.tsv", 7))
                 {
                     var h = new Hidden { file = f[0], path = f[1], status = f[2], objects = Int(f[3]), reason = f[4], from = f[5], scripts = f[6] };
                     hidden.Add(h);
                     hiddenByKey[h.file + "|" + h.path] = h;
                 }
-                foreach (var f in Rows("wires.tsv"))
+                foreach (var f in Rows("wires.tsv", 8))
                 {
                     var w = new Wire { file = f[0], connector = f[1], outName = f[2], inName = f[3], sender = f[4], receiver = f[5], status = f[6], flags = f[7] };
                     wires.Add(w);
@@ -63,19 +63,19 @@ namespace InsideDev
                     if (w.sender != w.connector) AddTo(wiresByKey, w.file + "|" + w.sender, w);
                     if (w.receiver != w.connector && w.receiver != w.sender) AddTo(wiresByKey, w.file + "|" + w.receiver, w);
                 }
-                foreach (var f in Rows("fsm.tsv"))
+                foreach (var f in Rows("fsm.tsv", 5))
                 {
                     var x = new FsmIssue { file = f[0], path = f[1], fsm = f[2], unreachable = List(f[3]), unsent = List(f[4]) };
                     fsms.Add(x);
                     AddTo(fsmByKey, x.file + "|" + x.path, x);
                 }
-                foreach (var f in Rows("subscenes.tsv"))
+                foreach (var f in Rows("subscenes.tsv", 4))
                 {
                     var a = new Area { index = Int(f[0]), name = f[1], file = f[2], savepoints = Int(f[3]) };
                     areas.Add(a);
                     areaByName[a.name] = a;
                 }
-                foreach (var f in Rows("savepoints.tsv"))
+                foreach (var f in Rows("savepoints.tsv", 8))
                 {
                     var s = new Spawn { subscene = f[0], i = Int(f[1]), file = f[2], path = f[3], pos = new Vector3(Float(f[4]), Float(f[5]), Float(f[6])), info = f[7] };
                     AddTo(spawnsByArea, s.subscene, s);
@@ -96,12 +96,13 @@ namespace InsideDev
         static bool CheckBuild()
         {
             string first = null;
-            foreach (var f in Rows("levels.tsv"))
+            foreach (var f in Rows("levels.tsv", 3))
             {
                 sceneOfFile[f[0]] = f[1];
                 levelsChecked++;
                 var fi = new FileInfo(Path.Combine(Application.dataPath, f[0]));
-                if (fi.Exists && fi.Length == long.Parse(f[2], IC)) continue;
+                long size;
+                if (fi.Exists && long.TryParse(f[2], NumberStyles.Integer, IC, out size) && fi.Length == size) continue;
                 levelsDiffer++;
                 if (first == null) first = f[0];
             }
@@ -111,14 +112,19 @@ namespace InsideDev
             return false;
         }
 
-        static IEnumerable<string[]> Rows(string name)
+        // rows of one table; a row with fewer columns than the table has (an editor stripped the empty ones at the end)
+        // is filled up with empty text instead of failing the whole atlas
+        static IEnumerable<string[]> Rows(string name, int columns)
         {
-            var lines = File.ReadAllLines(Path.Combine(Dir, name), Encoding.UTF8);
+            string[] lines;
+            try { lines = File.ReadAllLines(Path.Combine(Dir, name), Encoding.UTF8); }
+            catch (Exception e) { throw new Exception(name + ": " + e.Message); }
             for (int i = 1; i < lines.Length; i++)
             {
                 if (lines[i].Length == 0) continue;
                 var f = lines[i].Split('\t');
-                if (f.Length < 3) continue;
+                if (f.Length < 3 && f.Length < columns) continue;
+                if (f.Length < columns) { int had = f.Length; Array.Resize(ref f, columns); for (int k = had; k < columns; k++) f[k] = ""; }
                 yield return f;
             }
         }
@@ -182,7 +188,7 @@ namespace InsideDev
             foreach (var kv in masterKeys)
             {
                 if (kv.Value == live) { file = kv.Key; path = kv.Value; return true; }
-                if (path == null && kv.Value.EndsWith(tail)) { file = kv.Key; path = kv.Value; }
+                if (path == null && kv.Value.EndsWith(tail, StringComparison.Ordinal)) { file = kv.Key; path = kv.Value; }
             }
             return path != null;
         }

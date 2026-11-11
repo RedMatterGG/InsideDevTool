@@ -27,7 +27,11 @@ namespace InsideDev
         public static int respawnEntry = -1;         // index into entries, -1 = off
         static readonly CultureInfo IC = CultureInfo.InvariantCulture;
         static bool loaded, hooked;
-        static Entry pending; static string pendingWhy;
+        // lines of the file that are not a spawn (damaged, or written by a newer build): kept and written back as they are
+        static readonly List<string> keptLines = new List<string>();
+        static bool keepBadFile;   // the file could not be read at all: copied to custom_spawns.cfg.bad before the first save
+        static Entry pending; static string pendingWhy; static float pendingAt; static int pendingSub = -1;
+        const float PendingTimeout = 60f;
         static bool loadDone; static int settleFrames;
         public static string lastStatus = "";
 
@@ -41,26 +45,39 @@ namespace InsideDev
             try
             {
                 if (!File.Exists(PathCfg)) return;
-                string respawnName = null;
+                string respawnName = null; int bad = 0;
                 foreach (var raw in File.ReadAllLines(PathCfg))
                 {
                     var line = raw.Trim();
-                    if (line.Length == 0 || line.StartsWith("#")) continue;
-                    if (line.StartsWith("respawn=")) { respawnName = line.Substring(8); continue; }
+                    if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal)) continue;
+                    if (line.StartsWith("respawn=", StringComparison.Ordinal)) { respawnName = line.Substring(8).Trim(); continue; }
                     // name|subscene|savepoint|x|y|z|created
                     var p = line.Split('|');
-                    if (p.Length < 6) continue;
-                    entries.Add(new Entry
+                    int sp; float x, y, z;
+                    if (p.Length < 6 || !Fmt.TryI(p[2].Trim(), out sp) || !Fmt.TryF(p[3].Trim(), out x) || !Fmt.TryF(p[4].Trim(), out y) || !Fmt.TryF(p[5].Trim(), out z))
                     {
-                        name = p[0], subscene = p[1], savepoint = int.Parse(p[2], IC),
-                        pos = new Vector3(float.Parse(p[3], IC), float.Parse(p[4], IC), float.Parse(p[5], IC)),
-                        created = p.Length > 6 ? p[6] : ""
-                    });
+                        keptLines.Add(raw); bad++;
+                        continue;
+                    }
+                    entries.Add(new Entry { name = p[0], subscene = p[1], savepoint = sp, pos = new Vector3(x, y, z), created = p.Length > 6 ? p[6] : "" });
                 }
-                respawnEntry = respawnName == null ? -1 : entries.FindIndex(e => e.name == respawnName);
-                DevLog.Write("custom spawns: " + entries.Count + " loaded" + (respawnEntry >= 0 ? ", respawn point '" + entries[respawnEntry].name + "'" : ""));
+                respawnEntry = respawnName == null ? -1 : entries.FindIndex(e => e.name == respawnName || Clean(e.name) == Clean(respawnName));
+                DevLog.Write("custom spawns: " + entries.Count + " loaded" + (respawnEntry >= 0 ? ", respawn point '" + entries[respawnEntry].name + "'" : "") + (bad > 0 ? ", " + bad + " line(s) not understood (kept in the file as they are)" : ""));
             }
-            catch (Exception e) { DevLog.Error("custom spawns load", e); }
+            catch (Exception e)
+            {
+                keepBadFile = File.Exists(PathCfg);
+                DevLog.Error("custom spawns load (the file is kept as custom_spawns.cfg.bad before anything is saved)", e);
+            }
+        }
+
+        // a name that survives the file format: no field separator, not a comment, not the respawn line
+        static string Clean(string n)
+        {
+            n = (n ?? "").Replace('|', '/').Replace('\n', ' ').Replace('\r', ' ').Trim();
+            n = n.TrimStart('#').Trim();
+            if (n.StartsWith("respawn=", StringComparison.Ordinal)) n = "respawn " + n.Substring(8).Trim();
+            return n.Length > 0 ? n : "Spawn";
         }
 
         static void Save()
@@ -68,11 +85,13 @@ namespace InsideDev
             try
             {
                 var sb = new StringBuilder("# InsideDev custom spawns: name|subscene|savepoint|x|y|z|created\n");
-                if (respawnEntry >= 0 && respawnEntry < entries.Count) sb.Append("respawn=").Append(entries[respawnEntry].name).Append('\n');
+                if (respawnEntry >= 0 && respawnEntry < entries.Count) sb.Append("respawn=").Append(Clean(entries[respawnEntry].name)).Append('\n');
                 foreach (var e in entries)
-                    sb.Append(e.name.Replace("|", "/")).Append('|').Append(e.subscene).Append('|').Append(e.savepoint.ToString(IC)).Append('|')
-                      .Append(e.pos.x.ToString("R", IC)).Append('|').Append(e.pos.y.ToString("R", IC)).Append('|').Append(e.pos.z.ToString("R", IC)).Append('|').Append(e.created).Append('\n');
-                File.WriteAllText(PathCfg, sb.ToString());
+                    sb.Append(Clean(e.name)).Append('|').Append((e.subscene ?? "").Replace('|', '/')).Append('|').Append(e.savepoint.ToString(IC)).Append('|')
+                      .Append(e.pos.x.ToString("R", IC)).Append('|').Append(e.pos.y.ToString("R", IC)).Append('|').Append(e.pos.z.ToString("R", IC)).Append('|').Append((e.created ?? "").Replace('|', '/')).Append('\n');
+                foreach (var l in keptLines) sb.Append(l).Append('\n');
+                if (keepBadFile) { File.Copy(PathCfg, PathCfg + ".bad", true); keepBadFile = false; }
+                SafeFile.WriteAllText(PathCfg, sb.ToString(), true);
             }
             catch (Exception e) { DevLog.Error("custom spawns save", e); }
         }
@@ -88,14 +107,15 @@ namespace InsideDev
             string subName;
             try { subName = SavepointManager.GetSubsceneName(sub); } catch { return Status("subscene name unknown"); }
             if (string.IsNullOrEmpty(name)) name = "Spawn " + (entries.Count + 1) + " " + subName.TrimStart('#').Replace("_Gameplay", "");
-            var e = new Entry { name = UniqueName(name), subscene = subName, savepoint = sp, pos = ch.pos3, created = DateTime.Now.ToString("yyyy-MM-dd HH:mm") };
+            var e = new Entry { name = UniqueName(name), subscene = subName, savepoint = sp, pos = ch.pos3, created = DateTime.Now.ToString("yyyy-MM-dd HH:mm", IC) };
             entries.Add(e);
             Save();
-            return Status("saved '" + e.name + "' at " + e.pos.ToString("F2") + " (" + subName + " savepoint #" + sp + ")");
+            return Status("saved '" + e.name + "' at " + Fmt.V3(e.pos, "F2") + " (" + subName + " savepoint #" + sp + ")");
         }
 
         static string UniqueName(string n)
         {
+            n = Clean(n);
             string b = n; int k = 2;
             while (entries.Exists(x => x.name == n)) n = b + " (" + (k++) + ")";
             return n;
@@ -142,7 +162,7 @@ namespace InsideDev
             var ch = G.MainCharacter;
             bool here = ch != null && ch.isCharacterActive && !ch.isDead && G.CurrentSavepoint(out cs, out csp) && cs == sub;
             if (here) { G.Teleport(e.pos); return Status("teleported to '" + e.name + "'"); }
-            pending = e; pendingWhy = "go"; loadDone = false; settleFrames = 0;
+            pending = e; pendingWhy = "go"; loadDone = false; settleFrames = 0; pendingAt = Time.realtimeSinceStartup; pendingSub = sub;
             G.LoadSavepoint(sub, e.savepoint);
             return Status("loading " + e.subscene + " #" + e.savepoint + ", then moving to '" + e.name + "'");
         }
@@ -158,13 +178,28 @@ namespace InsideDev
                 try { GameManager.loadFinished += OnLoadFinished; hooked = true; }
                 catch (Exception ex) { DevLog.Error("custom spawns hook", ex); hooked = true; }
             }
-            if (pending == null || !loadDone) return;
+            if (pending == null) return;
+            // the game did not do the load that was asked for (menu, cutscene, another load running): forget the
+            // request instead of moving the boy after some later, unrelated load
+            if (Time.realtimeSinceStartup - pendingAt > PendingTimeout)
+            {
+                var gone = pending; pending = null;
+                Status("the load for '" + gone.name + "' did not finish within " + Fmt.F(PendingTimeout, "0") + " s: not moved");
+                return;
+            }
+            if (!loadDone) return;
             var ch = G.MainCharacter;
             bool loading = false;
             try { loading = GameManager.IsLoading(); } catch { }
             if (ch == null || !ch.isCharacterActive || loading) { settleFrames = 0; return; }
             if (++settleFrames < 20) return;   // let savepoint placement and camera settle first
             var e = pending; pending = null;
+            int nowSub, nowSp;
+            if (pendingSub >= 0 && (!G.CurrentSavepoint(out nowSub, out nowSp) || nowSub != pendingSub))
+            {
+                Status("the load did not reach " + e.subscene + ": not moved to '" + e.name + "'");
+                return;
+            }
             G.Teleport(e.pos);
             Status("moved to '" + e.name + "' after " + pendingWhy);
         }
@@ -178,7 +213,7 @@ namespace InsideDev
                 var e = entries[respawnEntry];
                 int sub, sp;
                 if (!G.CurrentSavepoint(out sub, out sp) || SubIndex(e.subscene) != sub) return;   // respawned in another area: leave it
-                pending = e; pendingWhy = "respawn"; loadDone = true; settleFrames = 0;
+                pending = e; pendingWhy = "respawn"; loadDone = true; settleFrames = 0; pendingAt = Time.realtimeSinceStartup; pendingSub = sub;
             }
             catch (Exception ex) { DevLog.Error("custom spawns loadFinished", ex); }
         }

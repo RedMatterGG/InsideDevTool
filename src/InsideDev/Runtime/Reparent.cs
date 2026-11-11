@@ -24,17 +24,22 @@ namespace InsideDev
             if (go == null) return "no object";
             var t = go.transform;
             for (var p = parent; p != null; p = p.parent) if (p == t) return "can't put " + go.name + " under its own child";
-            if (t.parent == parent) return go.name + " is already there";
+            if (t.parent == parent) { Mods.actionOk = true; RebindPending(); return go.name + " is already there"; }
             if (!original.ContainsKey(go.GetInstanceID()))
             {
                 original[go.GetInstanceID()] = t.parent;
                 originalSel[go.GetInstanceID()] = new ObjectSelector { path = Inspector.PathOf(t), name = go.name, hasPos = true, pos = t.position }.ToString();
             }
+            bool wasRoot = t.parent == null;
             t.SetParent(parent, true);
-            Rebind(t);
+            int waiting = Rebind(t);
+            // a new or a lost root is not in the object database's cached root list: without this the object and
+            // everything below it would drop out of the database until the next root refresh
+            if (wasRoot || parent == null) ObjectDatabase.MarkDirty("reparent");
             string sel = parent != null ? ObjectSelector.From(parent.gameObject).ToString() : "(root)";
             ChangeRecorder.Action(go, "reparent", null, sel, source);
-            string msg = go.name + " now under " + (parent != null ? parent.name : "(scene root)");
+            Mods.actionOk = true;
+            string msg = go.name + " now under " + (parent != null ? parent.name : "(scene root)") + (waiting > 0 ? " (" + waiting + " animation(s) above it are switched off: their bindings are rebuilt when they switch on)" : "");
             DevLog.Write("[reparent] " + msg);
             return msg;
         }
@@ -44,8 +49,10 @@ namespace InsideDev
             Transform p;
             if (go == null || !original.TryGetValue(go.GetInstanceID(), out p)) return "not moved";
             original.Remove(go.GetInstanceID()); originalSel.Remove(go.GetInstanceID());
+            bool wasRoot = go.transform.parent == null;
             go.transform.SetParent(p, true);
             Rebind(go.transform);
+            if (wasRoot || p == null) ObjectDatabase.MarkDirty("reparent");
             ChangeRecorder.Action(go, "reparent", null, p != null ? ObjectSelector.From(p.gameObject).ToString() : "(root)", "inspector");
             return go.name + " back under " + (p != null ? p.name : "(scene root)");
         }
@@ -53,20 +60,45 @@ namespace InsideDev
         // Legacy Animation components bind their clip paths once (INSIDE pre-builds them at load through
         // Animation.RebuildStateForEverythingIncremental, see AnimationPreAwake). After a move they still point at the
         // old place, so every Animation above the object rebuilds its bindings here, the same way the game does it.
+        // An Animation on an object that is switched off is not touched (walking its states crashes this engine build,
+        // see AnimSafe): it is remembered and rebound once it is active. Returns how many wait for that.
         public static int Rebind(Transform t)
         {
-            int n = 0;
+            int waiting = 0;
             for (var p = t.parent; p != null; p = p.parent)
                 foreach (var an in p.GetComponents<Animation>())
-                    if (an != null) { RebindAnimation(an); n++; }
-            return n;
+                {
+                    if (an == null) continue;
+                    if (AnimSafe.CanWalkStates(an)) RebindAnimation(an);
+                    else { if (!pending.Contains(an)) pending.Add(an); waiting++; }
+                }
+            return waiting;
+        }
+
+        static readonly List<Animation> pending = new List<Animation>();
+        public static int PendingRebinds { get { return pending.Count; } }
+
+        // rebinds the animations that were switched off when something below them moved and are active now
+        // (called by the mod runtime four times a second while any wait, and by every later move)
+        public static void RebindPending()
+        {
+            for (int i = pending.Count - 1; i >= 0; i--)
+            {
+                var an = pending[i];
+                if (an == null) { pending.RemoveAt(i); continue; }
+                if (!AnimSafe.CanWalkStates(an)) continue;
+                pending.RemoveAt(i);
+                RebindAnimation(an);
+                DevLog.Write("[reparent] " + an.name + " switched on: animation bindings rebuilt");
+            }
         }
 
         // Rebuilding alone keeps the old bindings (measured: the curtains stayed on frame 0 while the clip played).
         // Removing and re-adding each clip makes Unity create fresh states that resolve the paths again; the
-        // playing state (time / weight / enabled) is carried over.
+        // playing state (time / weight / enabled) is carried over. Only for an Animation that is active.
         public static void RebindAnimation(Animation an)
         {
+            if (!AnimSafe.CanWalkStates(an)) return;
             try
             {
                 var states = new List<AnimationState>();
