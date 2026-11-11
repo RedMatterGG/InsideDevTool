@@ -35,6 +35,9 @@ namespace InsideDev
             if (requested == Backend.Auto) Switch(PreferredBackend, "renderer " + r.Name + " prefers " + PreferredBackend);
             RequestProbe("renderer switch", 3);
         }
+
+        // MultiCam and the replay lab put their own renderer in place for clean takes
+        static bool IsNullRenderer { get { return renderer != glRenderer && renderer != meshRenderer; } }
         public static readonly Draw draw = new Draw();
         public static Action<Draw> buildWorld;          // editor fills the world layer (overlay, HUD, diag board)
 
@@ -51,6 +54,8 @@ namespace InsideDev
         public static string lastError;
         public static int uiCmds;
         public static bool uiPanelOpen;
+        public static long emptySubmits;        // frames in which nothing had to be drawn (no GL work at all)
+        static bool lastSubmitEmpty;
         static float lastErrorLog;
 
         // ---------------------------------------------------------------- focus / screen / scene
@@ -59,7 +64,7 @@ namespace InsideDev
         public static int firstSubmitAfterRegainCount, maxRegainFrames, probeVerifiedCount, probeFailedCount;
         static int regainFrame = -1;
         static bool awaitFirstAfterRegain;
-        static int sw, sh; static bool sfull; static string levelName;
+        static int sw, sh, levelIndex = -1; static bool sfull; static string levelName;
         static int eofGraceUntil;
         static int eofStreak;
 
@@ -80,26 +85,71 @@ namespace InsideDev
             if (inited) return;
             inited = true;
             Draw.Metrics = renderer;
-            Camera.onPostRender += OnCamPost;
-            Camera.onPreCull += OnCamPreCull;
-            try { Font.textureRebuilt += OnFontRebuilt; } catch (Exception e) { DevLog.Error("font rebuild hook", e); }
+            // the glyph table needs the rebuild callback; render.glyphcache=0 switches it off
+            try { Font.textureRebuilt += OnFontRebuilt; RenderResources.glyphCache = EditorState.Get("render.glyphcache", true); } catch (Exception e) { DevLog.Error("font rebuild hook", e); }
             sw = Screen.width; sh = Screen.height; sfull = Screen.fullScreen;
-            try { levelName = Application.loadedLevelName; } catch { levelName = "?"; }
+            try { levelName = Application.loadedLevelName; levelIndex = Application.loadedLevel; } catch { levelName = "?"; }
+            SyncCamHooks(Time.frameCount);
             RequestProbe("startup", 90);
+            Doctor.Register("editor", DoctorRows);
             Event("render host up: backend " + requested + " -> " + active + ", " + sw + "x" + sh + (sfull ? " fullscreen" : " windowed"));
         }
 
+        // Everything the host created goes away with it, and the settings changed in the last second are written.
         public static void Shutdown()
         {
-            Camera.onPostRender -= OnCamPost;
-            Camera.onPreCull -= OnCamPreCull;
+            SetCamHooks(false);
             try { Font.textureRebuilt -= OnFontRebuilt; } catch { }
+            RenderResources.glyphCache = false;
+            try { FocusTest.Abort(); } catch { }
+            try { if (overlayCam != null) UObj.Destroy(overlayCam.gameObject); } catch { }
+            overlayCam = null;
+            try { if (probeTex != null) UObj.Destroy(probeTex); } catch { }
+            probeTex = null;
+            try { glRenderer.DestroyResources(); meshRenderer.DestroyResources(); } catch { }
+            try { EditorState.Flush(); ModifiedPanel.Flush(); } catch (Exception e) { DevLog.Error("flush settings", e); }
+            Doctor.Unregister("editor");
             inited = false;
         }
 
         static void OnFontRebuilt(Font f)
         {
+            RenderResources.OnAtlasRebuilt(f);
             Event("font atlas rebuilt: " + (f != null ? f.name : "?"));
+        }
+
+        // ---------------------------------------------------------------- camera callbacks (on demand)
+        // Camera.onPreCull / onPostRender run for every camera of every frame. They are only needed while the editor draws
+        // from a camera (overlay or game-camera backend) or while the diagnostics want the observed render order.
+        static bool camHooks;
+        static int camOrderUntil = -1;
+
+        // The Diagnostics tab, the board and the "cams" report ask for the observed camera order for the next frames.
+        public static void WantCameraOrder() { camOrderUntil = Time.frameCount + 120; if (!camHooks && inited) SetCamHooks(true); }
+
+        // False until one complete frame was observed after the callbacks were switched on.
+        public static bool CameraOrderKnown { get { return camHooks && Time.frameCount - camHooksFrame >= 2; } }
+        static int camHooksFrame;
+
+        static bool DiagWanted(int f) { return RenderDiag.board || f <= camOrderUntil; }
+
+        static void SyncCamHooks(int f)
+        {
+            bool need = active != Backend.EndOfFrame || DiagWanted(f);
+            if (need != camHooks) SetCamHooks(need);
+        }
+
+        static void SetCamHooks(bool on)
+        {
+            if (on == camHooks) return;
+            camHooks = on;
+            if (on) { Camera.onPostRender += OnCamPost; Camera.onPreCull += OnCamPreCull; camHooksFrame = Time.frameCount; }
+            else
+            {
+                Camera.onPostRender -= OnCamPost; Camera.onPreCull -= OnCamPreCull;
+                orderCount = lastOrderCount = 0; frameOrderFrame = -1; finalCam = null;
+                Array.Clear(order, 0, order.Length); Array.Clear(lastOrder, 0, lastOrder.Length);
+            }
         }
 
         public static void OnFocus(bool f)
@@ -127,6 +177,7 @@ namespace InsideDev
         public static void OnLevelLoaded(int level)
         {
             renderer.Invalidate("scene load " + level);
+            RenderDiag.OnLevelLoaded();
             ObjectDatabase.MarkDirty("scene load " + level);
             Levels.Bump("level load");
             RefreshCameras();
@@ -152,16 +203,26 @@ namespace InsideDev
                 RefreshCameras();
                 RequestProbe("screen change", 5);
             }
-            // scene change (INSIDE streams additively; loadedLevelName changes on real level loads)
-            string ln = null;
-            if (f % 30 == 0) { try { ln = Application.loadedLevelName; } catch { } }
-            if (ln != null && ln != levelName) { levelName = ln; renderer.Invalidate("level " + ln); RefreshCameras(); }
+            // scene change (INSIDE streams additively; the loaded level changes on real level loads). The index is
+            // compared: asking for the name builds a string every time.
+            if (f % 30 == 0)
+            {
+                int li = levelIndex;
+                try { li = Application.loadedLevel; } catch { }
+                if (li != levelIndex)
+                {
+                    levelIndex = li;
+                    try { levelName = Application.loadedLevelName; } catch { levelName = "?"; }
+                    renderer.Invalidate("level " + levelName); RefreshCameras();
+                }
+            }
 
             Watchdog(f);
             FocusTest.Tick();
+            SyncCamHooks(f);
             if (active == Backend.OverlayCamera) MaintainOverlayCamera();
-            else if (overlayCam != null && overlayCam.enabled) overlayCam.enabled = false;
-            if (camScanDue < Time.realtimeSinceStartup) RefreshCameras();
+            else if ((object)overlayCam != null && overlayCam != null && overlayCam.enabled) overlayCam.enabled = false;
+            if (camHooks && camScanDue < Time.realtimeSinceStartup) RefreshCameras();
         }
 
         // Frame-based liveness: a pause (focus loss) stops frames, so it can never look like a dead callback.
@@ -198,6 +259,7 @@ namespace InsideDev
             if (b == active) return;
             Event("backend " + active + " -> " + b + ": " + why);
             active = b;
+            if (inited) SyncCamHooks(Time.frameCount);
             if (b == Backend.OverlayCamera) MaintainOverlayCamera();
             renderer.Invalidate("backend switch");
             RequestProbe("backend switch", 3);
@@ -241,7 +303,8 @@ namespace InsideDev
                     }
                     return;
                 }
-                if (c == WorldCam())
+                // the gameplay camera is only looked up for the backend that draws from it and for the diagnostics counters
+                if ((active == Backend.GameCameraPost || DiagWanted(Time.frameCount)) && c == WorldCam())
                 {
                     gameCamFrame = Time.frameCount; gameCamCount++;
                     if (active == Backend.GameCameraPost) Submit("gameCameraPost");
@@ -266,9 +329,21 @@ namespace InsideDev
                     catch (Exception e) { RateLimitedError("build world layer", e); }
                 }
                 Color? probe = null;
-                if (probePhase >= 0 && probePhase < 2 && f >= probeAtFrame) { probe = ProbeColors[probePhase]; probeDrawnFrame = f; probeDrawnVia = via; }
+                if (probePhase >= 0 && probePhase < 2 && f >= probeAtFrame)
+                {
+                    if (ProbeMayDraw()) { probe = ProbeColors[probePhase]; probeDrawnFrame = f; probeDrawnVia = via; probeWaiting = false; }
+                    else if (!probeWaiting)
+                    {
+                        probeWaiting = true;
+                        if (probeResultFrame < 0) probeResult = "not run yet: waits until the editor draws something and no capture runs (" + probeReason + ")";
+                    }
+                }
                 var st = new RenderStats();
-                bool ok = renderer.Submit(draw, probe, ref st);
+                bool ok;
+                // nothing of ours is visible: no resource check, no GL state, no draw call
+                lastSubmitEmpty = !probe.HasValue && draw.world.Count == 0 && draw.ui.Count == 0;
+                if (lastSubmitEmpty) { ok = true; st.width = sw; st.height = sh; emptySubmits++; }
+                else ok = renderer.Submit(draw, probe, ref st);
                 lastStats = st;
                 if (ok)
                 {
@@ -315,14 +390,33 @@ namespace InsideDev
         public static int probeResultFrame = -1;
         public static bool probeOk;
         static int autoSwitchesForProbe;
+        static bool probeForce, probeWaiting;
 
-        public static void RequestProbe(string reason, int delayFrames)
+        // The marker is two 6 px squares in the corners of the game image for two frames. A check the host asks for by
+        // itself (start, focus regained, resolution or backend change) therefore waits until the editor draws something
+        // anyway and no capture is running; a check a person or a client asks for ("render probe", the Diagnostics
+        // button) runs at once.
+        public static void RequestProbe(string reason, int delayFrames) { RequestProbe(reason, delayFrames, reason == "remote" || reason == "manual"); }
+
+        public static void RequestProbe(string reason, int delayFrames, bool now)
         {
             probeReason = reason;
+            probeForce = now;
+            probeWaiting = false;
             probePhase = 0;
             probeHits = 0;
             probeAtFrame = Time.frameCount + Math.Max(1, delayFrames);
             probeDrawnFrame = -1;
+        }
+
+        public static bool ProbePending { get { return probePhase >= 0; } }
+
+        static bool ProbeMayDraw()
+        {
+            if (probeForce || FocusTest.Running) return true;
+            if (draw.world.Count == 0 && draw.ui.Count == 0) return false;
+            if (IsNullRenderer || MultiCam.Running || MultiCamSession.active || SceneRecorder.active != null) return false;
+            return Owners.Holder(Owners.Readback) == null;
         }
 
         static void ProbeReadback(string where)
@@ -494,6 +588,7 @@ namespace InsideDev
             foreach (var l in LivenessLines()) sb.Append(l.Key).Append(l.Value ? "  [OK]  " : "  [--]  ").Append(l.Detail).Append('\n');
             sb.Append("RESOURCES        ").Append(rok ? "[OK]  " : "[BAD] ").Append(res).Append('\n');
             sb.Append("PIXEL PROBE      ").Append(probeOk ? "[OK]  " : "[--]  ").Append(probeResult).Append(probeResultFrame >= 0 ? " (" + Ago(probeResultFrame) + ")" : "").Append('\n');
+            sb.Append("TEXT METRICS     ").Append(RenderResources.MetricsStatus()).Append("  frames with nothing to draw ").Append(emptySubmits).Append("  camera callbacks ").Append(camHooks ? "on" : "off").Append('\n');
             sb.Append("focus lost ").Append(focusLostCount).Append("  regained ").Append(focusRegainCount).Append("  submits ").Append(submitCount).Append("  fails ").Append(submitFails)
               .Append(lastError != null ? "  last error: " + lastError : "").Append('\n');
             sb.Append("recent render events:\n");
@@ -511,7 +606,39 @@ namespace InsideDev
             l.Add(new Live { Key = "INPUT ALIVE     ", Value = inputPollFrame >= f - 1, Detail = "polled " + Ago(inputPollFrame) + ", last input event " + Ago(inputEventFrame) });
             l.Add(new Live { Key = "RENDER CALLBACK ", Value = eofFrame >= f - 2 || ovlFrame >= f - 2, Detail = "eof " + Ago(eofFrame) + " (" + eofCount + ")  overlayCam " + Ago(ovlFrame) + " (" + ovlCount + ")  gameCam " + Ago(gameCamFrame) + " (" + gameCamCount + ")" });
             l.Add(new Live { Key = "UI BUILD ALIVE  ", Value = uiBuildFrame >= f - 1 && worldBuildFrame >= f - 2, Detail = "ui " + Ago(uiBuildFrame) + (uiPanelOpen ? " (panel open, " + uiCmds + " cmds)" : " (panel closed)") + "  world/HUD " + Ago(worldBuildFrame) });
-            l.Add(new Live { Key = "UI SUBMIT ALIVE ", Value = submitOkFrame >= f - 2, Detail = "last ok " + Ago(submitOkFrame) + " via " + active + "  batches " + lastStats.batches + " passes " + lastStats.passes + " prims " + lastStats.Primitives + " (q" + lastStats.quads + " l" + lastStats.lines + " g" + lastStats.glyphs + ")" });
+            l.Add(new Live { Key = "UI SUBMIT ALIVE ", Value = submitOkFrame >= f - 2, Detail = "last ok " + Ago(submitOkFrame) + " via " + active + (lastSubmitEmpty ? "  (nothing to draw)" : "  batches " + lastStats.batches + " passes " + lastStats.passes + " prims " + lastStats.Primitives + " (q" + lastStats.quads + " l" + lastStats.lines + " g" + lastStats.glyphs + ")") });
+            return l;
+        }
+
+        // "diag json": the same facts as one JSON line
+        public static string ReportJson()
+        {
+            int f = Time.frameCount;
+            string res; bool rok = renderer.ResourcesOk(out res);
+            bool alive = submitOkFrame >= f - 2;
+            return JsonLine.Obj("ok", alive && (rok || lastSubmitEmpty), "frame", f, "screenW", Screen.width, "screenH", Screen.height, "fullscreen", Screen.fullScreen,
+                "focused", focused, "paused", paused, "backendRequested", requested.ToString(), "backend", active.ToString(), "renderer", renderer.Name,
+                "submits", submitCount, "submitFails", submitFails, "emptySubmits", emptySubmits, "framesSinceSubmit", submitOkFrame < 0 ? -1 : f - submitOkFrame,
+                "resourcesOk", rok, "resources", res, "probe", probeResultFrame < 0 ? "not run" : probeOk ? "verified" : "failed", "probeText", probeResult,
+                "probePending", ProbePending, "focusLost", focusLostCount, "focusRegained", focusRegainCount, "cameraCallbacks", camHooks, "lastError", lastError);
+        }
+
+        // doctor: quick, reads only
+        static List<Doctor.Row> DoctorRows()
+        {
+            var l = new List<Doctor.Row>();
+            int f = Time.frameCount;
+            bool alive = submitOkFrame >= f - 3;
+            l.Add(new Doctor.Row("editor", "render", submitFrame < 0 ? Doctor.Info : alive ? Doctor.Ok : Doctor.Fail,
+                submitFrame < 0 ? "no frame submitted yet" : "backend " + requested + " -> " + active + ", renderer " + renderer.Name + ", last frame " + Ago(submitOkFrame) + ", " + submitFails + " of " + submitCount + " failed" + (lastError != null ? ", last error: " + lastError : ""),
+                "render reset, then diag"));
+            if (RenderResources.rebuilds == 0) l.Add(new Doctor.Row("editor", "render resources", Doctor.Info, "not built yet (the editor has drawn nothing so far)"));
+            else { string res; bool rok = renderer.ResourcesOk(out res); l.Add(new Doctor.Row("editor", "render resources", rok ? Doctor.Ok : Doctor.Fail, res, "render reset")); }
+            l.Add(new Doctor.Row("editor", "pixel check", probeResultFrame < 0 ? Doctor.Info : probeOk ? Doctor.Ok : Doctor.Warn, probeResult, "render probe (with the panel open), then diag"));
+            bool cfgOk; string cfg = EditorState.FileStatus(out cfgOk);
+            l.Add(new Doctor.Row("editor", "settings file", cfgOk ? Doctor.Ok : Doctor.Warn, cfg, "close what holds the file open; the settings of this session are kept in memory until it can be read"));
+            l.Add(new Doctor.Row("editor", "keyboard", Doctor.Info, InputCapture.Status));
+            l.Add(new Doctor.Row("editor", "code graph", Doctor.Info, LogicPanel.ScanStatus));
             return l;
         }
     }

@@ -18,7 +18,8 @@ namespace InsideDev
     //   - category chips narrow the list: animation / sounds / scripts / triggers / state machines / characters
     public static class SmartFind
     {
-        public sealed class Hit { public ObjRecord r; public int score; public string text; public Color color; public int count = 1; public float nearest, farthest; public List<ObjRecord> members; }
+        // text and color are filled by whoever shows the hit (Describe); the Explorer does that for the rows on screen only
+        public sealed class Hit { public ObjRecord r; public int score; public string text; public Color color; public int count = 1; public float nearest, farthest; public List<ObjRecord> members; internal int stamp; }
 
         public const int Cap = 3000;
         public static int Truncated;   // rows left out by the cap in the last Run
@@ -39,7 +40,7 @@ namespace InsideDev
         static bool Clutter(ObjRecord r)
         {
             string n = r.name;
-            if (n.StartsWith("Batch_") || n.StartsWith("DECAL_") || n.StartsWith("LIGHT_Specular") || n.StartsWith("FX_Sunbeam") || n.Contains("(Clone)")) return true;
+            if (n.StartsWith("Batch_", StringComparison.Ordinal) || n.StartsWith("DECAL_", StringComparison.Ordinal) || n.StartsWith("LIGHT_Specular", StringComparison.Ordinal) || n.StartsWith("FX_Sunbeam", StringComparison.Ordinal) || n.Contains("(Clone)")) return true;
             if (r.pathLower.Contains("/bones/")) return true;
             // pure render mesh: only Transform + MeshFilter + a renderer, no children
             if (r.childCount == 0 && (r.kind == ObjKind.Renderer || r.kind == ObjKind.None) && r.compCount <= 3) return true;
@@ -67,12 +68,18 @@ namespace InsideDev
             {
                 case Cat.Animation: return (r.kind & ObjKind.Animation) != 0;
                 case Cat.Sounds: return (r.kind & ObjKind.Audio) != 0 || SoundsOf(r).Count > 0;
-                case Cat.Scripts: return GameScripts(r).Count > 0;
+                case Cat.Scripts: return HasGameScript(r);
                 case Cat.Triggers: return (r.kind & ObjKind.Trigger) != 0;
                 case Cat.StateMachines: return (r.kind & ObjKind.StateMachine) != 0;
                 case Cat.Characters: return (r.kind & ObjKind.Character) != 0 || r.Has("AnimcontrolledCharacter") || r.Has("AlbinoAI");
             }
             return true;
+        }
+
+        static bool HasGameScript(ObjRecord r)
+        {
+            foreach (var c in r.comps) if (!engine.Contains(c) && c != "PlayMakerFSM" && c != "(missing)") return true;
+            return false;
         }
 
         public static List<string> GameScripts(ObjRecord r)
@@ -82,13 +89,13 @@ namespace InsideDev
             return l;
         }
 
-        // sound events this object references (sound library bindings) - cached per database pass
+        // sound events this object references (sound library bindings) - cached until the set of loaded objects changes
         static readonly Dictionary<int, List<string>> soundsByGo = new Dictionary<int, List<string>>();
         static int soundsVersion = -1;
         static readonly List<string> none = new List<string>();
         public static List<string> SoundsOf(ObjRecord r)
         {
-            int v = SoundLibrary.defs.Count * 7919 + ObjectDatabase.completedPasses;
+            int v = SoundLibrary.defs.Count * 7919 + SceneStamp.Value;
             if (v != soundsVersion)
             {
                 soundsVersion = v; soundsByGo.Clear();
@@ -153,6 +160,25 @@ namespace InsideDev
             return sb.ToString();
         }
 
+        // what makes two hits copies of each other: name, kind, component count and the name of the parent (a part of
+        // the path, compared in place: a key string per match was most of the garbage of a short query)
+        struct GroupKey { public string name, path; public int kind, comps, parStart, parLen; }
+        sealed class GroupCmp : IEqualityComparer<GroupKey>
+        {
+            public bool Equals(GroupKey a, GroupKey b)
+            {
+                return a.kind == b.kind && a.comps == b.comps && a.parLen == b.parLen && a.name == b.name
+                    && string.CompareOrdinal(a.path, a.parStart, b.path, b.parStart, a.parLen) == 0;
+            }
+            public int GetHashCode(GroupKey k)
+            {
+                int h = k.name.GetHashCode() * 31 + k.kind; h = h * 31 + k.comps; h = h * 31 + k.parLen;
+                if (k.parLen > 0) h = h * 31 + k.path[k.parStart] + k.path[k.parStart + k.parLen - 1] * 7;
+                return h;
+            }
+        }
+        static readonly Dictionary<GroupKey, Hit> groups = new Dictionary<GroupKey, Hit>(new GroupCmp());
+
         // ranked hits; hiddenClutter / pathOnly report what was left out
         public static List<Hit> Run(string query, Cat cat, bool clutter, bool pathMatches, out int hiddenClutter, out int hiddenPath)
         {
@@ -188,13 +214,14 @@ namespace InsideDev
                 res.Add(new Hit { r = r, score = score, nearest = ch != null ? ((Vector2)(r.pos - boy)).magnitude : 0f });
             }
             // copies (same name, same kind of object, same parent name - e.g. 17 background pigs "PigSS") become one row
-            var groups = new Dictionary<string, Hit>();
+            groups.Clear();
             var merged = new List<Hit>();
             foreach (var h in res)
             {
-                int k = h.r.path.LastIndexOf('/'); string par = k > 0 ? h.r.path.Substring(0, k) : "";
-                int k2 = par.LastIndexOf('/'); par = k2 >= 0 ? par.Substring(k2 + 1) : par;
-                string key = h.r.name + "|" + (int)h.r.kind + "|" + h.r.compCount + "|" + par;
+                string path = h.r.path;
+                int k = path.LastIndexOf('/');
+                var key = new GroupKey { name = h.r.name, kind = (int)h.r.kind, comps = h.r.compCount, path = path };
+                if (k > 0) { key.parStart = path.LastIndexOf('/', k - 1) + 1; key.parLen = k - key.parStart; }
                 Hit g;
                 if (groups.TryGetValue(key, out g))
                 {
@@ -206,6 +233,7 @@ namespace InsideDev
                 }
                 h.farthest = h.nearest; groups[key] = h; merged.Add(h);
             }
+            groups.Clear();
             res = merged;
             res.Sort((a, b) => b.score != a.score ? b.score.CompareTo(a.score) : string.CompareOrdinal(a.r.name, b.r.name));
             // rows beyond the cap are cut, and reported (Truncated) so nothing disappears silently

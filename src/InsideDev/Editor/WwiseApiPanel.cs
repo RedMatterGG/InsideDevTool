@@ -15,7 +15,9 @@ namespace InsideDev
         static List<Row> rows;
         static string filter = "";
         static bool onlyWatched, onlyCalled;
-        static float builtAt = -99;
+        static float builtAt = -99, hooksAt;
+        static int builtExports; static bool builtAvailable;
+        static readonly Dictionary<string, WwiseNative.HookInfo> hookTmp = new Dictionary<string, WwiseNative.HookInfo>();
 
         public static List<Row> Build()
         {
@@ -39,7 +41,26 @@ namespace InsideDev
                     list.Add(r);
                 }
             list.Sort((a, b) => string.CompareOrdinal(a.entry, b.entry));
+            builtExports = exports.Count; builtAvailable = WwiseNative.Available;
             return list;
+        }
+
+        // While the game runs only the hook table changes (calls, resolved): the method list, the signatures and the
+        // export addresses of the table are kept, and rows whose counter moved get a new text.
+        static bool RefreshHooks(List<Row> list)
+        {
+            hookTmp.Clear();
+            for (int i = 0; i < 400; i++) { WwiseNative.HookInfo h; if (!WwiseNative.GetHook(i, out h)) break; hookTmp[h.name] = h; }
+            bool changed = false;
+            foreach (var r in list)
+            {
+                WwiseNative.HookInfo h;
+                bool w = hookTmp.TryGetValue(r.entry, out h);
+                bool res = w && h.resolved; long calls = w ? h.calls : 0;
+                if (w == r.watched && res == r.resolved && calls == r.calls) continue;
+                r.watched = w; r.resolved = res; r.calls = calls; r.text = null; changed = true;
+            }
+            return changed;
         }
 
         static string Sig(MethodInfo m)
@@ -59,10 +80,10 @@ namespace InsideDev
             sb.Append("  native tracer     ").Append(WwiseNative.Available ? "OK (v" + WwiseNative.NativeVersion + ", level " + s.level + (s.enabled == 0 ? ", HOOKS DISABLED by wwise_off.flag" : "") + ")" : "NOT AVAILABLE - " + WwiseNative.Problem).Append('\n');
             if (WwiseNative.Available)
             {
-                sb.Append("  AkSoundEngine.dll ").Append(s.akBase != 0 ? "base 0x" + s.akBase.ToString("X") + " size 0x" + s.akSize.ToString("X") + " PE timestamp 0x" + s.akStamp.ToString("X8") + " (" + new DateTime(1970, 1, 1).AddSeconds(s.akStamp).ToString("yyyy-MM-dd") + "), " + s.akExports + " exports" : "not seen yet").Append('\n');
+                sb.Append("  AkSoundEngine.dll ").Append(s.akBase != 0 ? "base 0x" + s.akBase.ToString("X") + " size 0x" + s.akSize.ToString("X") + " PE timestamp 0x" + s.akStamp.ToString("X8") + " (" + new DateTime(1970, 1, 1).AddSeconds(s.akStamp).ToString("yyyy-MM-dd", Fmt.IC) + "), " + s.akExports + " exports" : "not seen yet").Append('\n');
                 sb.Append("  path              ").Append(WwiseNative.ModulePath()).Append('\n');
                 sb.Append("  entry points      ").Append(s.resolvedHooked).Append(" of ").Append(s.hookCount).Append(" watched resolved; ").Append(s.resolvedAll).Append(" CSharp_* resolved by Mono in total\n");
-                sb.Append("  queue             ").Append(s.total).Append(" records, ").Append(s.head - s.tail).Append(" pending, ").Append(s.dropped).Append(" dropped; last drain ").Append(WwiseNative.lastDrained).Append(" in ").Append(WwiseNative.lastDrainMs.ToString("0.00")).Append(" ms (max batch ").Append(WwiseNative.maxDrained).Append(")\n");
+                sb.Append("  queue             ").Append(s.total).Append(" records, ").Append(s.head - s.tail).Append(" pending, ").Append(s.dropped).Append(" dropped; last drain ").Append(WwiseNative.lastDrained).Append(" in ").Append(Fmt.F(WwiseNative.lastDrainMs, "0.00")).Append(" ms (max batch ").Append(WwiseNative.maxDrained).Append(")\n");
                 sb.Append("  RenderAudio calls ").Append(s.render).Append("   callbacks parsed ").Append(s.cbItems).Append(s.cbBad > 0 ? "  (" + s.cbBad + " malformed walks stopped)" : "").Append('\n');
             }
             int mapped = 0; foreach (var o in AudioTrace.objs.Values) if (AudioTrace.Unity(o.id) != null) mapped++;
@@ -74,7 +95,10 @@ namespace InsideDev
             return sb.ToString();
         }
 
-        static string[] diag; static float diagAt; static string visKey; static List<Row> visRows; static readonly List<Row> vis = new List<Row>();
+        static string[] diag; static float diagAt; static string visFilter; static bool visWatched, visCalled; static List<Row> visRows; static readonly List<Row> vis = new List<Row>();
+        static readonly Color cHead = new Color(0.55f, 0.9f, 0.75f, 1f), cMissing = new Color(1f, 0.4f, 0.35f, 1f), cCalled = new Color(0.5f, 1f, 0.6f, 1f);
+        static UI curUi;
+        static readonly Action<int> drawRow = DrawRow;
         // §86: comparison with the stock Wwise Unity integration 2014.1.2 (build 5195), the closest public reference to
         // INSIDE's 2014.1.6 build 5318. 619 of 635 entry points exist in stock with identical signatures.
         static readonly Dictionary<string, string> nonStock = new Dictionary<string, string>
@@ -140,21 +164,24 @@ namespace InsideDev
         public static void Draw(UI ui)
         {
             // diagnostics text refreshed twice a second, the table rows only when the table or its counts change
-            if (diag == null || Time.realtimeSinceStartup - diagAt > 0.5f) { diag = (Diagnostics() + StockReport()).Split('\n'); diagAt = Time.realtimeSinceStartup; }
-            foreach (var line in diag) if (line.Length > 0) ui.Label(line, (line.StartsWith("AUDIO") || line.StartsWith("STOCK")) ? new Color(0.55f, 0.9f, 0.75f, 1f) : UI.Txt);
+            Background.Want(Background.Audio, 5f);
+            float now = Time.realtimeSinceStartup;
+            if (diag == null || now - diagAt > 0.5f) { diag = (Diagnostics() + StockReport()).Split('\n'); diagAt = now; }
+            foreach (var line in diag) if (line.Length > 0) ui.Label(line, (line.StartsWith("AUDIO", StringComparison.Ordinal) || line.StartsWith("STOCK", StringComparison.Ordinal)) ? cHead : UI.Txt);
             ui.BeginRow();
-            if (ui.Button("Refresh API table") || rows == null || Time.realtimeSinceStartup - builtAt > 5f) { rows = Build(); builtAt = Time.realtimeSinceStartup; }
+            // the whole table again only on request, or while the native module was not there at the last build
+            if (ui.Button("Refresh API table") || rows == null || ((builtExports == 0 || builtAvailable != WwiseNative.Available) && now - builtAt > 5f)) { rows = Build(); builtAt = hooksAt = now; }
+            else if (now - hooksAt > 5f) { hooksAt = now; if (RefreshHooks(rows)) visRows = null; }
             onlyWatched = ui.Toggle(onlyWatched, "watched only");
             onlyCalled = ui.Toggle(onlyCalled, "called only");
             ui.EndRow();
             ui.BeginRow();
             ui.Label("Filter:", null, 40);
-            ui.TextField("wapi_filter", ref filter, Mathf.Max(80, ui.Width - 4));
+            EditorInput.Field(ui, "wapi_filter", ref filter, Mathf.Max(80, ui.Width - 4));
             ui.EndRow();
-            string vk = filter + "|" + onlyWatched + onlyCalled;
-            if (vk != visKey || visRows != rows)
+            if (filter != visFilter || onlyWatched != visWatched || onlyCalled != visCalled || visRows != rows)
             {
-                visKey = vk; visRows = rows; vis.Clear();
+                visFilter = filter; visWatched = onlyWatched; visCalled = onlyCalled; visRows = rows; vis.Clear();
                 foreach (var r in rows)
                 {
                     if (onlyWatched && !r.watched) continue;
@@ -164,18 +191,22 @@ namespace InsideDev
                 }
             }
             ui.Label("MANAGED (AkSoundEnginePINVOKE)                              NATIVE EXPORT        HOOK", UI.Dim);
-            ui.VirtualList("wapi_list", vis.Count, UI.ItemPitch, ui.Remaining, i =>
+            curUi = ui;
+            ui.VirtualList("wapi_list", vis.Count, UI.ItemPitch, ui.Remaining, drawRow);
+        }
+
+        static void DrawRow(int i)
+        {
+            if (i >= vis.Count) return;
+            var r = vis[i];
+            if (r.text == null)
             {
-                var r = vis[i];
-                if (r.text == null)
-                {
-                    string hook = !r.watched ? "-" : !r.resolved ? "watched, not resolved yet" : "HOOKED  " + r.calls + " calls";
-                    string org = Origin(r.entry);
-                    r.text = r.entry.PadRight(52) + " " + r.export.PadRight(20) + " " + hook + "    " + r.sig + (org != "STOCK" ? "    [" + org + "]" : "");
-                }
-                var c = r.export == "MISSING" ? new Color(1f, 0.4f, 0.35f, 1f) : r.watched && r.resolved ? (r.calls > 0 ? new Color(0.5f, 1f, 0.6f, 1f) : UI.Txt) : UI.Dim;
-                ui.Item(r.text, c);
-            });
+                string hook = !r.watched ? "-" : !r.resolved ? "watched, not resolved yet" : "HOOKED  " + r.calls + " calls";
+                string org = Origin(r.entry);
+                r.text = r.entry.PadRight(52) + " " + r.export.PadRight(20) + " " + hook + "    " + r.sig + (org != "STOCK" ? "    [" + org + "]" : "");
+            }
+            var c = r.export == "MISSING" ? cMissing : r.watched && r.resolved ? (r.calls > 0 ? cCalled : UI.Txt) : UI.Dim;
+            curUi.Item(r.text, c);
         }
 
         public static string Dump(string f, bool watchedOnly)

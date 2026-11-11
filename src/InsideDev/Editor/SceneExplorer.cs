@@ -17,12 +17,12 @@ namespace InsideDev
         static readonly List<ObjRecord> roots = new List<ObjRecord>();
         static readonly HashSet<int> open = new HashSet<int>();
         static readonly List<Row> rows = new List<Row>(4096);
+        static readonly Stack<Row> flatStack = new Stack<Row>(256);
         static int builtPass = -1, seenSelVersion = -1;
         static float builtAt;
         static bool rowsDirty = true;
         static string filter = "", lastFilter = null;
-        static int lastFilterPass = -1;
-                static int revealRow = -1;
+        static int revealRow = -1;
         static bool showInactive = true;
         public static float lastBuildMs;
 
@@ -30,8 +30,12 @@ namespace InsideDev
 
         public static string Status()
         {
-            return roots.Count + " roots, " + open.Count + " expanded, " + rows.Count + " rows" + (filter.Length > 0 ? ", find '" + filter + "' " + hits.Count + " hit(s)" : "") + ", build " + lastBuildMs.ToString("0.0") + " ms";
+            return roots.Count + " roots, " + open.Count + " expanded, " + rows.Count + " rows" + (filter.Length > 0 ? ", find '" + filter + "' " + hits.Count + " hit(s)" : "") + ", build " + Fmt.F(lastBuildMs, "0.0") + " ms";
         }
+
+        // sibling order: the index of every child is fetched once (one native call per record instead of two per comparison)
+        static int[] sortKeys = new int[256];
+        static ObjRecord[] sortRecs = new ObjRecord[256];
 
         static void Build()
         {
@@ -53,12 +57,27 @@ namespace InsideDev
                 l.Add(r);
             }
             roots.Sort((a, b) => string.CompareOrdinal(a.name, b.name));
+            int used = 0;
             foreach (var kv in kids)
-                kv.Value.Sort((a, b) =>
+            {
+                var l = kv.Value; int n = l.Count;
+                if (n < 2) continue;
+                if (sortKeys.Length < n) { sortKeys = new int[n + 256]; sortRecs = new ObjRecord[n + 256]; }
+                bool ordered = true; int prev = int.MinValue;
+                for (int i = 0; i < n; i++)
                 {
-                    int ia = a.t != null ? a.t.GetSiblingIndex() : 0, ib = b.t != null ? b.t.GetSiblingIndex() : 0;
-                    return ia.CompareTo(ib);
-                });
+                    var rec = l[i];
+                    int si = rec.t != null ? rec.t.GetSiblingIndex() : 0;
+                    sortKeys[i] = si; sortRecs[i] = rec;
+                    if (si < prev) ordered = false;
+                    prev = si;
+                }
+                if (n > used) used = n;
+                if (ordered) continue;
+                Array.Sort(sortKeys, sortRecs, 0, n);
+                for (int i = 0; i < n; i++) l[i] = sortRecs[i];
+            }
+            Array.Clear(sortRecs, 0, used);
             open.RemoveWhere(id => !ObjectDatabase.byId.ContainsKey(id));
             rowsDirty = true;
             lastBuildMs = (float)sw.Elapsed.TotalMilliseconds;
@@ -69,7 +88,7 @@ namespace InsideDev
             if (!rowsDirty) return;
             rowsDirty = false;
             rows.Clear();
-            var stack = new Stack<Row>();
+            var stack = flatStack; stack.Clear();
             for (int i = roots.Count - 1; i >= 0; i--) stack.Push(new Row { r = roots[i], depth = 0 });
             while (stack.Count > 0)
             {
@@ -95,6 +114,7 @@ namespace InsideDev
         public static void Draw(UI ui)
         {
             ObjectDatabase.Demand(5f);
+            Background.Want(Background.Objects, 5f);
             Build();
 
             // follow selections made elsewhere (inspector links, references, objects list, bridge)
@@ -106,7 +126,7 @@ namespace InsideDev
 
             ui.BeginRow();
             ui.Label("Find:", null, 34);
-            ui.TextField("exp_find", ref filter, Mathf.Max(80, ui.Width - 250));
+            EditorInput.Field(ui, "exp_find", ref filter, Mathf.Max(80, ui.Width - 250));
             if (ui.Button("Reveal selected") && Selection.Current != null) { filter = ""; Reveal(Selection.Current); }
             if (ui.Button("Collapse")) CollapseAll();
             bool si = ui.Toggle(showInactive, "inactive");
@@ -115,7 +135,11 @@ namespace InsideDev
 
             if (!ObjectDatabase.Ready) { ui.Label("scanning scene… (" + ObjectDatabase.Stats() + ")", UI.Dim); return; }
 
+            curUi = ui;
+            var sel = Selection.Current;
+            curSel = sel != null ? sel.GetInstanceID() : 0;
             if (filter.Trim().Length > 0) { DrawFiltered(ui); return; }
+            findDelay.Set("");
 
             Flatten();
             if (revealRow != 0 && revealRow != -1)
@@ -123,32 +147,46 @@ namespace InsideDev
                 int idx = rows.FindIndex(x => x.r.id == revealRow);
                 if (idx >= 0)
                 {
-                    float y = idx * UI.ItemPitch, h = ui.Remaining, cur = ui.ScrollOf(ListId);
-                    if (y < cur || y > cur + h - UI.ItemPitch * 2) ui.ScrollTo(ListId, y - h * 0.4f);
+                    // tree rows are BeginRow / EndRow rows
+                    float y = idx * UI.RowPitch, h = ui.Remaining, cur = ui.ScrollOf(ListId);
+                    if (y < cur || y > cur + h - UI.RowPitch * 2) ui.ScrollTo(ListId, y - h * 0.4f);
                 }
                 revealRow = -1;
             }
-            var sel = Selection.Current;
-            int selId = sel != null ? sel.GetInstanceID() : 0;
-            curUi = ui; curSel = selId;
-            ui.VirtualList(ListId, rows.Count, UI.ItemPitch, ui.Remaining, drawTreeRow ?? (drawTreeRow = DrawTreeRow));
+            ui.VirtualList(ListId, rows.Count, UI.RowPitch, ui.Remaining, drawTreeRow);
         }
 
-        static UI curUi; static int curSel; static Action<int> drawTreeRow;
-        static void DrawTreeRow(int i) { DrawRow(curUi, rows[i].r, rows[i].depth, curSel, false); }
+        static UI curUi; static int curSel;
+        static readonly Action<int> drawTreeRow = DrawTreeRow, drawHitRow = DrawHitRow;
+        static void DrawTreeRow(int i) { if (i < rows.Count) DrawRow(curUi, rows[i].r, rows[i].depth, curSel, false); }
 
         // search: ranked, described, clutter hidden (SmartFind); the old "every path match" behaviour is the
-        // "path matches" + "clutter" toggles
-        static SmartFind.Cat cat = (SmartFind.Cat)EditorState.Get("explorer.cat", 0);
+        // "path matches" + "clutter" toggles.
+        // The search runs when the typing pauses and again only when objects were added or removed; a row is described
+        // when it comes on screen, and rows on screen are described again every two seconds (distance, what is playing).
+        static SmartFind.Cat cat = (SmartFind.Cat)Mathf.Clamp(EditorState.Get("explorer.cat", 0), 0, SmartFind.CatNames.Length - 1);
         static bool showClutter = EditorState.Get("explorer.clutter", false), showPath = EditorState.Get("explorer.path", false);
         static List<SmartFind.Hit> hits = new List<SmartFind.Hit>();
-        static int hidClutter, hidPath; static float hitsAt; static string hitsHead = "";
-        public static void SetQuery(string q) { filter = q ?? ""; lastFilter = null; }
+        static int hidClutter, hidPath, hitsStamp = -1, textStamp = 1; static float textAt, hitsAt; static string hitsHead = "";
+        static SearchDelay findDelay;
+        public static void SetQuery(string q) { filter = q ?? ""; lastFilter = null; findDelay.Set(filter); }
+        // The ranked hits of the last search. text and color are filled for rows that were on screen; HitText fills on demand.
         public static List<SmartFind.Hit> Hits { get { return hits; } }
+        public static string HitText(int i) { if (i < 0 || i >= hits.Count) return null; Fill(hits[i]); return hits[i].text; }
+
+        static readonly Color cCharacter = new Color(1f, 0.8f, 0.5f, 1f), cAnimation = new Color(0.55f, 1f, 0.55f, 1f);
+
+        static void Fill(SmartFind.Hit h)
+        {
+            if (h.text != null && h.stamp == textStamp) return;
+            h.stamp = textStamp;
+            h.text = SmartFind.Describe(h);
+            var k = h.r.kind;
+            h.color = !h.r.activeSelf ? cOff : !h.r.activeInHierarchy ? UI.Dim : (k & ObjKind.Character) != 0 ? cCharacter : (k & ObjKind.Animation) != 0 ? cAnimation : (k & ObjKind.Trigger) != 0 ? cTrig : (k & ObjKind.StateMachine) != 0 ? UI.Accent : UI.Txt;
+        }
 
         static void DrawFiltered(UI ui)
         {
-            string q = filter.Trim();
             ui.BeginRow();
             for (int i = 0; i < SmartFind.CatNames.Length; i++)
                 if (ui.Button(SmartFind.CatNames[i], -2, (int)cat == i ? (Color?)UI.Accent : null)) { cat = (SmartFind.Cat)i; EditorState.Set("explorer.cat", i); lastFilter = null; }
@@ -157,31 +195,32 @@ namespace InsideDev
             bool cl = ui.Toggle(showClutter, "clutter (static meshes, decals, bones, FX clones)"); if (cl != showClutter) { showClutter = cl; EditorState.Set("explorer.clutter", cl); lastFilter = null; }
             bool pm = ui.Toggle(showPath, "path matches"); if (pm != showPath) { showPath = pm; EditorState.Set("explorer.path", pm); lastFilter = null; }
             ui.EndRow();
-            if (q != lastFilter || ObjectDatabase.completedPasses != lastFilterPass || Time.realtimeSinceStartup - hitsAt > 2f)
+            string q = findDelay.Value(filter, 0.12f).Trim();
+            int stamp = SceneStamp.Value;
+            float now = Time.realtimeSinceStartup;
+            // objects that come and go all the time (spawned effects) must not restart the search on every database pass
+            if (q.Length > 0 && (q != lastFilter || (stamp != hitsStamp && now - hitsAt > 2f)))
             {
-                lastFilter = q; lastFilterPass = ObjectDatabase.completedPasses; hitsAt = Time.realtimeSinceStartup;
+                lastFilter = q; hitsStamp = stamp; hitsAt = now;
                 hits = SmartFind.Run(q, cat, showClutter, showPath, out hidClutter, out hidPath);
-                foreach (var h in hits)
-                {
-                    h.text = SmartFind.Describe(h);
-                    var k = h.r.kind;
-                    h.color = !h.r.activeSelf ? cOff : !h.r.activeInHierarchy ? UI.Dim : (k & ObjKind.Character) != 0 ? new Color(1f, 0.8f, 0.5f, 1f) : (k & ObjKind.Animation) != 0 ? new Color(0.55f, 1f, 0.55f, 1f) : (k & ObjKind.Trigger) != 0 ? cTrig : (k & ObjKind.StateMachine) != 0 ? UI.Accent : UI.Txt;
-                }
                 hitsHead = hits.Count + " result(s), best first" + (SmartFind.Truncated > 0 ? "   (" + SmartFind.Truncated + " more not listed - add a word to narrow it)" : "") + (hidClutter > 0 ? "   (" + hidClutter + " clutter hidden)" : "") + (hidPath > 0 ? "   (" + hidPath + " only matched the level / parent name - tick 'path matches')" : "") + ".  Click = select (the Inspector's ACTIVITY section lists its animations, sounds and events).";
             }
+            if (now - textAt > 2f) { textAt = now; textStamp++; }
             ui.Label(hitsHead, UI.Dim);
-            var sel = Selection.Current;
-            int selId = sel != null ? sel.GetInstanceID() : 0;
-            var list = hits;
-            ui.VirtualList("explorer_filtered", list.Count, UI.ItemPitch, ui.Remaining, i =>
-            {
-                var h = list[i];
-                if (h.r.go == null) { ui.Item("(destroyed) " + h.r.name, UI.Dim); return; }
-                if (h.r.id == selId) ui.RowHighlight(cSel);
-                bool ck = ui.Item(h.text, h.color);
-                if (ui.LastHover) Selection.SetHover(h.r.go);
-                if (ck) { Selection.Set(h.r.go, "explorer"); Reveal(h.r.go); }
-            });
+            ui.VirtualList("explorer_filtered", hits.Count, UI.ItemPitch, ui.Remaining, drawHitRow);
+        }
+
+        static void DrawHitRow(int i)
+        {
+            if (i >= hits.Count) return;
+            var ui = curUi;
+            var h = hits[i];
+            if (h.r.go == null) { ui.Item("(destroyed) " + h.r.name, UI.Dim); return; }
+            Fill(h);
+            if (h.r.id == curSel) ui.RowHighlight(cSel);
+            bool ck = ui.Item(h.text, h.color);
+            if (ui.LastHover) Selection.SetHover(h.r.go);
+            if (ck) { Selection.Set(h.r.go, "explorer"); Reveal(h.r.go); }
         }
 
         static readonly Dictionary<int, KeyValuePair<int, string>> labels = new Dictionary<int, KeyValuePair<int, string>>(4096);

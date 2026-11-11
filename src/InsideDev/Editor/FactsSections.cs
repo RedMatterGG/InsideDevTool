@@ -4,9 +4,9 @@ using UnityEngine;
 
 namespace InsideDev
 {
-    // Inspector sections: MATERIALS, LEVEL FILE. Computed for the selection and cached
-    // (recomputed when the selection or History changes, or every few seconds); the per-frame draw only reads
-    // prebuilt strings (no per-frame allocation).
+    // Inspector sections: MATERIALS, LEVEL FILE. Computed for the selection and cached: recomputed when the selection
+    // changes, and while at least one of the two is unfolded when the History changes (at most four times per second:
+    // a gizmo drag changes it every frame) or every few seconds. The per-frame draw only reads prebuilt strings.
     public static class FactsSections
     {
         static readonly Color cAct = new Color(0.55f, 1f, 0.6f, 1f), cNever = new Color(1f, 0.55f, 0.45f, 1f), cMat = new Color(0.95f, 0.8f, 0.55f, 1f), cFile = new Color(0.7f, 0.8f, 1f, 1f);
@@ -62,7 +62,8 @@ namespace InsideDev
         {
             int id = go.GetInstanceID();
             float now = Time.realtimeSinceStartup;
-            if (id != forId || forVersion != ChangeRecorder.Version || now - at > 3f || (pending && now - at > 0.25f))
+            bool open = EditorState.Get("insp.fold.materials", true) || EditorState.Get("insp.fold.levelfile", true);
+            if (id != forId || (open && now - at > 0.25f && (forVersion != ChangeRecorder.Version || pending || now - at > 3f)))
             {
                 if (id != forId) deep = false;
                 forId = id; forVersion = ChangeRecorder.Version; at = now;

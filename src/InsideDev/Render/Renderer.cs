@@ -37,21 +37,31 @@ namespace InsideDev
         public static int rebuilds, invalidations;
         public static string lastReason = "startup";
 
-        public static void Invalidate(string reason) { dirty = true; stateDirty = true; invalidations++; lastReason = reason; }
+        // glyph UVs are read again after anything that may have touched the font atlas
+        public static void Invalidate(string reason) { dirty = true; stateDirty = true; invalidations++; lastReason = reason; glyphs.Clear(); }
 
         public static void Destroy()
         {
             try { if (lineMat != null) UObj.Destroy(lineMat); } catch { }
             lineMat = null; font = null;
+            matRetryAt = fontRetryAt = 0f; failLogged = null; fontFailLogged = false;
+            ClearMetrics();
             Invalidate("hard reset");
         }
+
+        // A material or font that cannot be built is tried again once per second, not on every Measure and Submit,
+        // and the failure is written to the event list once per reason.
+        static float matRetryAt, fontRetryAt;
+        static string failLogged;
+        static bool fontFailLogged;
 
         public static bool MatOk(Material m) { return m != null && m.shader != null && m.shader.isSupported; }
 
         public static void Validate()
         {
             if (!dirty && MatOk(lineMat) && font != null) return;
-            if (!MatOk(lineMat))
+            float now = Time.realtimeSinceStartup;
+            if (!MatOk(lineMat) && now >= matRetryAt)
             {
                 try { if (lineMat != null) UObj.Destroy(lineMat); } catch { }
                 lineMat = null;
@@ -68,13 +78,24 @@ namespace InsideDev
                 }
                 if (lineMat != null) lineMat.hideFlags = HideFlags.HideAndDontSave;
                 rebuilds++;
-                RenderHost.Event("renderer: line material (re)built, ok=" + MatOk(lineMat) + " (" + lastReason + ")");
+                if (MatOk(lineMat)) { failLogged = null; RenderHost.Event("renderer: line material (re)built, ok=True (" + lastReason + ")"); }
+                else
+                {
+                    matRetryAt = now + 1f;
+                    if (failLogged != lastReason) { failLogged = lastReason; RenderHost.Event("renderer: line material (re)built, ok=False (" + lastReason + "); trying again once per second"); }
+                }
             }
-            if (font == null)
+            if (font == null && now >= fontRetryAt)
             {
-                try { font = (Font)Resources.GetBuiltinResource(typeof(Font), "Arial.ttf"); } catch (Exception e) { DevLog.Error("renderer: font", e); }
+                try { font = (Font)Resources.GetBuiltinResource(typeof(Font), "Arial.ttf"); } catch (Exception e) { if (!fontFailLogged) DevLog.Error("renderer: font", e); }
                 if (font == null) { try { font = Font.CreateDynamicFontFromOSFont("Arial", Draw.DefaultSize); } catch { } }
-                RenderHost.Event("renderer: font " + (font != null ? font.name : "NONE"));
+                ClearMetrics();
+                if (font != null) { fontFailLogged = false; RenderHost.Event("renderer: font " + font.name); }
+                else
+                {
+                    fontRetryAt = now + 1f;
+                    if (!fontFailLogged) { fontFailLogged = true; RenderHost.Event("renderer: font NONE; trying again once per second"); }
+                }
             }
             dirty = false;
         }
@@ -92,21 +113,76 @@ namespace InsideDev
             return mat && shOk && f && fm != null && ft != null;
         }
 
+        // ---- text metrics
+        // Widget labels are the same strings every frame: the width of a string is remembered per font size, the advance
+        // of a character per (size, char). Advances do not change when the atlas is rebuilt, glyph UVs do: the glyph table
+        // used by the tessellator is emptied from Font.textureRebuilt and on every Invalidate, and is only used while
+        // that hook is in place (glyphCache).
+        static readonly Dictionary<int, Dictionary<string, float>> widths = new Dictionary<int, Dictionary<string, float>>();
+        static readonly Dictionary<int, float> advances = new Dictionary<int, float>(1024);
+        internal static readonly Dictionary<int, CharacterInfo> glyphs = new Dictionary<int, CharacterInfo>(1024);
+        static int widthCount;
+        public static bool glyphCache;
+        const int MaxWidths = 6000, MaxAdvances = 20000;
+        internal const int GlyphLimit = 8000;
+
+        static void ClearMetrics()
+        {
+            foreach (var d in widths.Values) d.Clear();
+            widthCount = 0; advances.Clear(); glyphs.Clear();
+        }
+
+        // Font.textureRebuilt: every UV of that font is stale
+        public static void OnAtlasRebuilt(Font f) { if (f == null || f == font) glyphs.Clear(); }
+
+        // Second line of defence, once per drawn frame: an atlas texture that is another object or another size than at
+        // the last look empties the glyph table even when no rebuild callback arrived.
+        static int atlasId, atlasW, atlasH;
+        public static void CheckAtlas()
+        {
+            if (!glyphCache || glyphs.Count == 0) return;
+            var f = font;
+            if (f == null) return;
+            var m = f.material;
+            var t = m != null ? m.mainTexture : null;
+            int id = 0, w = 0, h = 0;
+            if (t != null) { id = t.GetInstanceID(); w = t.width; h = t.height; }
+            if (id != atlasId || w != atlasW || h != atlasH) { atlasId = id; atlasW = w; atlasH = h; glyphs.Clear(); }
+        }
+
+        public static string MetricsStatus() { return "widths " + widthCount + "  advances " + advances.Count + "  glyphs " + glyphs.Count + (glyphCache ? "" : " (glyph table off)"); }
+
         public static float Measure(string s, int size)
         {
+            if (string.IsNullOrEmpty(s)) return 0f;
+            Dictionary<string, float> bySize; float w;
+            if (!widths.TryGetValue(size, out bySize)) widths[size] = bySize = new Dictionary<string, float>(256);
+            else if (bySize.TryGetValue(s, out w)) return w;
             Validate();
             var f = font;
-            if (f == null || string.IsNullOrEmpty(s)) return (s ?? "").Length * size * 0.55f;
-            f.RequestCharactersInTexture(s, size);
-            float w = 0, best = 0;
+            if (f == null) return s.Length * size * 0.55f;
+            bool requested = false;
+            float line = 0, best = 0;
             CharacterInfo ci;
-            foreach (char ch in s)
+            for (int i = 0; i < s.Length; i++)
             {
-                if (ch == '\n') { best = Mathf.Max(best, w); w = 0; continue; }
-                if (f.GetCharacterInfo(ch, out ci, size)) w += ci.advance;
-                else w += size * 0.5f;
+                char ch = s[i];
+                if (ch == '\n') { if (line > best) best = line; line = 0; continue; }
+                int key = (size << 16) | ch; float adv;
+                if (!advances.TryGetValue(key, out adv))
+                {
+                    if (!requested) { f.RequestCharactersInTexture(s, size); requested = true; }
+                    adv = f.GetCharacterInfo(ch, out ci, size) ? ci.advance : size * 0.5f;
+                    if (advances.Count >= MaxAdvances) advances.Clear();
+                    advances[key] = adv;
+                }
+                line += adv;
             }
-            return Mathf.Max(best, w);
+            w = line > best ? line : best;
+            // strings that change every frame (counters, clocks) must not grow the table without bound
+            if (widthCount >= MaxWidths) { foreach (var d in widths.Values) d.Clear(); widthCount = 0; }
+            bySize[s] = w; widthCount++;
+            return w;
         }
     }
 
@@ -174,11 +250,19 @@ namespace InsideDev
             // request everything first: a request can rebuild the atlas and invalidate earlier UVs
             for (int i = 0; i < ts.Count; i++) f.RequestCharactersInTexture(ts[i].s, ts[i].size);
             CharacterInfo ci;
+            var table = RenderResources.glyphs; bool useTable = RenderResources.glyphCache;
             for (int i = 0; i < ts.Count; i++)
             {
                 var t = ts[i];
                 var cl = t.clip;
-                if (t.y > cl.yMax || t.y + t.size * 1.3f < cl.yMin || t.x > cl.xMax) { st.clippedTexts++; continue; }
+                if (t.y > cl.yMax || t.x > cl.xMax) { st.clippedTexts++; continue; }
+                if (t.y + t.size * 1.3f < cl.yMin)
+                {
+                    // above the clip: gone, unless it is a wrapped block whose later lines reach into it
+                    int more = 0;
+                    for (int k = t.s.IndexOf('\n'); k >= 0; k = t.s.IndexOf('\n', k + 1)) more++;
+                    if (more == 0 || t.y + more * (t.size + 3) + t.size * 1.3f < cl.yMin) { st.clippedTexts++; continue; }
+                }
                 st.texts++;
                 float x = Mathf.Round(t.x);
                 float lineTop = Mathf.Round(t.y);
@@ -186,7 +270,12 @@ namespace InsideDev
                 foreach (char ch in t.s)
                 {
                     if (ch == '\n') { x = Mathf.Round(t.x); lineTop += t.size + 3; baseline = lineTop + Mathf.Round(t.size * 0.95f); continue; }
-                    if (!f.GetCharacterInfo(ch, out ci, t.size)) { x += t.size * 0.5f; continue; }
+                    int gk = (t.size << 16) | ch;
+                    if (!useTable || !table.TryGetValue(gk, out ci))
+                    {
+                        if (!f.GetCharacterInfo(ch, out ci, t.size)) { x += t.size * 0.5f; continue; }
+                        if (useTable) { if (table.Count >= RenderResources.GlyphLimit) table.Clear(); table[gk] = ci; }
+                    }
                     // glyph box in top-left space
                     float x0 = x + ci.minX, x1 = x + ci.maxX;
                     float yTop = baseline - ci.maxY, yBot = baseline - ci.minY;
@@ -273,6 +362,7 @@ namespace InsideDev
         {
             st = new RenderStats();
             RenderResources.Validate();
+            RenderResources.CheckAtlas();
             var mat = RenderResources.lineMat;
             if (!RenderResources.MatOk(mat)) { st.error = "no usable line material"; return false; }
             int w = Screen.width, h = Screen.height;
@@ -290,18 +380,8 @@ namespace InsideDev
                 GL.Viewport(new Rect(0, 0, w, h));     // never inherit a camera's pixelRect
                 GL.LoadPixelMatrix(0, w, 0, h);        // explicit pixel projection for the current size
                 BeginFrame();
-                foreach (var layer in new[] { list.world, list.ui })
-                {
-                    for (int i = 0; i < layer.used; i++)
-                    {
-                        var seg = layer.segments[i];
-                        if (seg.Count == 0) continue;
-                        Tessellator.Build(seg, geo, font, h, list.flipY, ref st);
-                        if (geo.tv.Count > 0 && fmat == null) { fmat = font.material; if (fmat == null) throw new Exception("font material missing"); }
-                        DrawGeometry(geo, mat, fmat, ref st);
-                        st.segments++;
-                    }
-                }
+                DrawLayer(list.world, list, font, mat, ref fmat, h, ref st);
+                DrawLayer(list.ui, list, font, mat, ref fmat, h, ref st);
                 if (probe.HasValue)
                 {
                     geo.Clear();
@@ -323,6 +403,19 @@ namespace InsideDev
                 EndFrame();
                 if (pushed) { try { GL.PopMatrix(); } catch { } }
                 RenderTexture.active = prevRT;
+            }
+        }
+
+        void DrawLayer(Draw.Layer layer, Draw list, Font font, Material mat, ref Material fmat, int h, ref RenderStats st)
+        {
+            for (int i = 0; i < layer.used; i++)
+            {
+                var seg = layer.segments[i];
+                if (seg.Count == 0) continue;
+                Tessellator.Build(seg, geo, font, h, list.flipY, ref st);
+                if (geo.tv.Count > 0 && fmat == null) { fmat = font.material; if (fmat == null) throw new Exception("font material missing"); }
+                DrawGeometry(geo, mat, fmat, ref st);
+                st.segments++;
             }
         }
 
@@ -411,12 +504,16 @@ namespace InsideDev
 
         static int Cap(int n) { int c = 64; while (c < n) c <<= 1; return c; }
 
-        void Upload(Slot s, List<Vector3> v, List<Color> c, List<Vector2> uv, MeshTopology topo)
+        // Unity 5.0 meshes are limited to 65000 vertices: a segment with more goes out in chunks of this many
+        // (a multiple of 4 and of 2, so quads and line pairs are never split)
+        const int ChunkVerts = 32768;
+
+        void Upload(Slot s, List<Vector3> v, List<Color> c, List<Vector2> uv, MeshTopology topo, int from, int n)
         {
-            int n = Math.Min(v.Count, 32768), cap = Cap(n);   // Unity 5.0 meshes are limited to 65000 vertices
+            int cap = Cap(n);
             bool realloc = s.v == null || s.v.Length != cap;
             if (realloc) { s.v = new Vector3[cap]; s.c = new Color[cap]; s.uv = new Vector2[cap]; }
-            for (int i = 0; i < n; i++) { s.v[i] = v[i]; s.c[i] = c[i]; if (uv != null) s.uv[i] = uv[i]; }
+            for (int i = 0; i < n; i++) { s.v[i] = v[from + i]; s.c[i] = c[from + i]; if (uv != null) s.uv[i] = uv[from + i]; }
             for (int i = n; i < cap; i++) { s.v[i] = Vector3.zero; s.c[i] = Color.clear; }
             int icount = topo == MeshTopology.Lines ? cap : cap / 4 * 6;
             if (s.idx == null || s.idx.Length != icount) s.idx = new int[icount];
@@ -439,9 +536,21 @@ namespace InsideDev
 
         protected override void DrawGeometry(Geometry g, Material solid, Material text, ref RenderStats st)
         {
-            if (g.sv.Count > 0) { var s = Take(); Upload(s, g.sv, g.sc, null, MeshTopology.Triangles); Pass(solid, ref st); Graphics.DrawMeshNow(s.mesh, Matrix4x4.identity); st.batches++; }
-            if (g.lv.Count > 0) { var s = Take(); Upload(s, g.lv, g.lc, null, MeshTopology.Lines); Pass(solid, ref st); Graphics.DrawMeshNow(s.mesh, Matrix4x4.identity); st.batches++; }
-            if (g.tv.Count > 0 && text != null) { var s = Take(); Upload(s, g.tv, g.tc, g.tu, MeshTopology.Triangles); Pass(text, ref st); Graphics.DrawMeshNow(s.mesh, Matrix4x4.identity); st.batches++; }
+            Chunks(g.sv, g.sc, null, MeshTopology.Triangles, solid, ref st);
+            Chunks(g.lv, g.lc, null, MeshTopology.Lines, solid, ref st);
+            if (text != null) Chunks(g.tv, g.tc, g.tu, MeshTopology.Triangles, text, ref st);
+        }
+
+        void Chunks(List<Vector3> v, List<Color> c, List<Vector2> uv, MeshTopology topo, Material m, ref RenderStats st)
+        {
+            for (int from = 0; from < v.Count; from += ChunkVerts)
+            {
+                var s = Take();
+                Upload(s, v, c, uv, topo, from, Math.Min(ChunkVerts, v.Count - from));
+                Pass(m, ref st);
+                Graphics.DrawMeshNow(s.mesh, Matrix4x4.identity);
+                st.batches++;
+            }
         }
     }
 }

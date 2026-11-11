@@ -7,6 +7,7 @@ namespace InsideDev
     // Phase 11: guided actions + contextual explanations at the top of the Inspector.
     // Explains in game terms what the selected object is, why it may not be doing anything, and offers the
     // relevant one-click actions (all recorded in History, so they can be undone or turned into a mod).
+    // The texts are worked out when the selection or the History changes and twice per second, not on every frame.
     public static class Guide
     {
         static readonly Dictionary<string, string> explain = new Dictionary<string, string>
@@ -27,23 +28,61 @@ namespace InsideDev
             { "PersistentBool", "saved flag: part of the savegame's world state" },
         };
 
-        static readonly Color cHead = new Color(0.6f, 0.85f, 1f, 1f), cWarn = new Color(1f, 0.7f, 0.4f, 1f);
+        static readonly Color cHead = new Color(0.6f, 0.85f, 1f, 1f), cWarn = new Color(1f, 0.7f, 0.4f, 1f), cCode = new Color(0.4f, 0.95f, 0.95f, 1f);
 
-        static int codeFor; static readonly List<KeyValuePair<Type, string>> codeLines = new List<KeyValuePair<Type, string>>();
-        public static void Draw(UI ui, GameObject go)
+        // what was worked out for the selection
+        struct Off { public Behaviour b; public string label, button; }
+        static int forId, forVersion = -1; static float at;
+        static string what, parentOff, colliderOff;
+        static Collider col; static GameObject offParent;
+        static bool bookmarked, hasScripts;
+        static readonly List<Off> offs = new List<Off>();
+        static readonly List<Type> gameScripts = new List<Type>();
+
+        static int codeFor; static bool codeBuilt; static readonly List<KeyValuePair<Type, string>> codeLines = new List<KeyValuePair<Type, string>>();
+
+        static void Refresh(GameObject go)
         {
-            if (go == null) return;
             var lines = new List<string>();
             var seen = new HashSet<string>();
+            offs.Clear(); gameScripts.Clear();
             foreach (var c in go.GetComponents<Component>())
             {
                 if (c == null) continue;
-                string n = c.GetType().Name, e;
-                if (explain.TryGetValue(n, out e) && seen.Add(n)) lines.Add(e);
+                var t = c.GetType();
+                string n = t.Name, e;
+                bool known = explain.TryGetValue(n, out e);
+                if (known && seen.Add(n)) lines.Add(e);
+                var b = c as Behaviour;
+                if (known && b != null && !b.enabled) offs.Add(new Off { b = b, label = n + " disabled ", button = "Enable " + n });
+                if (c is MonoBehaviour && GameTypes.IsGame(t) && !gameScripts.Contains(t)) gameScripts.Add(t);
             }
-            var col = go.GetComponent<Collider>();
+            hasScripts = gameScripts.Count > 0;
+            col = go.GetComponent<Collider>();
             if (col != null && seen.Count == 0) lines.Add(col.isTrigger ? "trigger collider (no known game script on it)" : "solid collider");
-            if (lines.Count > 0) ui.Label("WHAT IS THIS:  " + string.Join("  •  ", lines.ToArray()), cHead);
+            what = lines.Count > 0 ? "WHAT IS THIS:  " + string.Join("  •  ", lines.ToArray()) : null;
+            colliderOff = col != null ? (col.isTrigger ? "trigger" : "collider") + " disabled " : null;
+            offParent = null; parentOff = null;
+            if (go.activeSelf && !go.activeInHierarchy)
+            {
+                var p = go.transform.parent; while (p != null && p.gameObject.activeSelf) p = p.parent;
+                offParent = p != null ? p.gameObject : null;
+                parentOff = "a parent is off (" + (p != null ? p.name : "?") + ") ";
+            }
+            bookmarked = Bookmarks.Has(go);
+        }
+
+        public static void Draw(UI ui, GameObject go)
+        {
+            if (go == null) return;
+            int gid = go.GetInstanceID();
+            float now = Time.realtimeSinceStartup;
+            if (gid != forId || forVersion != ChangeRecorder.Version || now - at > 0.5f)
+            {
+                forId = gid; forVersion = ChangeRecorder.Version; at = now;
+                Refresh(go);
+            }
+            if (what != null) ui.Label(what, cHead);
 
             // why is it not doing anything? + the matching fix
             ui.BeginRow();
@@ -53,37 +92,34 @@ namespace InsideDev
                 ui.Label("switched off (hidden) ", cWarn); any = true;
                 if (ui.Button("Show it")) ChangeRecorder.SetActive(go, true, "guide");
             }
-            else if (!go.activeInHierarchy)
+            else if (parentOff != null && !go.activeInHierarchy)
             {
-                var p = go.transform.parent; while (p != null && p.gameObject.activeSelf) p = p.parent;
-                ui.Label("a parent is off (" + (p != null ? p.name : "?") + ") ", cWarn); any = true;
-                if (p != null && ui.Button("Show parent")) ChangeRecorder.SetActive(p.gameObject, true, "guide");
+                ui.Label(parentOff, cWarn); any = true;
+                if (offParent != null && ui.Button("Show parent")) ChangeRecorder.SetActive(offParent, true, "guide");
             }
             if (col != null && !col.enabled)
             {
-                ui.Label((col.isTrigger ? "trigger" : "collider") + " disabled ", cWarn); any = true;
+                ui.Label(colliderOff, cWarn); any = true;
                 if (ui.Button("Enable collider")) ChangeRecorder.SetEnabledRecorded(col, true, "guide");
             }
-            foreach (var b in go.GetComponents<Behaviour>())
-                if (b != null && !b.enabled && explain.ContainsKey(b.GetType().Name))
-                {
-                    ui.Label(b.GetType().Name + " disabled ", cWarn); any = true;
-                    if (ui.Button("Enable " + b.GetType().Name)) ChangeRecorder.SetEnabledRecorded(b, true, "guide");
-                }
+            for (int i = 0; i < offs.Count; i++)
+            {
+                var o = offs[i];
+                if (o.b == null || o.b.enabled) continue;
+                ui.Label(o.label, cWarn); any = true;
+                if (ui.Button(o.button)) ChangeRecorder.SetEnabledRecorded(o.b, true, "guide");
+            }
             if (!any) ui.Space(0);
-            // code logic summary per script (who else sets / calls / reads it) - details in the Logic panel
-            if (LogicPanel.Ready)
+            // code logic summary per script (who else sets / calls / reads it) - details in the Logic panel.
+            // An object with game scripts is what the code scan is for: showing one starts it.
+            if (hasScripts && LogicPanel.Ready)
             {
                 // per selected object, rebuilt when the selection changes (the code graph does not change)
-                int gid = go.GetInstanceID();
-                if (gid != codeFor)
+                if (gid != codeFor || !codeBuilt)
                 {
-                    codeFor = gid; codeLines.Clear();
-                    foreach (var mb in go.GetComponents<MonoBehaviour>())
+                    codeFor = gid; codeBuilt = true; codeLines.Clear();
+                    foreach (var t in gameScripts)
                     {
-                        if (mb == null) continue;
-                        var t = mb.GetType(); string an = t.Assembly.GetName().Name;
-                        if (an != "Assembly-CSharp" && an != "Assembly-CSharp-firstpass") continue;
                         var inc = CodeGraph.Incoming(t);
                         if (inc.Count == 0) continue;
                         var setters = new List<string>(); var readers = new List<string>();
@@ -94,11 +130,12 @@ namespace InsideDev
                 foreach (var kv in codeLines)
                 {
                     ui.EndRow(); ui.BeginRow();
-                    ui.Label(kv.Value, new Color(0.4f, 0.95f, 0.95f, 1f), Mathf.Max(100, ui.Width - 70));
+                    ui.Label(kv.Value, cCode, Mathf.Max(100, ui.Width - 70));
                     if (ui.Button("Logic", 60)) { LogicPanel.Show(kv.Key); DevCore.Instance.ShowPanel("logic"); }
                 }
             }
-            if (ui.Button(Bookmarks.Has(go) ? "Bookmarked" : "Bookmark", 90) && !Bookmarks.Has(go)) Bookmarks.Add(go);
+            else codeBuilt = false;
+            if (ui.Button(bookmarked ? "Bookmarked" : "Bookmark", 90) && !bookmarked) { Bookmarks.Add(go); bookmarked = true; }
             ui.EndRow();
         }
     }

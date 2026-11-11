@@ -8,31 +8,45 @@ namespace InsideDev
     // Inspector section ACTIVITY: everything that moves or makes noise in the selected object AND everything below it,
     // so selecting "the pig" (or its root) answers "what animations / sounds / events does it have" in one place:
     //   animations     Animation / Animator components below, clip count and what is playing (click = select it)
-    //   sounds         sound events referenced by objects below (sound library) and posts heard from them this
+    //   sounds         sound events referenced by objects below (sound library bindings) and posts heard from them this
     //                  session (click = open in Audio DB)
     //   state machines PlayMaker FSMs below with their current state
     //   signals        signal outputs below
     //   live events    the last events raised by objects below, filtered by type (signals / FSM / sounds / animation)
-    // Rebuilt on selection change and every 3 s; the live list every 0.25 s. Objects below are also watched for
-    // animation clips starting (event type "animation").
+    // Rebuilt on selection change, and while the section is unfolded every 3 s (every 10 s for an object with more than
+    // 500 objects below it); the live list when an event arrives and once per second. At most 4000 objects below the
+    // selection are looked at.
+    // Objects below are also watched for animation clips starting (event type "animation").
     public static class ActivitySection
     {
         struct Line { public string text; public Color c; public GameObject go; public string sound; }
         static readonly Color cHead = new Color(0.55f, 1f, 0.55f, 1f), cSnd = new Color(0.3f, 0.9f, 0.85f, 1f), cFsm = new Color(0.72f, 0.55f, 1f, 1f), cSig = new Color(1f, 0.72f, 0.25f, 1f);
+        const int MaxObjects = 4000;
 
         static int forId; static float at, liveAt; static string title;
         static readonly List<Line> lines = new List<Line>();
         static readonly HashSet<int> ids = new HashSet<int>();
         static readonly List<Line> live = new List<Line>();
-        static bool lS = true, lF = true, lA = true, lN = true;
+        static readonly List<GameObject> gos = new List<GameObject>(256);
+        static readonly Stack<Transform> walk = new Stack<Transform>(64);
+        static bool lS = true, lF = true, lA = true, lN = true, capped;
         static long liveTotal = -1;
 
         static void Rebuild(GameObject go)
         {
-            lines.Clear(); ids.Clear();
-            var all = go.GetComponentsInChildren<Transform>(true);
-            var gos = new List<GameObject>();
-            for (int i = 0; i < all.Length && i < 4000; i++) { ids.Add(all[i].gameObject.GetInstanceID()); gos.Add(all[i].gameObject); }
+            lines.Clear(); ids.Clear(); gos.Clear(); walk.Clear();
+            // the object and what is below it, stopping at MaxObjects (no array of every transform of a level root)
+            capped = false;
+            walk.Push(go.transform);
+            while (walk.Count > 0)
+            {
+                if (gos.Count >= MaxObjects) { capped = true; break; }
+                var t = walk.Pop();
+                var g = t.gameObject;
+                ids.Add(g.GetInstanceID()); gos.Add(g);
+                for (int i = t.childCount - 1; i >= 0; i--) walk.Push(t.GetChild(i));
+            }
+            walk.Clear();
             EventMonitor.WatchExtra(gos);
 
             // animations
@@ -63,21 +77,27 @@ namespace InsideDev
             for (int i = 0; i < EventMonitor.Count; i++)
             {
                 var e = EventMonitor.Get(i); if (e.kind != 'A' || !ids.Contains(e.goId)) continue;
-                int k = e.text.IndexOf("  posts  "); if (k < 0) continue;
+                int k = e.text.IndexOf("  posts  ", StringComparison.Ordinal); if (k < 0) continue;
                 string ev = e.text.Substring(k + 9); int c; snd.TryGetValue(ev, out c); snd[ev] = c + 1;
             }
             // state machines and signals
             var fsms = new List<Line>(); var sigs = new List<Line>();
             foreach (var g in gos)
+            {
+                if (fsms.Count >= 20) break;
                 foreach (var f in g.GetComponents<PlayMakerFSM>())
                     if (f != null && fsms.Count < 20) fsms.Add(new Line { text = "      " + Rel(go, g) + " / " + f.FsmName + "   state: " + (f.ActiveStateName ?? "-"), c = cFsm, go = g });
+            }
             SignalManager sm = null; try { sm = PersistentBehaviour<SignalManager>.instance; } catch { }
             if (sm != null && sm.signalOuts != null)
                 foreach (var so in sm.signalOuts)
-                    if (so != null && so.gameObject != null && ids.Contains(so.gameObject.GetInstanceID()) && sigs.Count < 20)
+                {
+                    if (sigs.Count >= 20) break;
+                    if (so != null && so.gameObject != null && ids.Contains(so.gameObject.GetInstanceID()))
                         sigs.Add(new Line { text = "      " + Rel(go, so.gameObject) + " . " + so.debugName, c = cSig, go = so.gameObject });
+                }
 
-            title = "ACTIVITY (this object and " + (gos.Count - 1) + " below):  " + na + " animation(s), " + snd.Count + " sound(s), " + fsms.Count + " state machine(s), " + sigs.Count + " signal(s)";
+            title = "ACTIVITY (this object and " + (capped ? "the first " : "") + (gos.Count - 1) + " below):  " + na + " animation(s), " + snd.Count + " sound(s), " + fsms.Count + " state machine(s), " + sigs.Count + " signal(s)";
             if (anims.Count > 0) { lines.Add(new Line { text = "   animations" + (na > anims.Count ? " (first " + anims.Count + " of " + na + ")" : ""), c = UI.Dim }); lines.AddRange(anims); }
             if (snd.Count > 0)
             {
@@ -115,8 +135,12 @@ namespace InsideDev
         {
             float now = Time.realtimeSinceStartup;
             int id = go.GetInstanceID();
-            if (id != forId || now - at > 3f) { forId = id; at = now; try { Rebuild(go); } catch (Exception e) { DevLog.Error("activity", e); } liveTotal = -1; }
+            // a folded section is only worked out when the selection changes (its title then keeps those counts)
+            bool open = EditorState.Get("insp.fold.activity", true);
+            float period = gos.Count > 500 ? 10f : 3f;
+            if (id != forId || (open && now - at > period)) { forId = id; at = now; try { Rebuild(go); } catch (Exception e) { DevLog.Error("activity", e); } liveTotal = -1; }
             if (!Links.Section(ui, "activity", title ?? "ACTIVITY", lines.Count, cHead)) return;
+            Background.Want(Background.Events, 5f);
             for (int i = 0; i < lines.Count; i++)
             {
                 var l = lines[i];
@@ -136,7 +160,8 @@ namespace InsideDev
             bool s = ui.Toggle(lS, "signals"), f = ui.Toggle(lF, "state machines"), a = ui.Toggle(lA, "sounds"), n = ui.Toggle(lN, "animation");
             if (s != lS || f != lF || a != lA || n != lN) { lS = s; lF = f; lA = a; lN = n; liveTotal = -1; }
             ui.EndRow();
-            if (liveTotal != EventMonitor.total || now - liveAt > 1f) { liveTotal = EventMonitor.total; liveAt = now; RebuildLive(); }
+            // new events at once, the "s ago" texts once per second while there is something to show
+            if (liveTotal != EventMonitor.total || (live.Count > 0 && now - liveAt > 1f)) { liveTotal = EventMonitor.total; liveAt = now; RebuildLive(); }
             if (live.Count == 0) ui.Label("      nothing yet - events appear here as the game raises them", UI.Dim);
             for (int i = 0; i < live.Count; i++) ui.Label(live[i].text, live[i].c);
         }

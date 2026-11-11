@@ -44,7 +44,9 @@ namespace InsideDev
         const int SlicePerFrame = 2500;
 
         // ------------------------------------------------------------ incremental screen/bounds cache
-        struct Slot { public float sx, sy, depth; public bool onScreen; public Bounds rb; public bool hasR; }
+        // id: the record the slot was filled for. The database refills its list after a pass that added or removed
+        // objects, so the record at an index can be another one than the slot describes until the slice gets there.
+        struct Slot { public int id; public float sx, sy, depth; public bool onScreen; public Bounds rb; public bool hasR; }
         static Slot[] slots = new Slot[0];
         static int sliceAt, cacheFor = -1;
         static readonly Dictionary<int, Renderer> rendOf = new Dictionary<int, Renderer>(8192);
@@ -61,6 +63,7 @@ namespace InsideDev
             for (int i = sliceAt; i < end; i++)
             {
                 var r = all[i]; var s = new Slot();
+                s.id = r.id;
                 if (r.go != null && r.t != null)
                 {
                     var wp = r.t.position;
@@ -148,7 +151,7 @@ namespace InsideDev
                     var g = col.gameObject;
                     if (g.transform.root.name.StartsWith("_Boy")) continue;
                     string cat = col.isTrigger ? "Trigger/" + Overlay.TriggerKindOf(col) : "Collider";
-                    Add(g, cat, col.GetType().Name + ", " + h.distance.ToString("0.0") + " m", h.distance);
+                    Add(g, cat, col.GetType().Name + ", " + Fmt.F(h.distance, "0.0") + " m", h.distance);
                 }
             }
             catch (Exception e) { DevLog.Error("pick raycast", e); }
@@ -160,6 +163,7 @@ namespace InsideDev
             {
                 var s = slots[i];
                 var r = all[i];
+                if (s.id != r.id) continue;
                 if (s.hasR)
                 {
                     float dist;
@@ -167,7 +171,7 @@ namespace InsideDev
                     {
                         if (exact) { Renderer rend; if (rendOf.TryGetValue(r.id, out rend) && rend != null && !rend.bounds.IntersectRay(ray)) continue; }
                         // bigger boxes (floors, backdrops) sort after small ones at the same depth
-                        Add(r.go, "Mesh", "bounds " + s.rb.size.x.ToString("0.#") + "x" + s.rb.size.y.ToString("0.#") + "x" + s.rb.size.z.ToString("0.#") + ", " + dist.ToString("0.0") + " m",
+                        Add(r.go, "Mesh", "bounds " + Fmt.F(s.rb.size.x, "0.#") + "x" + Fmt.F(s.rb.size.y, "0.#") + "x" + Fmt.F(s.rb.size.z, "0.#") + ", " + Fmt.F(dist, "0.0") + " m",
                             dist + 0.02f * s.rb.size.magnitude + 0.5f);
                         continue;
                     }
@@ -185,7 +189,7 @@ namespace InsideDev
                     px = Mathf.Sqrt(ex * ex + ey * ey);
                     if (px > PixelRadius) continue;
                 }
-                Add(r.go, CategoryOf(r), "pivot " + px.ToString("0") + " px, " + s.depth.ToString("0.0") + " m", 1000f + px + s.depth * 0.01f);
+                Add(r.go, CategoryOf(r), "pivot " + Fmt.F(px, "0") + " px, " + Fmt.F(s.depth, "0.0") + " m", 1000f + px + s.depth * 0.01f);
             }
             cands.Sort((a, b) => a.order.CompareTo(b.order));
             if (cands.Count > 40) cands.RemoveRange(40, cands.Count - 40);
@@ -200,6 +204,9 @@ namespace InsideDev
                 else { mode = !mode; DevLog.Write("[pick] mode " + (mode ? "ON" : "off")); }
             }
             if (!mode) { if (cands.Count > 0) { cands.Clear(); queries++; } return; }
+            // pick mode can be on while the panel is closed: the object list must stay current for it
+            ObjectDatabase.Demand(2f);
+            Background.Want(Background.Objects, 2f);
             var cam = G.Cam();
             if (cam == null) return;
             RefreshSlice(cam);
@@ -266,16 +273,22 @@ namespace InsideDev
             }
         }
 
-        // bridge test: pick at a GUI-space pixel (top-left origin), same rules as a click
-        public static string PickAt(Vector2 p)
+        // bridge test: pick at a GUI-space pixel (top-left origin), same rules as a click: the first candidate is selected
+        public static string PickAt(Vector2 p) { return PickAt(p, true); }
+
+        // select false: only lists what is under the pixel, the selection stays as it is
+        public static string PickAt(Vector2 p, bool select)
         {
             var cam = G.Cam();
-            if (cam != null) { int guard = 0; do RefreshSlice(cam); while (sliceAt != 0 && ++guard < 100); }
+            if (cam == null) return "cannot pick: no gameplay camera";
+            ObjectDatabase.Demand(5f);
+            { int guard = 0; do RefreshSlice(cam); while (sliceAt != 0 && ++guard < 100); }
             Collect(p, true);
-            if (cands.Count == 0) return "nothing at " + p + " (filter " + Filters[filter] + ")";
-            var sb = new System.Text.StringBuilder(cands.Count + " candidate(s) at " + p + " (filter " + Filters[filter] + ")\n");
-            for (int i = 0; i < cands.Count; i++) sb.Append(i == 0 ? " -> " : "    ").Append('[').Append(cands[i].cat).Append("] ").Append(Inspector.PathOf(cands[i].go.transform)).Append("   ").Append(cands[i].detail).Append('\n');
-            Selection.Set(cands[0].go, "pick");
+            string at = Fmt.V2(p, "F1");
+            if (cands.Count == 0) return "nothing at " + at + " (filter " + Filters[filter] + ")";
+            var sb = new System.Text.StringBuilder(cands.Count + " candidate(s) at " + at + " (filter " + Filters[filter] + ")\n");
+            for (int i = 0; i < cands.Count; i++) sb.Append(i == 0 && select ? " -> " : "    ").Append('[').Append(cands[i].cat).Append("] ").Append(Inspector.PathOf(cands[i].go.transform)).Append("   ").Append(cands[i].detail).Append('\n');
+            if (select) Selection.Set(cands[0].go, "pick");
             return sb.ToString();
         }
     }

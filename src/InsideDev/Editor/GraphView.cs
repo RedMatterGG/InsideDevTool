@@ -25,16 +25,21 @@ namespace InsideDev
         {
             public Node a, b; public Provenance prov; public int count; public string label; public readonly List<string> fields = new List<string>();
             public bool audio; public uint evId;        // audio edge; animates when this event was posted recently
+            public string shown;                        // label as drawn ("field  +2"), built when first drawn
         }
 
         static readonly Dictionary<long, Node> nodes = new Dictionary<long, Node>();
         // Phase J/K: GAME (reference graph), WWISE (bank structure around the Audio DB selection or the selected
         // object's sounds), COMBINED (reference graph + the Wwise events each object posts, and their structure)
-        static int mode = EditorState.Get("graph.mode", 0);
+        static int mode = Mathf.Clamp(EditorState.Get("graph.mode", 0), 0, 3);
         static readonly string[] Modes = { "GAME", "WWISE", "COMBINED", "LOGIC" };
+        static readonly string[] HopLabels = { "1 hop", "2 hops", "3 hops" };
         static readonly Color cAudio = new Color(0.3f, 0.9f, 0.85f, 1f);
         static readonly List<Edge> edgesList = new List<Edge>();
-        static string builtKey;
+        // what the graph was built for, compared field by field (a key string per frame was garbage); keyValid false = build again
+        static bool keyValid, kReady;
+        static int kCenter, kHops, kEdges, kStamp, kFilter, kMode, kLive, kAudioVer, kSounds, buildSerial;
+        static uint kArec;
         static int hops = 1;
         static bool showFields = true;
         // edge-type filters (phase 8 leftover): fields / signals / state machines / other (adapter, observed, inferred)
@@ -50,7 +55,7 @@ namespace InsideDev
         }
         public static string LiveFilter { get { return (liveSig ? "s" : "") + (liveFsm ? "f" : "") + (liveSnd ? "a" : "") + (liveAnim ? "n" : ""); } }
         // recent events raised by objects shown in the graph, filtered by the live kinds (rebuilt 4x per second)
-        static readonly List<int> stripIdx = new List<int>(); static readonly List<string> stripText = new List<string>(); static float stripAt; static long stripTotal = -1; static string stripKey;
+        static readonly List<int> stripIdx = new List<int>(); static readonly List<string> stripText = new List<string>(); static float stripAt; static long stripTotal = -1; static int stripSerial = -1, stripLive = -1;
         public static string LiveDump()
         {
             Build(Selection.Current); BuildStrip();
@@ -61,9 +66,9 @@ namespace InsideDev
         static void BuildStrip()
         {
             float now = Time.realtimeSinceStartup;
-            string k = builtKey + LiveFilter;
-            if (now - stripAt < 0.25f && stripTotal == EventMonitor.total && k == stripKey) return;
-            stripAt = now; stripTotal = EventMonitor.total; stripKey = k;
+            int live = (liveSig ? 1 : 0) | (liveFsm ? 2 : 0) | (liveSnd ? 4 : 0) | (liveAnim ? 8 : 0);
+            if (now - stripAt < 0.25f && stripTotal == EventMonitor.total && stripSerial == buildSerial && stripLive == live) return;
+            stripAt = now; stripTotal = EventMonitor.total; stripSerial = buildSerial; stripLive = live;
             stripIdx.Clear(); stripText.Clear();
             for (int i = 0; i < EventMonitor.Count && stripIdx.Count < 6; i++)
             {
@@ -92,21 +97,54 @@ namespace InsideDev
         static readonly Color cSignal = new Color(1f, 0.72f, 0.25f, 1f), cFsm = new Color(0.72f, 0.55f, 1f, 1f), cField = new Color(0.65f, 0.68f, 0.72f, 0.9f),
                               cReflect = new Color(0.55f, 0.58f, 0.62f, 0.7f), cObserved = new Color(0.3f, 1f, 0.5f, 1f);
 
-        // text form of the graph for the bridge ("graph [hops]")
-        // filter string: any of f s m o (fields, signals, fsm, other); "all" = everything
-        public static void SetMode(string m) { int i = Array.IndexOf(Modes, m.ToUpperInvariant()); if (i >= 0) { mode = i; EditorState.Set("graph.mode", mode); builtKey = null; } }
+        // text form of the graph for the bridge ("graph [hops] [filter]")
+        public static void SetMode(string m) { int i = Array.IndexOf(Modes, m.ToUpperInvariant()); if (i >= 0) { mode = i; EditorState.Set("graph.mode", mode); keyValid = false; } }
 
+        // filter string: any of f s m o c (fields, signals, state machines, other, code edges); "all" = everything.
+        // A kind whose letter is missing is left out of the graph.
         public static void SetFilter(string f)
         {
             if (f == "all") f = "fsmoc";
-            fFields = f.Contains("f"); fSignals = f.Contains("s"); fFsm = f.Contains("m"); fOther = f.Contains("o"); fCode = f.Contains("c"); builtKey = null;
+            fFields = f.Contains("f"); fSignals = f.Contains("s"); fFsm = f.Contains("m"); fOther = f.Contains("o"); fCode = f.Contains("c"); keyValid = false;
         }
+        public static string Filter { get { return (fFields ? "f" : "") + (fSignals ? "s" : "") + (fFsm ? "m" : "") + (fOther ? "o" : "") + (fCode ? "c" : ""); } }
 
         public static string Dump(int h)
         {
-            if (h >= 1 && h <= 3) { hops = h; builtKey = null; }
+            if (h >= 1 && h <= 3) { hops = h; keyValid = false; }
             Build(Selection.Current);
-            if (mode == 3 && liveQueue.Count > 0) { while (liveQueue.Count > 0) LiveTick(); Build(Selection.Current); }   // bridge: resolve now
+            if (mode == 3 && LiveResolveNow()) Build(Selection.Current);   // bridge: resolve now
+            return DumpText();
+        }
+
+        // The graph around center as text without changing what the Graph panel shows: mode (GAME, WWISE, COMBINED, LOGIC;
+        // null = the panel's), hops 1-3 (0 = the panel's), filter letters f s m o c (null = the panel's).
+        public static string Snapshot(GameObject center, string modeName, int snapHops, string filter)
+        {
+            int m = modeName == null ? mode : Array.IndexOf(Modes, modeName.ToUpperInvariant());
+            if (m < 0) return "unknown mode '" + modeName + "' (GAME, WWISE, COMBINED, LOGIC)";
+            int oMode = mode, oHops = hops, oFitC = fitCenter, oFitH = fitHops; bool oFit = needFit;
+            bool oF = fFields, oS = fSignals, oM = fFsm, oO = fOther, oC = fCode;
+            try
+            {
+                mode = m;
+                if (snapHops >= 1 && snapHops <= 3) hops = snapHops;
+                if (filter != null) { if (filter == "all") filter = "fsmoc"; fFields = filter.Contains("f"); fSignals = filter.Contains("s"); fFsm = filter.Contains("m"); fOther = filter.Contains("o"); fCode = filter.Contains("c"); }
+                keyValid = false;
+                Build(center);
+                if (mode == 3 && LiveResolveNow()) { keyValid = false; Build(center); }
+                return DumpText();
+            }
+            finally
+            {
+                mode = oMode; hops = oHops; fFields = oF; fSignals = oS; fFsm = oM; fOther = oO; fCode = oC;
+                fitCenter = oFitC; fitHops = oFitH; needFit = oFit;
+                keyValid = false;   // the panel builds its own graph again
+            }
+        }
+
+        static string DumpText()
+        {
             var sb = new System.Text.StringBuilder(Status() + "\n");
             var cols = new List<Node>(nodes.Values);
             cols.Sort((x, y) => x.col != y.col ? x.col.CompareTo(y.col) : string.CompareOrdinal(x.name, y.name));
@@ -115,7 +153,15 @@ namespace InsideDev
             return sb.ToString();
         }
 
-        public static string Status() { return nodes.Count + " nodes, " + edgesList.Count + " edges, hops " + hops + ", key " + builtKey; }
+        public static string Status() { return nodes.Count + " nodes, " + edgesList.Count + " edges, hops " + hops + ", key " + KeyText() + ", mode " + Modes[mode] + ", filter " + Filter; }
+
+        static string KeyText()
+        {
+            if (!keyValid) return "null";
+            string flags = "" + fFields + fSignals + fFsm + fCode + fOther;
+            return kMode == 3 ? kCenter + "/L/" + flags + "/" + kReady + "/" + kLive
+                              : kCenter + "/" + kHops + "/" + kEdges + "/" + kStamp + "/" + flags + "/" + kMode + "/" + kArec + "/" + kAudioVer + "/" + kSounds;
+        }
 
         static Color KindColor(ObjRecord r)
         {
@@ -147,13 +193,23 @@ namespace InsideDev
         static void Build(GameObject center)
         {
             var arec = AudioDbPanel.Current;
-            // LOGIC depends only on the selected object's scripts, the code graph and live-instance results
-            string key = mode == 3
-                ? (center != null ? center.GetInstanceID() : 0) + "/L/" + fFields + fSignals + fFsm + fCode + fOther + "/" + LogicPanel.Ready + "/" + liveVersion
-                : (center != null ? center.GetInstanceID() : 0) + "/" + hops + "/" + ReferenceIndex.edges + "/" + ObjectDatabase.completedPasses + "/" + fFields + fSignals + fFsm + fCode + fOther
-                  + "/" + mode + "/" + (arec != null ? arec.id : 0) + "/" + AudioDb.Version + "/" + SoundLibrary.defs.Count;
-            if (key == builtKey) return;
-            builtKey = key;
+            int cidKey = center != null ? center.GetInstanceID() : 0;
+            int filter = (fFields ? 1 : 0) | (fSignals ? 2 : 0) | (fFsm ? 4 : 0) | (fCode ? 8 : 0) | (fOther ? 16 : 0);
+            if (mode == 3)
+            {
+                // LOGIC depends only on the selected object's scripts, the code graph and live-instance results
+                bool ready = LogicPanel.Ready;
+                if (keyValid && kMode == 3 && kCenter == cidKey && kFilter == filter && kReady == ready && kLive == liveVersion) return;
+                kReady = ready; kLive = liveVersion;
+            }
+            else
+            {
+                // the set of loaded objects (not the pass counter, which moves every second or two) and the reference index
+                int stamp = SceneStamp.Value, redges = ReferenceIndex.edges, sounds = SoundLibrary.defs.Count; uint aid = arec != null ? arec.id : 0;
+                if (keyValid && kMode == mode && kCenter == cidKey && kFilter == filter && kHops == hops && kEdges == redges && kStamp == stamp && kArec == aid && kAudioVer == AudioDb.Version && kSounds == sounds) return;
+                kHops = hops; kEdges = redges; kStamp = stamp; kArec = aid; kAudioVer = AudioDb.Version; kSounds = sounds;
+            }
+            kMode = mode; kCenter = cidKey; kFilter = filter; keyValid = true; buildSerial++;
             nodes.Clear(); edgesList.Clear(); reachCache.Clear();
             if (mode == 1) { BuildWwise(center, arec); return; }
             if (mode == 3) { BuildLogic(center); return; }
@@ -205,7 +261,7 @@ namespace InsideDev
             if (nodes.TryGetValue(TKey(t), out n)) return n;
             GameObject live; int count;
             LiveOf(t, out live, out count);
-            string nm = t.Name + (live != null ? "  (" + (count > 1 ? count + " loaded" : live.name) + ")" : count < 0 ? "  (checking…)" : typeof(Component).IsAssignableFrom(t) ? "  (none active)" : "  (code)");
+            string nm = t.Name + (live != null ? "  (" + (count > 1 ? count + " loaded" : live.name) + ")" : count < 0 ? "  (checking…)" : typeof(Component).IsAssignableFrom(t) ? "  (none loaded)" : "  (code)");
             n = new Node { id = 0, codeType = t, live = live, col = col, name = nm, tag = "code", color = live != null ? new Color(0.9f, 0.9f, 0.95f, 1f) : new Color(0.6f, 0.62f, 0.7f, 1f) };
             n.tip = extra;
             n.w = Mathf.Clamp(nm.Length * 7.2f + 16, 90, ColW - 30);
@@ -213,34 +269,134 @@ namespace InsideDev
             return n;
         }
 
-        // live instances per type, cached (FindObjectsOfType is expensive; the graph rebuilds on topology changes)
-        // FindObjectsOfType costs 10-30 ms each in a loaded area, so lookups are queued and resolved one per frame
-        // (LiveTick); a build uses what is known and the graph rebuilds when a result changes (liveVersion).
-        static readonly Dictionary<Type, KeyValuePair<GameObject, int>> liveCache = new Dictionary<Type, KeyValuePair<GameObject, int>>();
+        // Loaded instances per script type (LOGIC mode). They come from the object database: one walk over its records
+        // builds "component type name -> first object, count" (a slice per frame, again only when objects were added or
+        // removed), so no FindObjectsOfType runs (10-30 ms each in a loaded area) and switched-off objects count too.
+        // A type also counts the instances of the game types derived from it. Only a type whose short name is shared by
+        // an unrelated game type is still resolved with FindObjectsOfType, one per frame.
+        struct LiveInfo { public GameObject go; public int count; public bool active; }
+        sealed class TypeNames { public string[] names; public bool shared; }
+        static Dictionary<string, LiveInfo> liveNow = new Dictionary<string, LiveInfo>(), liveBuild;
+        static readonly Dictionary<Type, TypeNames> typeNames = new Dictionary<Type, TypeNames>();
+        static readonly Dictionary<Type, LiveInfo> liveShared = new Dictionary<Type, LiveInfo>();
         static readonly List<Type> liveQueue = new List<Type>();
-        static float liveCacheAt; static int liveStream = -1, liveVersion;
+        static int liveAt, livePass = -1, liveStampNow = -1, liveStampBuild = -1, liveVersion;
+        static bool liveReady;
+        const int LiveSlice = 4000;
+
+        static TypeNames NamesOf(Type t)
+        {
+            TypeNames tn;
+            if (typeNames.TryGetValue(t, out tn)) return tn;
+            tn = new TypeNames();
+            var l = new List<string> { t.Name };
+            foreach (var k in CodeGraph.byType.Keys)
+            {
+                if (k == t) continue;
+                if (t.IsAssignableFrom(k)) { if (!l.Contains(k.Name)) l.Add(k.Name); }
+                else if (k.Name == t.Name) tn.shared = true;
+            }
+            tn.names = l.ToArray();
+            typeNames[t] = tn;
+            return tn;
+        }
+
         static void LiveOf(Type t, out GameObject live, out int count)
         {
-            KeyValuePair<GameObject, int> kv;
-            if (liveCache.TryGetValue(t, out kv)) { live = kv.Key; count = kv.Value; if (kv.Value > 0 && live == null && !liveQueue.Contains(t)) liveQueue.Add(t); return; }
-            live = null; count = -1;
-            if (typeof(Component).IsAssignableFrom(t) && !liveQueue.Contains(t)) liveQueue.Add(t);
+            live = null; count = 0;
+            if (!typeof(Component).IsAssignableFrom(t)) return;
+            var tn = NamesOf(t);
+            if (tn.shared)
+            {
+                LiveInfo si;
+                if (liveShared.TryGetValue(t, out si)) { live = si.go; count = si.count; if (count > 0 && live == null && !liveQueue.Contains(t)) liveQueue.Add(t); }
+                else { count = -1; if (!liveQueue.Contains(t)) liveQueue.Add(t); }
+                return;
+            }
+            if (!liveReady) { count = -1; return; }
+            bool active = false;
+            foreach (var name in tn.names)
+            {
+                LiveInfo li;
+                if (!liveNow.TryGetValue(name, out li) || li.go == null) continue;
+                count += li.count;
+                if (live == null || (!active && li.active)) { live = li.go; active = li.active; }
+            }
         }
+
+        // every frame while the LOGIC graph is shown
         public static void LiveTick()
         {
-            if (Time.realtimeSinceStartup - liveCacheAt > 10f || Levels.Changed(ref liveStream))
+            if (liveQueue.Count > 0)
             {
-                liveCacheAt = Time.realtimeSinceStartup;                     // refresh known types in the background, keep old values meanwhile
-                foreach (var t in liveCache.Keys) if (!liveQueue.Contains(t)) liveQueue.Add(t);
+                var ty = liveQueue[0]; liveQueue.RemoveAt(0);
+                var found = new LiveInfo();
+                try { foreach (var o in UnityEngine.Object.FindObjectsOfType(ty)) { var c = o as Component; if (c == null) continue; if (found.go == null) found.go = c.gameObject; found.count++; } } catch { }
+                LiveInfo old;
+                if (!liveShared.TryGetValue(ty, out old) || old.count != found.count || old.go != found.go) liveVersion++;
+                liveShared[ty] = found;
             }
-            if (liveQueue.Count == 0) return;
-            var ty = liveQueue[0]; liveQueue.RemoveAt(0);
-            GameObject live = null; int count = 0;
-            try { foreach (var o in UnityEngine.Object.FindObjectsOfType(ty)) { var c = o as Component; if (c == null) continue; if (live == null) live = c.gameObject; count++; } } catch { }
-            KeyValuePair<GameObject, int> old;
-            bool changed = !liveCache.TryGetValue(ty, out old) || old.Value != count || old.Key != live;
-            liveCache[ty] = new KeyValuePair<GameObject, int>(live, count);
+            if (!ObjectDatabase.Ready) return;
+            int stamp = SceneStamp.Value;
+            if (liveBuild == null)
+            {
+                if (liveReady && stamp == liveStampNow) return;
+                liveBuild = new Dictionary<string, LiveInfo>(liveNow.Count + 64);
+                liveAt = 0; livePass = ObjectDatabase.completedPasses; liveStampBuild = stamp;
+            }
+            else if (ObjectDatabase.completedPasses != livePass)
+            {
+                // the database refilled its list under the walk: start over
+                liveBuild.Clear(); liveAt = 0; livePass = ObjectDatabase.completedPasses; liveStampBuild = stamp;
+            }
+            var all = ObjectDatabase.all;
+            int end = Math.Min(all.Count, liveAt + LiveSlice);
+            for (int i = liveAt; i < end; i++)
+            {
+                var r = all[i];
+                if (r.go == null) continue;
+                var comps = r.comps;
+                for (int k = 0; k < comps.Length; k++)
+                {
+                    LiveInfo li;
+                    liveBuild.TryGetValue(comps[k], out li);
+                    li.count++;
+                    if (li.go == null || (!li.active && r.activeInHierarchy)) { li.go = r.go; li.active = r.activeInHierarchy; }
+                    liveBuild[comps[k]] = li;
+                }
+            }
+            liveAt = end;
+            if (end < all.Count) return;
+            // done: the graph is built again only when something it shows came out differently
+            var before = liveNow;
+            liveNow = liveBuild; liveBuild = null; liveStampNow = liveStampBuild;
+            bool changed = !liveReady;
+            liveReady = true;
+            if (!changed)
+                foreach (var n in nodes.Values)
+                {
+                    if (n.codeType == null || !typeof(Component).IsAssignableFrom(n.codeType)) continue;
+                    foreach (var name in NamesOf(n.codeType).names)
+                    {
+                        LiveInfo a, b;
+                        before.TryGetValue(name, out a); liveNow.TryGetValue(name, out b);
+                        if (a.count != b.count || a.go != b.go) { changed = true; break; }
+                    }
+                    if (changed) break;
+                }
             if (changed) liveVersion++;
+            // types that share their name with another type are looked up again as well
+            if (liveShared.Count > 0) foreach (var t in liveShared.Keys) if (!liveQueue.Contains(t)) liveQueue.Add(t);
+        }
+
+        // bridge: finish the index and the queued lookups now; true when the graph has to be built again
+        static bool LiveResolveNow()
+        {
+            int was = liveVersion, guard = 0;
+            ObjectDatabase.Demand(5f);
+            if (!ObjectDatabase.Ready) return false;
+            do LiveTick(); while ((liveBuild != null || liveQueue.Count > 0) && ++guard < 4096);
+            return liveVersion != was;
         }
 
         static void LinkT(Dictionary<long, Edge> pairs, Node a, Node b, string label, bool sets)
@@ -262,8 +418,9 @@ namespace InsideDev
             if (center != null)
                 foreach (var mb in center.GetComponents<MonoBehaviour>())
                 {
-                    if (mb == null) continue; string an = mb.GetType().Assembly.GetName().Name;
-                    if ((an == "Assembly-CSharp" || an == "Assembly-CSharp-firstpass") && !centers.Contains(mb.GetType())) centers.Add(mb.GetType());
+                    if (mb == null) continue;
+                    var mt = mb.GetType();
+                    if (GameTypes.IsGame(mt) && !centers.Contains(mt)) centers.Add(mt);
                 }
             if (!LogicPanel.Ready || centers.Count == 0) { edgesList.Clear(); Layout(); return; }
             foreach (var t in centers)
@@ -507,17 +664,25 @@ namespace InsideDev
         public static void Draw(UI ui)
         {
             var center = Selection.Current;
-            if (mode == 3) LiveTick();
+            ObjectDatabase.Demand(5f);
+            Background.Want(Background.Objects, 5f);
+            if (mode == 3) { Background.Want(Background.Code, 5f); LiveTick(); }
+            else if (mode != 1) Background.Want(Background.Events, 5f);
             Build(center);
 
             ui.BeginRow();
             if (ui.Button("<", 22, Selection.CanBack ? (Color?)null : UI.BgAlt) && Selection.CanBack) Selection.Back();
             if (ui.Button(">", 22, Selection.CanForward ? (Color?)null : UI.BgAlt) && Selection.CanForward) Selection.Forward();
-            string head = mode == 3 ? (nodes.Count == 0 ? "LOGIC: select an object with game scripts (code scan " + (LogicPanel.Ready ? "ready" : "running") + ")." : "Code logic around " + (center != null ? center.name : "?") + ": " + nodes.Count + " script types, " + edgesList.Count + " links   (left: who sets / reads / calls it, right: what it does)") : mode == 1 ? (nodes.Count == 0 ? "WWISE: select an event in the Audio DB (or an object that posts sounds)." : "Wwise structure: " + nodes.Count + " nodes, " + edgesList.Count + " links")
+            bool scanned = LogicPanel.Scanned;
+            if (headSerial != buildSerial || headScanned != scanned)
+            {
+                headSerial = buildSerial; headScanned = scanned;
+                head = mode == 3 ? (nodes.Count == 0 ? "LOGIC: select an object with game scripts (code scan " + (scanned ? "ready" : "running") + ")." : "Code logic around " + (center != null ? center.name : "?") + ": " + nodes.Count + " script types, " + edgesList.Count + " links   (left: who sets / reads / calls it, right: what it does)") : mode == 1 ? (nodes.Count == 0 ? "WWISE: select an event in the Audio DB (or an object that posts sounds)." : "Wwise structure: " + nodes.Count + " nodes, " + edgesList.Count + " links")
                         : center == null ? "Select an object (Explorer, Objects, Inspector, bridge) to see its reference graph." : "Graph of " + center.name + ":  " + nodes.Count + " objects, " + edgesList.Count + " links";
+            }
             ui.Label(head, UI.Dim, Mathf.Max(100, ui.Width - 300));
-            if (ui.Button(Modes[mode])) { mode = (mode + 1) % 4; EditorState.Set("graph.mode", mode); builtKey = null; needFit = true; }
-            if (ui.Button(hops == 1 ? "1 hop" : hops + " hops")) { hops = hops % 3 + 1; builtKey = null; }
+            if (ui.Button(Modes[mode])) { mode = (mode + 1) % 4; EditorState.Set("graph.mode", mode); keyValid = false; needFit = true; }
+            if (ui.Button(HopLabels[Mathf.Clamp(hops, 1, 3) - 1])) { hops = hops % 3 + 1; keyValid = false; }
             bool sf = ui.Toggle(showFields, "labels"); if (sf != showFields) showFields = sf;
             fFields = ui.Toggle(fFields, "fields"); fSignals = ui.Toggle(fSignals, "signals"); fFsm = ui.Toggle(fFsm, "fsm"); fCode = ui.Toggle(fCode, "code"); fOther = ui.Toggle(fOther, "other");
             if (ui.Button("Fit")) { userView = false; needFit = true; SaveView(); }
@@ -544,12 +709,13 @@ namespace InsideDev
             var d = ui.D;
             d.Fill(area, new Color(0, 0, 0, 0.25f));
             if (center == null && nodes.Count == 0) return;
-            if (mode == 3 && !LogicPanel.Ready) builtKey = null;   // rebuild once the code scan completes
             if (needFit) Fit(area);
             d.PushClip(area);
             try { DrawGraph(ui, d, area); }
             finally { d.PopClip(); }
         }
+
+        static string head = ""; static int headSerial = -1; static bool headScanned;
 
         static Vector2 ToScreen(Rect area, Vector2 p) { return area.center + pan + p * zoom; }
 
@@ -694,11 +860,13 @@ namespace InsideDev
                 d.Frame(g, new Color(0.3f, 1f, 0.45f, a));
             }
             d.Fill(r, selected ? new Color(0.16f, 0.3f, 0.5f, 0.98f) : hover ? new Color(0.22f, 0.24f, 0.3f, 0.98f) : new Color(0.12f, 0.13f, 0.16f, 0.96f));
-            d.Frame(r, n.color);
+            // an object node follows its record (switched on / off) without the graph being built again
+            var nc = n.rec != null ? KindColor(n.rec) : n.color;
+            d.Frame(r, nc);
             if (zoom >= 0.55f)
             {
                 d.PushClip(r);
-                d.Text(r.x + 5, r.y + (NodeH * zoom - 13) * 0.5f, n.name, n.color, Mathf.RoundToInt(12 * Mathf.Clamp(zoom, 0.7f, 1.3f)));
+                d.Text(r.x + 5, r.y + (NodeH * zoom - 13) * 0.5f, n.name, nc, Mathf.RoundToInt(12 * Mathf.Clamp(zoom, 0.7f, 1.3f)));
                 d.PopClip();
             }
         }
@@ -738,7 +906,7 @@ namespace InsideDev
                 if (e.label == null) continue;
                 bool emph = hoverNode != null && (e.a == hoverNode || e.b == hoverNode);
                 if (hoverNode != null && !emph) continue;          // while hovering a node only its links are labelled
-                string txt = e.label + (e.count > 1 ? "  +" + (e.count - 1) : "");
+                string txt = e.shown ?? (e.shown = e.label + (e.count > 1 ? "  +" + (e.count - 1) : ""));
                 float w = d.Measure(txt, size) + 8;
                 Vector2 a = Anchor(area, e.a, true), b = Anchor(area, e.b, false);
                 bool nearSource = e.b.col == 0 && e.a.col != 0;     // many links converge on the centre: label at the far end

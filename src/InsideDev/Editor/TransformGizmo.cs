@@ -81,9 +81,11 @@ namespace InsideDev
         // called every frame before WorldPick (so a click on a handle is not a pick)
         public static void Update(bool overUI)
         {
+            // no gizmo, no camera lookup: this runs every frame, panel open or not
+            if (!globalOn && perObject.Count == 0 || !Visible) { hot = -1; if (drag >= 0) EndDrag(false); return; }
             var sel = Selection.Current;
             var cam = G.Cam();
-            if (!Visible || cam == null) { hot = -1; if (drag >= 0) EndDrag(false); return; }
+            if (cam == null) { hot = -1; if (drag >= 0) EndDrag(false); return; }
             var t = sel.transform;
             if (drag >= 0)
             {
@@ -153,14 +155,14 @@ namespace InsideDev
         static void EndDrag(bool cancel)
         {
             if (cancel && dragT != null) Apply(startPos);
-            if (dragT != null) DevLog.Write("[gizmo] " + (cancel ? "cancelled " : "moved ") + dragT.name + " " + startPos.ToString("F2") + " -> " + dragT.position.ToString("F2"));
+            if (dragT != null) DevLog.Write("[gizmo] " + (cancel ? "cancelled " : "moved ") + dragT.name + " " + Fmt.V3(startPos, "F2") + " -> " + Fmt.V3(dragT.position, "F2"));
             drag = -1; dragT = null; dragRb = null;
         }
 
         // world layer (physical px)
         public static void Emit(Draw d)
         {
-            if (!Visible) return;
+            if (!globalOn && perObject.Count == 0 || !Visible) return;
             var cam = G.Cam();
             if (cam == null) return;
             var t = Selection.Current.transform;

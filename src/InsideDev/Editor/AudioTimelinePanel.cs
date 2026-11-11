@@ -7,15 +7,24 @@ namespace InsideDev
     // Audio Timeline: every observed call into AkSoundEngine.dll plus the callbacks coming back, newest first.
     // Click a row: selects the Unity object that owns the Wwise game object, and for posts/callbacks shows the
     // playing-id detail. "Follow" pins the view to one playing id (post -> callbacks -> end).
+    // The visible index list is rebuilt when the trace got a new entry or a toggle, the filter, the followed id or (with
+    // "selected object only") the selection changed, not every frame.
     public static class AudioTimelinePanel
     {
         static string filter = "";
         static readonly bool[] cats = { true, true, true, false, true, true, true, false, true };   // per AudioTrace.Cat
         static readonly string[] catNames = { "events", "switch", "state", "rtpc", "banks", "objects", "callbacks", "ids", "other" };
+        static readonly string[] levelNames = { "telemetry: OFF", "telemetry: NORMAL", "telemetry: DETAILED", "telemetry: RAW" };
+        static string[] stackLabels;
         static bool onlySelected, raw;
         static uint detailPid, detailFor; static float detailAt; static string[] detailLines = new string[0];
-        static readonly Stack<uint> back = new Stack<uint>();
-        static readonly List<int> idxBuf = new List<int>(4096);   // playing ids viewed before (Back)
+        static readonly Stack<uint> back = new Stack<uint>();   // playing ids viewed before (Back)
+        static readonly ListCache list = new ListCache();
+        static SearchDelay filterDelay;
+        static int coalescedSeen; static float coalescedAt;
+        static string statusLine; static float statusAt;
+        static UI curUi; static float curNow;
+        static readonly Action<int> drawRow = DrawRow, drawDetail = DrawDetail;
         static readonly Color cPost = new Color(0.55f, 0.9f, 1f, 1f), cFail = new Color(1f, 0.4f, 0.35f, 1f), cSync = new Color(1f, 0.8f, 0.35f, 1f),
             cRtpc = new Color(0.7f, 0.7f, 0.85f, 1f), cBank = new Color(0.5f, 1f, 0.55f, 1f), cObj = new Color(0.65f, 0.65f, 0.65f, 1f), cCb = new Color(0.85f, 0.6f, 1f, 1f);
 
@@ -36,24 +45,29 @@ namespace InsideDev
 
         public static void Draw(UI ui)
         {
+            Background.Want(Background.Audio, 5f);
+            float now = Time.realtimeSinceStartup;
             ui.BeginRow();
             if (ui.Button(AudioTrace.paused ? "Resume" : "Pause")) AudioTrace.paused = !AudioTrace.paused;
             if (ui.Button("Clear")) AudioTrace.Clear();
-            for (int i = 0; i < cats.Length; i++) cats[i] = ui.Toggle(cats[i], catNames[i]);
+            int catMask = 0;
+            for (int i = 0; i < cats.Length; i++) { cats[i] = ui.Toggle(cats[i], catNames[i]); if (cats[i]) catMask |= 1 << i; }
             ui.EndRow();
             ui.BeginRow();
             onlySelected = ui.Toggle(onlySelected, "selected object only");
             raw = ui.Toggle(raw, "raw ids");
             int lvl = WwiseNative.Level;
-            if (ui.Button("telemetry: " + (lvl == 0 ? "OFF" : lvl == 1 ? "NORMAL" : lvl == 2 ? "DETAILED" : "RAW"))) WwiseNative.SetLevel((lvl + 1) % 4);
-            if (ui.Button("call stacks: " + AudioSpy.StackModes[AudioSpy.stackMode])) AudioSpy.stackMode = (AudioSpy.stackMode + 1) % 3;
+            if (ui.Button(levelNames[Mathf.Clamp(lvl, 0, 3)])) WwiseNative.SetLevel((lvl + 1) % 4);
+            if (stackLabels == null) { stackLabels = new string[AudioSpy.StackModes.Length]; for (int i = 0; i < stackLabels.Length; i++) stackLabels[i] = "call stacks: " + AudioSpy.StackModes[i]; }
+            if (ui.Button(stackLabels[AudioSpy.stackMode])) AudioSpy.stackMode = (AudioSpy.stackMode + 1) % 3;
             if (AudioTrace.follow != 0) { if (ui.Button("Stop following " + AudioTrace.follow)) AudioTrace.follow = 0; }
             ui.EndRow();
             ui.BeginRow();
             ui.Label("Filter:", null, 40);
-            ui.TextField("atl_filter", ref filter, Mathf.Max(80, ui.Width - 4));
+            EditorInput.Field(ui, "atl_filter", ref filter, Mathf.Max(80, ui.Width - 4));
             ui.EndRow();
-            ui.Label(AudioTrace.Status(), UI.Dim);
+            if (statusLine == null || now - statusAt > 0.5f) { statusLine = AudioTrace.Status(); statusAt = now; }
+            ui.Label(statusLine, UI.Dim);
 
             if (detailPid != 0)
             {
@@ -66,46 +80,61 @@ namespace InsideDev
                 ui.EndRow();
                 if (detailPid != 0)
                 {
-                    if (detailFor != detailPid || Time.realtimeSinceStartup - detailAt > 0.5f) { detailLines = AudioTrace.DescribePlay(detailPid).Split('\n'); detailFor = detailPid; detailAt = Time.realtimeSinceStartup; }
-                    var dl = detailLines;
-                    ui.VirtualList("atl_detail", dl.Length, UI.ItemPitch, Mathf.Min(dl.Length * UI.ItemPitch + 4, ui.Remaining * 0.45f), i => ui.Label(dl[i], Color.white));
+                    if (detailFor != detailPid || now - detailAt > 0.5f) { detailLines = AudioTrace.DescribePlay(detailPid).Split('\n'); detailFor = detailPid; detailAt = now; }
+                    curUi = ui;
+                    ui.VirtualList("atl_detail", detailLines.Length, UI.ItemPitch, Mathf.Min(detailLines.Length * UI.ItemPitch + 4, ui.Remaining * 0.45f), drawDetail);
                 }
             }
 
-            int selId = Selection.Current != null ? Selection.Current.GetInstanceID() : 0;
-            string fl = filter.Trim();
-            var idx = idxBuf; idx.Clear();
-            for (int i = 0; i < AudioTrace.Count && idx.Count < 4000; i++)
+            int selId = onlySelected && Selection.Current != null ? Selection.Current.GetInstanceID() : 0;
+            string fl = filterDelay.Value(filter, 0.12f).Trim();
+            int count = AudioTrace.Count;
+            long newest = count > 0 && AudioTrace.Get(0) != null ? AudioTrace.Get(0).seq : -1;
+            // a repeat that was folded into an existing entry changes that entry's text, not the list: with a filter typed
+            // the list follows such changes four times per second at most
+            if (fl.Length > 0 && AudioTrace.coalesced != coalescedSeen && now - coalescedAt > 0.25f) { coalescedSeen = AudioTrace.coalesced; coalescedAt = now; list.Invalidate(); }
+            long toggles = (uint)catMask | (onlySelected ? 1L << 16 : 0) | (raw ? 1L << 17 : 0) | ((long)AudioTrace.follow << 20);
+            if (list.Changed(((long)count << 40) ^ newest, toggles, selId, fl))
             {
-                var e = AudioTrace.Get(i);
-                if (e == null) break;
-                var r = e.r;
-                if (AudioTrace.follow != 0) { if (r.playingId != AudioTrace.follow) continue; }
-                else if (!cats[(int)AudioTrace.CategoryOf(r.type)]) continue;
-                if (onlySelected && (int)r.gameObj != selId) continue;
-                if (fl.Length > 0 && AudioTrace.Text(e, raw).IndexOf(fl, StringComparison.OrdinalIgnoreCase) < 0 && AudioTrace.Kind(r.type).IndexOf(fl, StringComparison.OrdinalIgnoreCase) < 0) continue;
-                idx.Add(i);
+                uint follow = AudioTrace.follow;
+                for (int i = 0; i < count && list.Count < 4000; i++)
+                {
+                    var e = AudioTrace.Get(i);
+                    if (e == null) break;
+                    var r = e.r;
+                    if (follow != 0) { if (r.playingId != follow) continue; }
+                    else if (!cats[(int)AudioTrace.CategoryOf(r.type)]) continue;
+                    if (onlySelected && (int)r.gameObj != selId) continue;
+                    if (fl.Length > 0 && AudioTrace.Text(e, raw).IndexOf(fl, StringComparison.OrdinalIgnoreCase) < 0 && AudioTrace.Kind(r.type).IndexOf(fl, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    list.Add(i);
+                }
             }
-            float now = Time.realtimeSinceStartup;
-            ui.VirtualList("atl_list", idx.Count, UI.ItemPitch, ui.Remaining, row =>
+            curUi = ui; curNow = now;
+            ui.VirtualList("atl_list", list.Count, UI.ItemPitch, ui.Remaining, drawRow);
+        }
+
+        static void DrawDetail(int i) { curUi.Label(detailLines[i], Color.white); }
+
+        static void DrawRow(int row)
+        {
+            var ui = curUi;
+            var e = AudioTrace.Get(list.idx[row]);
+            if (e == null) return;
+            var c = ColorOf(e);
+            if (curNow - e.t < 1.2f) c = Color.Lerp(Color.white, c, (curNow - e.t) / 1.2f);
+            if (e.line == null || e.lineCount != e.count || e.lineRaw != raw || (!raw && e.text == null))
             {
-                var e = AudioTrace.Get(idx[row]);
-                var c = ColorOf(e);
-                if (now - e.t < 1.2f) c = Color.Lerp(Color.white, c, (now - e.t) / 1.2f);
-                if (e.line == null || e.lineCount != e.count || e.lineRaw != raw || (!raw && e.text == null))
-                {
-                    e.line = e.t.ToString("0.00") + "s  f" + e.frame + "  " + AudioTrace.Kind(e.r.type).PadRight(12) + AudioTrace.Text(e, raw);
-                    e.lineCount = e.count; e.lineRaw = raw;
-                }
-                bool ck = ui.Item(e.line, c);
-                if (ui.LastHover) { var u = AudioTrace.Unity(e.r.gameObj); if (u != null) Selection.SetHover(u); }
-                if (ck)
-                {
-                    var u = AudioTrace.Unity(e.r.gameObj);
-                    if (u != null) Selection.Set(u, "audio timeline");
-                    if (e.r.playingId != 0 && e.r.playingId != detailPid) { if (detailPid != 0) { back.Push(detailPid); if (back.Count > 50) back.Clear(); } detailPid = e.r.playingId; }
-                }
-            });
+                e.line = e.t.ToString("0.00") + "s  f" + e.frame + "  " + AudioTrace.Kind(e.r.type).PadRight(12) + AudioTrace.Text(e, raw);
+                e.lineCount = e.count; e.lineRaw = raw;
+            }
+            bool ck = ui.Item(e.line, c);
+            if (ui.LastHover) { var u = AudioTrace.Unity(e.r.gameObj); if (u != null) Selection.SetHover(u); }
+            if (ck)
+            {
+                var u = AudioTrace.Unity(e.r.gameObj);
+                if (u != null) Selection.Set(u, "audio timeline");
+                if (e.r.playingId != 0 && e.r.playingId != detailPid) { if (detailPid != 0) { back.Push(detailPid); if (back.Count > 50) back.Clear(); } detailPid = e.r.playingId; }
+            }
         }
 
         static void Play(uint pid, UI ui)
