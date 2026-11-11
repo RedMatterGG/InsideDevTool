@@ -25,6 +25,14 @@ namespace InsideDev.ReplayLab
 
     public static class LabUtil
     {
+        // letters, digits, '_' and '-' of a name that becomes part of a folder name (anything else becomes '_')
+        public static string SafeName(string s)
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (char ch in s ?? "") sb.Append(char.IsLetterOrDigit(ch) || ch == '_' || ch == '-' ? ch : '_');
+            return sb.Length > 0 ? sb.ToString() : "_";
+        }
+
         public static readonly CultureInfo IC = CultureInfo.InvariantCulture;
         const BindingFlags All = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
 

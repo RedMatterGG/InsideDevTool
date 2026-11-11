@@ -352,7 +352,7 @@ namespace InsideDev.ReplayLab
                 try { var p = Path.Combine(Lab.outRoot, "L5_S3/verdict.txt"); if (File.Exists(p)) s3v = File.ReadAllText(p).Trim(); } catch { }
                 c.result["s3Verdict"] = s3v ?? "none";
                 if (!(s3v != null && s3v.StartsWith("FAIL")) && !c.Has("force")) c.Prep("S2 runs only after S3 failed (L5_S3 verdict: " + (s3v ?? "none") + "); add force to override");
-                if (!c.Has("confirm")) c.Prep("S2 lifts rtpc_master_volume to " + level + " with only InsideMuter guarding; add confirm");
+                if (!c.Has("confirm")) c.Prep("S2 lifts rtpc_master_volume to " + level.ToString("0.###", IC) + " with only InsideMuter guarding; add confirm");
                 if (suspendedByLab)
                 {
                     if (!c.Has("wake")) c.Prep("Wwise was suspended by L5 S3 in this session; add wake (rtpc forced 0, 100 ms, WakeupFromSuspend)");
@@ -372,6 +372,10 @@ namespace InsideDev.ReplayLab
             if (!suspendedByLab && h0.muted == 0) c.Prep("no muted INSIDE session in the heartbeat (InsideMuter must see the game's audio session)");
             var rb = new List<string>();
             rb.Add("start " + ReadRtpc());
+            // the test leaves the master volume rule at 0 (it never restores a louder value by itself): say so in the result
+            c.result["rtpcBefore"] = ReadRtpc();
+            c.result["rtpcAfter"] = "0, forced by the audio rule " + RtpcKey + " (the game stays silent until that rule is changed)";
+            c.Log("rtpc_master_volume was " + ReadRtpc() + "; the test forces 0 and leaves it there");
             ForceZero();
             c.Undo("rtpc forced 0", ForceZero);
             c.Undo("capture stop", () => { windowOpen = false; requireQuiet = false; ForceZero(); StopCapture(); EndTimer(); });
@@ -444,7 +448,7 @@ namespace InsideDev.ReplayLab
                 requireQuiet = s3;
                 windowOpen = true;
                 ForceLevel(level);
-                c.Log("capture window open: rtpc_master_volume " + level);
+                c.Log("capture window open: rtpc_master_volume " + level.ToString("0.###", IC));
             }
             var sizesT = new List<double>(); var sizes = new List<double>();
             int markers = 0, everUnmuted = 0, everActive = 0, hbFails = 0, signalReads = 0;

@@ -27,7 +27,7 @@ namespace InsideDev.ReplayLab
                 usage = "lab l12 [tag=<scene name>] [frames=30] [dx=1.5] [yaw=10] [eps=1e-5] [cam=...]",
                 prep = "run once in ChickenGun (tag=chickengun) and once in a water scene with WaterDust (tag=water); results in L12_<tag>",
                 body = L12,
-                name = c => "L12" + (c.Arg("tag", null) != null ? "_" + c.Arg("tag", null) : "")
+                name = c => "L12" + (c.Arg("tag", null) != null ? "_" + LabUtil.SafeName(c.Arg("tag", null)) : "")
             });
         }
 
@@ -47,6 +47,9 @@ namespace InsideDev.ReplayLab
 
         static IEnumerator L7(LabContext c)
         {
+            // the test counts sound posts and signal / fsm events: the monitors that log them sleep unless asked for
+            Background.Want(Background.Audio, 600f);
+            Background.Want(Background.Events, 600f);
             var names = c.List("cullers");
             if (names.Count == 0) names = new List<string> { "3_Interior_CULL", "1b_IndoorDetails_CULL" };
             var forced = new List<BoundsCullerRuntime>();

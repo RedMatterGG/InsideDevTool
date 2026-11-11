@@ -64,7 +64,16 @@ namespace InsideDev.Play
             PlayRegistry.Resource(new ResourceDef { uri = TunablesUri, name = "tunables", title = "Typed tunables", mimeType = "application/json", profiles = McpProfiles.Dev,
                 description = "The knobs an agent may turn (time, camera, render, air, god, audio, debug flags) with type, range, units and the tool call that sets each. Out-of-range values are refused, never clamped." });
             PlayRegistry.Reader(ReadResource);
-            PlayRegistry.OnTick("render_fog", FogTick);
+            fogTick = PlayRegistry.OnTick("render_fog", FogTick, TickWhen.OnDemand);
+        }
+
+        static PlayTick fogTick;
+
+        // the fog tick runs only while a tool holds the fog setting
+        static void SyncFogTick()
+        {
+            var t = fogTick;
+            if (t != null) t.Active = fogHeld;
         }
 
         // ---------------------------------------------------------------- audio
@@ -307,12 +316,13 @@ namespace InsideDev.Play
                     var l = lv;
                     World.Restore("render:fog", "fog (Unity fog, volumetric light fog)", () =>
                     {
-                        lock (gate) fogHeld = false;
+                        lock (gate) { fogHeld = false; SyncFogTick(); }
                         RenderSettings.fog = before;
                         if (l != null) l.enabled = lvBefore;
                         return before ? "fog on" : "fog off";
                     });
                     fogHeld = true;
+                    SyncFogTick();
                 }
                 fogWanted = on;
             }

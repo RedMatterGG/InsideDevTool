@@ -31,6 +31,7 @@ namespace InsideDev.Play
 
         public static void Register()
         {
+            EditorState.Describe("notes", "play.notes_key", DefaultKey, "Key that flags the current moment as a note (a UnityEngine.KeyCode name such as Home or F9); none or off = no hotkey.");
             PlayRegistry.Add(PlayShared.Def("notes", "Flagged moments", PlayShared.Play, Owner,
                 "Moments the user flagged in the game with the notes hotkey (or added here): frame, checkpoint, body position, screenshot. list the latest, get one (image attaches its screenshot), add a note at the current moment, clear all (the old list is kept as a backup file).",
                 Schema.Obj().Enum("op", "list, get, add or clear.", "list", "list", "get", "add", "clear").Int("id", "op get.", 0, 1000000)
@@ -43,7 +44,18 @@ namespace InsideDev.Play
                     .Str("image", "op get image: the attached screenshot's size (scaled to 960 px wide).")
                     .Arr("warnings", "", Schema.Str(), 0, 20).BuildOutput()), Handle);
             PlayRegistry.Instructions(McpProfiles.Play, 10, "If the user mentions a moment, a spot or \"here\", read notes {op:\"list\"} first: the user flags moments in the game with a hotkey (checkpoint, position, screenshot, text).");
-            PlayRegistry.OnTick("notes", Tick);
+            tick = PlayRegistry.OnTick("notes", Tick, TickWhen.OnDemand);
+            tick.Active = true;
+            PlayRegistry.OnWake(WakeKey);
+        }
+
+        static PlayTick tick;
+
+        // main thread, when Play is used again: read play.notes_key at once (with the hotkey off the tick sleeps)
+        static void WakeKey()
+        {
+            ticks = 0;
+            tick.Active = true;
         }
 
         static ToolResult Handle(Json.Obj a, CallContext ctx)
@@ -137,7 +149,17 @@ namespace InsideDev.Play
                 if (file != null && File.Exists(file))
                 {
                     int bad;
-                    if (ring.Load(File.ReadAllLines(file, Encoding.UTF8), out bad)) File.WriteAllText(file, ring.Serialize(), new UTF8Encoding(false));
+                    if (ring.Load(File.ReadAllLines(file, Encoding.UTF8), out bad))
+                    {
+                        // lines that do not parse (a half-written last line, a newer format) are kept in a copy before
+                        // the file is rewritten without them
+                        if (bad > 0)
+                        {
+                            File.Copy(file, file + ".bad", true);
+                            Log("[notes] " + bad + " line(s) of " + file + " could not be read; the file as it was is kept as " + Path.GetFileName(file) + ".bad");
+                        }
+                        SafeFile.WriteAllText(file, ring.Serialize());
+                    }
                 }
             }
             catch (Exception e) { Log("[notes] could not read " + file + ": " + e.Message); }
@@ -163,15 +185,37 @@ namespace InsideDev.Play
             {
                 var r = Ring();
                 int n = r.Count;
-                r.Clear();
+                var cleared = r.Clear();
                 string file = FilePath();
                 try
                 {
                     if (file != null && File.Exists(file))
                     {
-                        backup = Path.Combine(Path.GetDirectoryName(file), "notes_cleared_" + DateTime.Now.ToString("yyyyMMdd_HHmmss", System.Globalization.CultureInfo.InvariantCulture) + ".jsonl");
-                        if (File.Exists(backup)) File.Delete(backup);
-                        File.Move(file, backup);
+                        string stamp = "notes_cleared_" + DateTime.Now.ToString("yyyyMMdd_HHmmss", System.Globalization.CultureInfo.InvariantCulture);
+                        backup = Path.Combine(Path.GetDirectoryName(file), stamp + ".jsonl");
+                        // the pictures go with the backup: note ids start again after a clear, so a new note_1.png would
+                        // otherwise replace the picture the backup still points at
+                        string shots = Path.Combine(Path.GetDirectoryName(file), stamp);
+                        var sb = new StringBuilder();
+                        foreach (var e in cleared)
+                        {
+                            try
+                            {
+                                if (!string.IsNullOrEmpty(e.screenshot) && File.Exists(e.screenshot) && Path.GetFileName(e.screenshot).StartsWith("note_"))
+                                {
+                                    Directory.CreateDirectory(shots);
+                                    string to = Path.Combine(shots, Path.GetFileName(e.screenshot));
+                                    if (File.Exists(to)) File.Delete(to);
+                                    File.Move(e.screenshot, to);
+                                    e.screenshot = to;
+                                }
+                            }
+                            catch (Exception ex) { Log("[notes] clear: picture of note " + e.id + " stays where it is: " + ex.Message); }
+                            sb.Append(NoteRing.Line(e)).Append('\n');
+                        }
+                        if (cleared.Count > 0) SafeFile.WriteAllText(backup, sb.ToString());
+                        else { if (File.Exists(backup)) File.Delete(backup); File.Copy(file, backup); }
+                        File.Delete(file);
                     }
                 }
                 catch (Exception e) { Log("[notes] clear: " + e.Message); }
@@ -247,7 +291,7 @@ namespace InsideDev.Play
             try
             {
                 if (evicted.Count == 0) File.AppendAllText(file, NoteRing.Line(added) + "\n", new UTF8Encoding(false));
-                else File.WriteAllText(file, r.Serialize(), new UTF8Encoding(false));
+                else SafeFile.WriteAllText(file, r.Serialize());
             }
             catch (Exception ex) { Log("[notes] could not write " + file + ": " + ex.Message); }
             foreach (var old in evicted)
@@ -257,10 +301,14 @@ namespace InsideDev.Play
             }
         }
 
-        // main thread, every frame
+        // main thread, every frame while a hotkey is set (play.notes_key none / off: the tick sleeps until Play is used)
         static void Tick()
         {
-            if (++ticks % 120 == 1) ReadKey();
+            if (++ticks % 120 == 1)
+            {
+                ReadKey();
+                if (key == KeyCode.None) { tick.Active = false; return; }
+            }
             if (key != KeyCode.None && EditorInput.Key(key)) Add("");
         }
 

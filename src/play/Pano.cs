@@ -26,12 +26,20 @@ namespace InsideDev.Play
     // them. campath's onPreCull pose is suspended. Afterwards the free camera / its pose, TAA and post are put back after
     // one more frame with TAA feedback 0 at the original pose (no ghost). A worker thread box-filters the faces, maps them
     // to the equirect and writes an uncompressed (stored deflate) PNG, fast; "compress" deflates it in the game instead.
-    // Commands: pano <file.png> [size=4096] [x y z] [noVignette] ... (Help), pano status. Restore (key pano) ends a capture and puts the camera back.
+    // The stored PNG is streamed to the file in bands of at most 32 MiB of pixels (StoredPng), so a 16384 px panorama
+    // needs no more memory than a 4096 px one. For the six faces the game is held (Stepper.Freeze, undone at the end)
+    // unless it is frozen already or "live" is given, and the free camera's keys are locked (CameraControl.captureLock),
+    // so all faces show one moment from one point. overscan=<deg> renders each face about that much wider than 90 degrees
+    // and reads only the centre square that spans exactly 90, which keeps screen-edge effects (vignette, bloom falloff,
+    // TAA edge clamps) off the cube seams at the price of smaller faces.
+    // File: no name -> <_mod>/recordings/pano_<date>_<time>.png, a bare name -> that folder, a path -> as given.
+    // Commands: pano [file.png] [size=4096] [x y z] [noVignette] ... (Help), pano status [json], pano wait. Restore (key
+    // pano) ends a capture and puts the camera back.
     // Approach after yasirkula/Unity360ScreenshotCapture (MIT, Copyright (c) 2018 Suleyman Yasir KULA: cube faces to
     // equirect, GPano XMP in the PNG) and SoylentGraham's RenderToCubemap + equirect blit gist; no code copied.
     public static class Pano
     {
-        public const string Help = "pano <file.png> [size=4096 | <size>] [x y z | eye=x,y,z] [noVignette] [lens] [near=m] [warm=0..30] [samples=1..16] [faces=<dir>] [compress] [delay=frames] | pano status | pano help";
+        public const string Help = "pano [file.png | take] [size=4096 | <size>] [x y z | eye=x,y,z] [noVignette] [lens] [near=m] [warm=0..30] [samples=1..16] [faces=<dir>] [compress] [delay=frames] [live | hold] [overscan=0..45 deg] [wait] | pano status [json] | pano wait | pano help";
         public const string RestoreKey = "pano";
         const string HeadPath = "_Boy/_BoyPreprocessed/visual/Boy/Head";
         const float EyeUp = 0.10f;
@@ -44,6 +52,7 @@ namespace InsideDev.Play
         static Job job;
         static int lastId;
         static string last = "pano: idle";
+        static Json.Obj lastObj;
         internal static bool Capturing;
 
         static Cap cap;
@@ -54,10 +63,11 @@ namespace InsideDev.Play
 
         sealed class Job
         {
-            public int id, size = 4096, samples = 1, warm = 1, delay = 2, n, m, frame0, frames;
-            public string file = "", facesDir = "", eyeFrom = "head", vignetteName = "";
-            public bool hasEye, vignette = true, lens, compress, cleaned;
-            public float near = -1f, usedNear, usedFov;
+            public int id, size = 4096, samples = 1, warm = 1, delay = 2, n, full, m, frame0, frames, lastFrame;
+            public string file = "", facesDir = "", eyeFrom = "head", vignetteName = "", sidecar = "";
+            public bool hasEye, vignette = true, lens, compress, cleaned, hold = true, held, replaced;
+            public volatile bool dropped;
+            public float near = -1f, usedNear, usedFov, overscan;
             public Vector3 eye, camPos, camEuler;
             public float camFov, camNear;
             public double gameTime, srecT = double.NaN, renderMs, convertMs, encodeMs;
@@ -73,36 +83,59 @@ namespace InsideDev.Play
             public D11PDTemporalReprojection3 taa;
             public D11PDPostCombined pc;
             public float fbMin, fbMax, blur, barrel, chroma, fb, prevFov, prevNear;
-            public bool jitter, jitterOn, lens, vignette, wasFree;
+            public bool jitter, jitterOn, lens, vignette, wasFree, lockBefore, froze, scaleHeld;
+            public float scaleBefore;
             public Texture vig;
             public Vector3 prevPos;
             public Quaternion prevRot;
             public Texture2D tex;
         }
 
-        public static string Command(List<string> a, DevCore core)
+        public static string Command(List<string> args, DevCore core)
         {
+            var a = new List<string>(args);
             string sub = a.Count > 1 ? a[1] : "status";
             string low = sub.ToLowerInvariant();
-            if (low == "status") return Status();
+            if (low == "status") return FilmShared.TakeLast(a, "json", 2) ? JsonLine.Write(StatusObj()) : Status();
             if (low == "help") return "usage: " + Help;
+            if (low == "wait") { lock (gate) return job != null ? "pending: " + Status() : last; }
+            bool wait = FilmShared.TakeLast(a, "wait", 1);
+            string text = Start(a, core, false);
+            return wait && text.StartsWith("pano #", StringComparison.Ordinal) ? text + "\nwait: pano wait" : text;
+        }
+
+        // main thread: a new job from the words after "pano"; the reply starts with "pano #<id> queued" when it runs.
+        // bareOnly keeps the files inside <_mod>/recordings (the film tool on the play profile).
+        internal static string Start(List<string> a, DevCore core, bool bareOnly)
+        {
             lock (gate)
             {
-                if (job != null && (job.phase == "queued" || job.phase == "capturing") && job.total.ElapsedMilliseconds > 30000)
+                if (job != null && (job.phase == "queued" || job.phase == "capturing") && Time.frameCount - job.lastFrame > 120)
                 {
-                    last = "pano #" + job.id + " dropped: its capture stalled (level load?)";
-                    RestorePose(job);
+                    var old = job;
+                    old.dropped = true;
+                    last = "pano #" + old.id + " failed: dropped, its capture stalled (level load?)";
+                    lastObj = Result(old, false, "dropped, its capture stalled (level load?)", 0, 0);
+                    RestorePose(old);
                     job = null;
                     End();
+                    if (old.cleaned) { old.cleaned = false; Clean(core, false, old); }
                 }
                 if (job != null) return "pano: busy with #" + job.id + " (" + job.phase + "); pano status says when it is done";
             }
-            if (MultiCam.Capturing || CameraControl.captureLock) return "pano: mcam is capturing";
+            if (MultiCam.Capturing) return "pano: mcam is capturing";
+            if (CameraControl.captureLock) return "pano: busy: another capture holds the camera (an mcam pass, det or lab)";
             var j = new Job();
-            try { j.file = Path.GetFullPath(sub).Replace('\\', '/'); } catch (Exception e) { return "pano: bad file " + sub + ": " + e.Message; }
+            int first = 1;
+            string name = null;
+            if (a.Count > 1 && a[1].ToLowerInvariant() == "take") first = 2;
+            else if (a.Count > 1 && !IsOption(a[1])) { name = a[1]; first = 2; }
+            string why;
+            j.file = FilmFiles.Resolve(Path.Combine(Extensions.Dir, FilmFiles.Folder), "pano", ".png", name, bareOnly, out why);
+            if (j.file == null) return "pano: " + why;
             if (!j.file.EndsWith(".png", StringComparison.OrdinalIgnoreCase)) j.file += ".png";
             var nums = new List<float>();
-            for (int i = 2; i < a.Count; i++)
+            for (int i = first; i < a.Count; i++)
             {
                 string s = a[i], k = s.ToLowerInvariant();
                 int eq = s.IndexOf('=');
@@ -115,7 +148,12 @@ namespace InsideDev.Play
                     else if (key == "samples") j.samples = (int)Num(val, -1f);
                     else if (key == "warm") j.warm = (int)Num(val, -1f);
                     else if (key == "delay") j.delay = (int)Num(val, -1f);
-                    else if (key == "faces") { try { j.facesDir = Path.GetFullPath(val).Replace('\\', '/'); } catch (Exception e) { return "pano: bad faces dir " + val + ": " + e.Message; } }
+                    else if (key == "overscan") j.overscan = Num(val, -1f);
+                    else if (key == "faces")
+                    {
+                        if (bareOnly) return "pano: refused: faces=<dir> is not available here";
+                        try { j.facesDir = Path.GetFullPath(val).Replace('\\', '/'); } catch (Exception e) { return "pano: bad faces dir " + val + ": " + e.Message; }
+                    }
                     else if (key == "vignette") j.vignette = val != "0" && val.ToLowerInvariant() != "off";
                     else if (key == "eye")
                     {
@@ -132,6 +170,8 @@ namespace InsideDev.Play
                 else if (k == "vignette") j.vignette = true;
                 else if (k == "lens") j.lens = true;
                 else if (k == "compress") j.compress = true;
+                else if (k == "live") j.hold = false;
+                else if (k == "hold") j.hold = true;
                 else return "pano: unknown option " + s + "\nusage: " + Help;
             }
             if (nums.Count == 1 || nums.Count == 4) j.size = (int)nums[0];
@@ -148,14 +188,79 @@ namespace InsideDev.Play
             if (j.warm < 0 || j.warm > 30) return "pano: warm 0..30 frames";
             if (j.delay < 0 || j.delay > 120) return "pano: delay 0..120 frames";
             if (j.near != -1f && (j.near <= 0f || j.near > 10f)) return "pano: near must be in (0, 10] m";
+            if (!(j.overscan >= 0f && j.overscan <= 45f)) return "pano: overscan 0..45 degrees";
             var root = UnityEngine.Object.FindObjectOfType<DevRoot>();
             if (root == null) return "pano: no DevRoot to run on";
+            j.replaced = File.Exists(j.file);
+            j.lastFrame = Time.frameCount;
             lock (gate) { j.id = ++lastId; job = j; }
             j.total.Start();
             root.StartCoroutine(Run(j, core));
-            return "pano #" + j.id + " queued: " + j.file + " " + j.size + "x" + (j.size / 2) + ", eye " + (j.hasEye ? V(j.eye) : "head + " + F(EyeUp) + " m") +
+            return "pano #" + j.id + " queued: " + j.file + (j.replaced ? " (replacing the existing file)" : "") + " " + j.size + "x" + (j.size / 2) + ", eye " + (j.hasEye ? V(j.eye) : "head + " + F(EyeUp) + " m") +
                    (j.vignette ? "" : ", no vignette") + (j.lens ? ", lens kept" : "") + ", " + (j.warm + j.samples) + " frame(s) per face" + (j.samples > 1 ? " (" + j.samples + " samples)" : "") +
-                   (j.near > 0f ? ", near " + F(j.near) : "") + (j.facesDir.Length > 0 ? ", faces -> " + j.facesDir : "") + (j.compress ? ", compressed PNG" : ", stored PNG") + "; pano status";
+                   (j.near > 0f ? ", near " + F(j.near) : "") + (j.overscan > 0f ? ", overscan " + F(j.overscan) + " deg" : "") + (j.hold ? ", game held for the faces" : ", live") +
+                   (j.facesDir.Length > 0 ? ", faces -> " + j.facesDir : "") + (j.compress ? ", compressed PNG" : ", stored PNG") + "; pano status";
+        }
+
+        static readonly string[] Words = { "novignette", "vignette", "lens", "compress", "live", "hold", "wait" };
+        static readonly string[] Keys = { "size", "near", "samples", "warm", "delay", "overscan", "faces", "vignette", "eye" };
+
+        // true when the first word after "pano" is an option, so no file name was given
+        static bool IsOption(string s)
+        {
+            string k = s.ToLowerInvariant();
+            float v;
+            if (Array.IndexOf(Words, k) >= 0 || float.TryParse(s, NumberStyles.Float, IC, out v)) return true;
+            int eq = k.IndexOf('=');
+            return eq > 0 && Array.IndexOf(Keys, k.Substring(0, eq)) >= 0;
+        }
+
+        // any thread: no capture is queued, running or being written
+        internal static bool Idle { get { lock (gate) return job == null; } }
+        internal static int LastId { get { lock (gate) return lastId; } }
+
+        // any thread: pano status json. busy with the running job, and "last" = the result of the last finished one
+        internal static Json.Obj StatusObj()
+        {
+            var o = new Json.Obj();
+            lock (gate)
+            {
+                var j = job;
+                o["busy"] = j != null;
+                if (j != null)
+                {
+                    o["id"] = (double)j.id; o["phase"] = j.phase; o["file"] = j.file; o["ms"] = (double)j.total.ElapsedMilliseconds;
+                }
+                if (lastObj != null) o["last"] = lastObj;
+                o["text"] = j != null ? "pano #" + j.id + " " + j.phase + " " + j.file : last;
+            }
+            return o;
+        }
+
+        static Json.Obj Result(Job j, bool ok, string error, int W, int H)
+        {
+            var o = new Json.Obj();
+            o["id"] = (double)j.id;
+            o["ok"] = ok;
+            o["file"] = j.file;
+            if (ok)
+            {
+                o["sidecar"] = j.sidecar;
+                o["width"] = (double)W; o["height"] = (double)H;
+                o["face_px"] = (double)j.n;
+                o["frames"] = (double)j.frames;
+                o["held"] = j.held;
+                o["game_time"] = Math.Round(j.gameTime, 6);
+                if (j.facesDir.Length > 0) o["faces_dir"] = j.facesDir;
+                var ms = new Json.Obj();
+                ms["capture"] = Math.Round(j.renderMs); ms["convert"] = Math.Round(j.convertMs); ms["write"] = Math.Round(j.encodeMs); ms["total"] = (double)j.total.ElapsedMilliseconds;
+                o["ms"] = ms;
+            }
+            else o["error"] = error ?? "";
+            var w = new List<object>();
+            lock (j.warn) foreach (var x in j.warn) w.Add(x);
+            o["warnings"] = w;
+            return o;
         }
 
         static string Status()
@@ -168,17 +273,29 @@ namespace InsideDev.Play
             }
         }
 
-        static void Finish(Job j, string text)
+        static void Finish(Job j, string text, Json.Obj result)
         {
-            lock (gate) { last = text; if (job == j) job = null; }
+            lock (gate)
+            {
+                if (j.dropped) return;
+                last = text; lastObj = result;
+                if (job == j) job = null;
+            }
             DevLog.Write("[play] " + text);
         }
 
         static IEnumerator Run(Job j, DevCore core)
         {
             j.cleaned = Clean(core, true, j);
-            for (int i = 0; i < j.delay; i++) yield return null;
+            for (int i = 0; i < j.delay; i++)
+            {
+                yield return null;
+                if (j.dropped) yield break;
+                j.lastFrame = Time.frameCount;
+            }
             yield return eof;
+            if (j.dropped) yield break;
+            j.lastFrame = Time.frameCount;
             j.phase = "capturing";
             j.frame0 = Time.frameCount;
             var sw = Stopwatch.StartNew();
@@ -192,6 +309,8 @@ namespace InsideDev.Play
                     cap.fb = i <= 1 ? 0f : (i - 1) / (float)i;
                     cap.jitterOn = cap.jitter && j.samples > 1 && i >= 1;
                     yield return eof;
+                    if (j.dropped) yield break;
+                    j.lastFrame = Time.frameCount;
                     if (cap == null) { err = "capture state lost (restore or level load)"; break; }
                 }
                 if (err == null) err = Read(j, f);
@@ -203,12 +322,13 @@ namespace InsideDev.Play
                 cap.fb = 0f;
                 cap.jitterOn = cap.jitter;
                 yield return eof;
+                if (j.dropped) yield break;
             }
             End();
             j.renderMs = sw.Elapsed.TotalMilliseconds;
             j.frames = Time.frameCount - j.frame0;
-            if (j.cleaned) Clean(core, false, j);
-            if (err != null) { j.raw = null; Finish(j, "pano #" + j.id + " failed: " + err); yield break; }
+            if (j.cleaned) { j.cleaned = false; Clean(core, false, j); }
+            if (err != null) { j.raw = null; Finish(j, "pano #" + j.id + " failed: " + err, Result(j, false, err, 0, 0)); yield break; }
             j.phase = "converting";
             var t = new Thread(() => Work(j));
             t.IsBackground = true;
@@ -257,16 +377,43 @@ namespace InsideDev.Play
                 if (c.pc == null) Warn(j, "no D11PDPostCombined on " + cam.name);
                 if (cam != Camera.main) Warn(j, "camera " + cam.name + " is not Camera.main");
                 int w = cam.pixelWidth, h = cam.pixelHeight;
-                j.n = Math.Min(w, h);
-                if (j.n < 64) return "camera view " + w + "x" + h + " too small";
+                j.full = Math.Min(w, h);
+                j.n = j.overscan > 0f ? (int)(j.full / Math.Tan((45.0 + j.overscan * 0.5) * Math.PI / 180.0)) & ~1 : j.full;
+                if (j.n < 64) return "camera view " + w + "x" + h + (j.overscan > 0f ? " too small for overscan " + F(j.overscan) : " too small");
                 c.tex = new Texture2D(j.n, j.n, TextureFormat.RGB24, false);
+                c.lockBefore = CameraControl.captureLock;
+                CameraControl.captureLock = true;
                 cap = c;
                 Capturing = true;
+                if (j.hold) Hold(j, c);
                 if (!hooked) { Camera.onPreRender += PreRender; hooked = true; }
                 Restorer.Register(RestoreKey, "panorama capture (pano)", () => { RestorePose(j); End(); return "pano capture ended"; });
                 return Pose(j, 0);
             }
             catch (Exception e) { return "begin: " + e.GetType().Name + ": " + e.Message; }
+        }
+
+        // The game stands still for the six faces unless something else already holds or runs the clock. While no agent
+        // or ctl command has touched the stepper, only Time.timeScale is held (taking the stepper would switch on its focus
+        // and background handling until the next restore); otherwise the stepper freezes and unfreezes.
+        static void Hold(Job j, Cap c)
+        {
+            try
+            {
+                if (Time.timeScale == 0f || Stepper.Frozen) { j.held = true; return; }
+                if (Stepper.Running) { Warn(j, "not held: a clock run is active, the faces show different moments"); return; }
+                if (!Stepper.Clock.Touched)
+                {
+                    c.scaleBefore = Time.timeScale;
+                    Time.timeScale = 0f;
+                    c.scaleHeld = true; j.held = true;
+                    return;
+                }
+                Stepper.Freeze();
+                if (Stepper.Frozen) { c.froze = true; j.held = true; }
+                else { Stepper.Unfreeze(); Warn(j, "not held: the game cannot be frozen now (loading, or a capture owns the clock)"); }
+            }
+            catch (Exception e) { Warn(j, "hold: " + e.Message); }
         }
 
         static string Pose(Job j, int f)
@@ -276,10 +423,12 @@ namespace InsideDev.Play
                 var c = cap;
                 if (c == null) return "capture state lost";
                 int w = c.cam.pixelWidth, h = c.cam.pixelHeight;
-                if (Math.Min(w, h) != j.n) return "view size changed during the capture";
+                if (Math.Min(w, h) != j.full) return "view size changed during the capture";
+                // the centre j.n pixels are the 90 degree face: with overscan j.n is smaller than the view, so the view is wider
                 float fov = 2f * Mathf.Atan(h / (float)j.n) * Mathf.Rad2Deg;
                 if (!CameraControl.Set(j.eye, Quaternion.Euler(Pitch[f], Yaw[f], 0f), fov, j.near)) return "free camera unavailable";
                 j.usedFov = c.cam.fieldOfView; j.usedNear = c.cam.nearClipPlane;
+                if (Mathf.Abs(j.usedFov - fov) > 0.05f) return "the camera did not take the field of view " + F(fov) + " (it has " + F(j.usedFov) + "); use a smaller overscan";
                 return null;
             }
             catch (Exception e) { return "pose " + Names[f] + ": " + e.GetType().Name + ": " + e.Message; }
@@ -292,6 +441,7 @@ namespace InsideDev.Play
                 var c = cap;
                 if (c == null) return "capture state lost";
                 var tr = c.cam.transform;
+                if (c.scaleHeld && Time.timeScale != 0f) Warn(j, Names[f] + ": the game ran during the capture (something set the time scale to " + F(Time.timeScale) + ")");
                 if ((tr.position - j.eye).sqrMagnitude > 1e-4f || Quaternion.Angle(tr.rotation, Quaternion.Euler(Pitch[f], Yaw[f], 0f)) > 0.05f)
                     Warn(j, Names[f] + ": camera moved off the face pose before the read (" + V(tr.position) + ")");
                 var pr = c.cam.pixelRect;
@@ -350,6 +500,9 @@ namespace InsideDev.Play
             if (hooked) { Camera.onPreRender -= PreRender; hooked = false; }
             try { Restorer.Forget(RestoreKey); } catch { }
             if (c == null) return;
+            CameraControl.captureLock = c.lockBefore;
+            if (c.froze) { c.froze = false; try { Stepper.Unfreeze(); } catch { } }
+            if (c.scaleHeld) { c.scaleHeld = false; try { if (Time.timeScale == 0f && !Stepper.Host.Paused && !Stepper.Host.Loading) Time.timeScale = c.scaleBefore; } catch { } }
             try { if (c.pc != null) { c.pc.barrelValue = c.barrel; c.pc.colorDistortionPx720p = c.chroma; c.pc.vignetteTex = c.vig; } } catch { }
             try { if (c.taa != null) { c.taa.feedbackMin = c.fbMin; c.taa.feedbackMax = c.fbMax; c.taa.motionBlurStrength = c.blur; c.taa.frustumJitter = c.jitter; } } catch { }
             if (c.tex != null) UnityEngine.Object.Destroy(c.tex);
@@ -413,13 +566,17 @@ namespace InsideDev.Play
             return null;
         }
 
+        const long BandBytes = 32L << 20;
+
         static void Work(Job j)
         {
+            string tmp = j.file + ".tmp";
             try
             {
                 var sw = Stopwatch.StartNew();
                 int n = j.n, target = Math.Max(64, j.size / 4), k = Math.Max(1, n / target), m = n / k, o = (n - m * k) / 2;
                 j.m = m;
+                float sc = n / (float)(m * k);
                 var faces = new byte[6][];
                 byte[][] full = j.facesDir.Length > 0 ? new byte[6][] : null;
                 Par(6, f =>
@@ -428,28 +585,98 @@ namespace InsideDev.Play
                     if (full != null) full[f] = k == 1 ? faces[f] : Box(j.raw[f], n, 1, n, 0);
                     j.raw[f] = null;
                 });
-                int W = j.size, H = j.size / 2;
-                var img = new byte[W * H * 3];
+                j.raw = null;
+                int W = j.size, H = j.size / 2, stride = W * 3;
                 int parts = Math.Max(1, Math.Min(16, Environment.ProcessorCount));
-                Par(parts, p => Equirect(faces, m, img, W, H, H * p / parts, H * (p + 1) / parts));
-                j.convertMs = sw.Elapsed.TotalMilliseconds;
-                j.phase = "writing";
-                sw = Stopwatch.StartNew();
                 var dir = Path.GetDirectoryName(j.file);
                 if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-                if (full != null) Directory.CreateDirectory(j.facesDir);
-                Par(full != null ? 7 : 1, i =>
+                var write = new Stopwatch();
+                j.phase = "writing";
+                if (j.compress)
                 {
-                    if (i == 0) Write(j.file, j.compress ? WithXmp(Png.EncodeRgb(img, W, H), W, H) : StoredPng(img, W, H, Xmp(W, H)));
-                    else Write(Path.Combine(j.facesDir, Names[i - 1] + ".png"), j.compress ? Png.EncodeRgb(full[i - 1], n, n) : StoredPng(full[i - 1], n, n, null));
-                });
-                j.encodeMs = sw.Elapsed.TotalMilliseconds;
+                    var img = new byte[(long)stride * H];
+                    Par(parts, p => Equirect(faces, m, sc, img, W, 0, H, H * p / parts, H * (p + 1) / parts));
+                    sw.Stop();
+                    write.Start();
+                    var png = Png.EncodeRgb(img, W, H);
+                    img = null;
+                    var xmp = Xmp(W, H);
+                    const int at = 8 + 25;
+                    using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16))
+                    {
+                        fs.Write(png, 0, at);
+                        StoredPng.Chunk(fs, "iTXt", xmp, 0, xmp.Length);
+                        fs.Write(png, at, png.Length - at);
+                    }
+                }
+                else
+                {
+                    int bandRows = (int)Math.Max(1, Math.Min(H, BandBytes / stride));
+                    var band = new byte[(long)bandRows * stride];
+                    using (var png = new StoredPng(tmp, W, H, Xmp(W, H)))
+                    {
+                        for (int y0 = 0; y0 < H; y0 += bandRows)
+                        {
+                            int rows = Math.Min(bandRows, H - y0), top = y0;
+                            sw.Start();
+                            Par(Math.Min(parts, rows), p => Equirect(faces, m, sc, band, W, top, H, top + rows * p / Math.Min(parts, rows), top + rows * (p + 1) / Math.Min(parts, rows)));
+                            sw.Stop();
+                            write.Start();
+                            png.Rows(band, 0, rows);
+                            write.Stop();
+                        }
+                        write.Start();
+                        png.End();
+                    }
+                }
+                SafeFile.Replace(tmp, j.file);
+                if (full != null)
+                {
+                    Directory.CreateDirectory(j.facesDir);
+                    Par(6, i =>
+                    {
+                        string fp = Path.Combine(j.facesDir, Names[i] + ".png"), ft = fp + ".tmp";
+                        if (j.compress) File.WriteAllBytes(ft, Png.EncodeRgb(full[i], n, n));
+                        else using (var png = new StoredPng(ft, n, n, null)) { png.Rows(full[i], 0, n); png.End(); }
+                        SafeFile.Replace(ft, fp);
+                    });
+                }
+                write.Stop();
+                j.convertMs = sw.Elapsed.TotalMilliseconds;
+                j.encodeMs = write.Elapsed.TotalMilliseconds;
                 j.total.Stop();
-                Write(Path.ChangeExtension(j.file, ".json"), Encoding.UTF8.GetBytes(Sidecar(j, W, H)));
+                j.sidecar = SidecarPath(j);
+                SafeFile.WriteAllText(j.sidecar, Sidecar(j, W, H));
+                string warn;
+                lock (j.warn) warn = j.warn.Count > 0 ? "; warnings: " + string.Join("; ", j.warn.ToArray()) : "";
                 Finish(j, "pano #" + j.id + " done " + j.file + " " + W + "x" + H + " from 6 x " + n + " px faces in " + j.frames + " frame(s): capture " + Ms(j.renderMs) + " ms, convert " + Ms(j.convertMs) +
-                          " ms, write " + Ms(j.encodeMs) + " ms, total " + j.total.ElapsedMilliseconds + " ms" + (j.warn.Count > 0 ? "; warnings: " + string.Join("; ", j.warn.ToArray()) : ""));
+                          " ms, write " + Ms(j.encodeMs) + " ms, total " + j.total.ElapsedMilliseconds + " ms" + warn, Result(j, true, null, W, H));
             }
-            catch (Exception e) { j.raw = null; Finish(j, "pano #" + j.id + " failed: " + e.GetType().Name + ": " + e.Message); }
+            catch (Exception e)
+            {
+                j.raw = null;
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+                string err = e.GetType().Name + ": " + e.Message;
+                Finish(j, "pano #" + j.id + " failed: " + err, Result(j, false, err, 0, 0));
+            }
+        }
+
+        // <name>.json next to the picture; when a file of that name is there and is not a panorama sidecar (a scenario,
+        // a spec, a package.json) it is left alone and the sidecar becomes <name>.pano.json
+        static string SidecarPath(Job j)
+        {
+            string plain = Path.ChangeExtension(j.file, ".json");
+            try
+            {
+                if (File.Exists(plain) && File.ReadAllText(plain).IndexOf("\"projection\": \"equirectangular\"", StringComparison.Ordinal) < 0)
+                {
+                    string other = Path.ChangeExtension(j.file, ".pano.json");
+                    Warn(j, Path.GetFileName(plain) + " exists and is not a panorama sidecar: the sidecar is " + Path.GetFileName(other));
+                    return other;
+                }
+            }
+            catch { }
+            return plain;
         }
 
         static void Par(int count, Action<int> body)
@@ -488,7 +715,9 @@ namespace InsideDev.Play
             return d;
         }
 
-        static void Equirect(byte[][] faces, int m, byte[] img, int W, int H, int y0, int y1)
+        // rows y0..y1 of the W x H picture into img, whose first row is picture row top. sc = full face / the part Box used
+        // (over 1 when the face size is not a multiple of the box factor), so 90 degrees map onto the whole face.
+        static void Equirect(byte[][] faces, int m, float sc, byte[] img, int W, int top, int H, int y0, int y1)
         {
             var sinLon = new float[W];
             var cosLon = new float[W];
@@ -502,7 +731,7 @@ namespace InsideDev.Play
             {
                 double lat = Math.PI / 2.0 - (y + 0.5) / H * Math.PI;
                 float cl = (float)Math.Cos(lat), sl = (float)Math.Sin(lat);
-                int row = y * W * 3;
+                int row = (y - top) * W * 3;
                 for (int x = 0; x < W; x++)
                 {
                     float dx = cl * sinLon[x], dy = sl, dz = cl * cosLon[x];
@@ -521,7 +750,7 @@ namespace InsideDev.Play
                     }
                     else if (dy > 0f) { f = 4; u = dx / ay; v = dz / ay; }
                     else { f = 5; u = dx / ay; v = -dz / ay; }
-                    Sample(faces[f], m, (u + 1f) * hm - 0.5f, (v + 1f) * hm - 0.5f, img, row + x * 3);
+                    Sample(faces[f], m, (u * sc + 1f) * hm - 0.5f, (v * sc + 1f) * hm - 0.5f, img, row + x * 3);
                 }
             }
         }
@@ -543,70 +772,6 @@ namespace InsideDev.Play
             }
         }
 
-        static void Write(string path, byte[] data)
-        {
-            string tmp = path + ".tmp";
-            File.WriteAllBytes(tmp, data);
-            if (File.Exists(path)) File.Delete(path);
-            File.Move(tmp, path);
-        }
-
-        static byte[] StoredPng(byte[] px, int w, int h, byte[] itxt)
-        {
-            int stride = w * 3, rawLen = (stride + 1) * h;
-            const int Block = 65535;
-            int blocks = Math.Max(1, (rawLen + Block - 1) / Block);
-            int zlen = 2 + blocks * 5 + rawLen + 4;
-            var z = new byte[zlen];
-            z[0] = 0x78; z[1] = 0x01;
-            int zp = 2, row = 0, col = -1;
-            uint s1 = 1, s2 = 0;
-            for (int b = 0; b < blocks; b++)
-            {
-                int len = Math.Min(Block, rawLen - b * Block);
-                z[zp] = (byte)(b == blocks - 1 ? 1 : 0);
-                z[zp + 1] = (byte)len; z[zp + 2] = (byte)(len >> 8);
-                z[zp + 3] = (byte)~len; z[zp + 4] = (byte)(~len >> 8);
-                zp += 5;
-                for (int i = 0; i < len; i++)
-                {
-                    byte v;
-                    if (col < 0) { v = 0; col = 0; }
-                    else
-                    {
-                        v = px[row * stride + col];
-                        if (++col == stride) { col = -1; row++; }
-                    }
-                    z[zp++] = v;
-                    s1 += v; if (s1 >= 65521) s1 -= 65521;
-                    s2 += s1; if (s2 >= 65521) s2 -= 65521;
-                }
-            }
-            uint ad = s2 << 16 | s1;
-            z[zp] = (byte)(ad >> 24); z[zp + 1] = (byte)(ad >> 16); z[zp + 2] = (byte)(ad >> 8); z[zp + 3] = (byte)ad;
-            var s = new MemoryStream(zlen + 1024);
-            s.Write(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 }, 0, 8);
-            var hdr = new MemoryStream();
-            PutBE(hdr, (uint)w); PutBE(hdr, (uint)h); hdr.WriteByte(8); hdr.WriteByte(2); hdr.WriteByte(0); hdr.WriteByte(0); hdr.WriteByte(0);
-            Chunk(s, "IHDR", hdr.ToArray(), 0, 13);
-            if (itxt != null) Chunk(s, "iTXt", itxt, 0, itxt.Length);
-            const int Part = 1 << 20;
-            for (int p = 0; p < zlen; p += Part) Chunk(s, "IDAT", z, p, Math.Min(Part, zlen - p));
-            Chunk(s, "IEND", new byte[0], 0, 0);
-            return s.ToArray();
-        }
-
-        static void Chunk(Stream s, string type, byte[] data, int off, int len)
-        {
-            var t = Encoding.ASCII.GetBytes(type);
-            PutBE(s, (uint)len);
-            s.Write(t, 0, 4);
-            s.Write(data, off, len);
-            uint c = Crc(t, 0, 4, 0xFFFFFFFFu);
-            c = Crc(data, off, len, c);
-            PutBE(s, c ^ 0xFFFFFFFFu);
-        }
-
         static byte[] Xmp(int w, int h)
         {
             string xmp = "<?xpacket begin=\"" + (char)0xFEFF + "\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?><x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">" +
@@ -622,42 +787,6 @@ namespace InsideDev.Play
             return body.ToArray();
         }
 
-        static byte[] WithXmp(byte[] png, int w, int h)
-        {
-            var data = Xmp(w, h);
-            const int at = 8 + 25;
-            var outp = new MemoryStream(png.Length + data.Length + 12);
-            outp.Write(png, 0, at);
-            Chunk(outp, "iTXt", data, 0, data.Length);
-            outp.Write(png, at, png.Length - at);
-            return outp.ToArray();
-        }
-
-        static void PutBE(Stream s, uint v)
-        {
-            s.WriteByte((byte)(v >> 24)); s.WriteByte((byte)(v >> 16)); s.WriteByte((byte)(v >> 8)); s.WriteByte((byte)v);
-        }
-
-        static uint[] crcTable;
-
-        static uint Crc(byte[] b, int off, int len, uint r)
-        {
-            if (crcTable == null)
-            {
-                var t = new uint[256];
-                for (uint n = 0; n < 256; n++)
-                {
-                    uint c = n;
-                    for (int k = 0; k < 8; k++) c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-                    t[n] = c;
-                }
-                crcTable = t;
-            }
-            var tb = crcTable;
-            for (int i = off, e = off + len; i < e; i++) r = tb[(r ^ b[i]) & 0xFF] ^ (r >> 8);
-            return r;
-        }
-
         static string Sidecar(Job j, int W, int H)
         {
             var s = new StringBuilder();
@@ -671,11 +800,12 @@ namespace InsideDev.Play
             s.Append(" \"faces\": [");
             for (int f = 0; f < 6; f++) s.Append(f > 0 ? ", " : "").Append("{\"name\": ").Append(Q(Names[f])).Append(", \"yaw\": ").Append(F(Yaw[f])).Append(", \"pitch\": ").Append(F(Pitch[f])).Append("}");
             s.Append("],\n");
-            s.Append(" \"game_time\": ").Append(N(j.gameTime)).Append(",\n");
+            s.Append(" \"game_time\": ").Append(N(j.gameTime)).Append(", \"held\": ").Append(j.held ? "true" : "false").Append(",\n");
             s.Append(" \"srec_t\": ").Append(double.IsNaN(j.srecT) ? "null" : N(j.srecT)).Append(",\n");
             s.Append(" \"frame\": ").Append(j.frame0).Append(", \"frames\": ").Append(j.frames).Append(",\n");
             s.Append(" \"camera\": {\"pos\": ").Append(Arr(j.camPos)).Append(", \"euler\": ").Append(Arr(j.camEuler)).Append(", \"fov\": ").Append(F(j.camFov)).Append(", \"near\": ").Append(F(j.camNear)).Append("},\n");
             s.Append(" \"capture\": {\"method\": \"one game frame per face (free camera)\", \"face_px\": ").Append(j.n).Append(", \"face_used_px\": ").Append(j.m).Append(", \"fov\": ").Append(F(j.usedFov)).Append(", \"near\": ").Append(F(j.usedNear))
+             .Append(", \"overscan_deg\": ").Append(F(j.overscan)).Append(", \"view_px\": ").Append(j.full)
              .Append(", \"vignette\": ").Append(j.vignette ? "true" : "false").Append(", \"vignette_tex\": ").Append(Q(j.vignetteName)).Append(", \"lens\": ").Append(j.lens ? "true" : "false")
              .Append(", \"warm\": ").Append(j.warm).Append(", \"samples\": ").Append(j.samples).Append(", \"png\": ").Append(j.compress ? "\"deflate\"" : "\"stored\"").Append(", \"faces_dir\": ").Append(j.facesDir.Length > 0 ? Q(j.facesDir) : "null").Append("},\n");
             s.Append(" \"ms\": {\"capture\": ").Append(Ms(j.renderMs)).Append(", \"convert\": ").Append(Ms(j.convertMs)).Append(", \"write\": ").Append(Ms(j.encodeMs)).Append(", \"total\": ").Append(j.total.ElapsedMilliseconds).Append("},\n");

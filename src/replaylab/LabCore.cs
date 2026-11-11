@@ -441,7 +441,7 @@ namespace InsideDev.ReplayLab
             c.result["counts"] = stats;
             c.result["timeScale"] = LabUtil.Num(Time.timeScale);
             var lu = (Json.Obj)stats["lateUpdate"];
-            c.Verdict(ok, inst.Length + " RuntimeCallbacks instance(s) (" + string.Join(", ", paths.ToArray()) + "); lateUpdate " + lu["callsPerFrameMean"] + " call(s)/frame; frame guard " + (ok ? "keeps work to once per frame" : "FAILED"));
+            c.Verdict(ok, inst.Length + " RuntimeCallbacks instance(s) (" + string.Join(", ", paths.ToArray()) + "); lateUpdate " + Convert.ToString(lu["callsPerFrameMean"], LabUtil.IC) + " call(s)/frame; frame guard " + (ok ? "keeps work to once per frame" : "FAILED"));
         }
     }
 }

@@ -68,7 +68,8 @@ namespace InsideDev.Det
 
         sealed class RefRow { public int rngFixed, rngUpdate, rngLate; public float[] pos; }
         Dictionary<long, RefRow> reference;
-        public long kStar = -1, kRngFixed = -1, kRngUpdate = -1, kRngLate = -1, kPos = -1, compared;
+        public long kStar = -1, kRngFixed = -1, kRngUpdate = -1, kRngLate = -1, kPos = -1, kPresence = -1, compared, presence;
+        bool widthWarned;
         public double maxBoy, maxBale, maxChick;
         public string refDir = "";
 
@@ -76,9 +77,18 @@ namespace InsideDev.Det
         {
             this.dir = dir;
             Directory.CreateDirectory(dir);
-            steps = new StreamWriter(Path.Combine(dir, "steps.csv"), false, Utf8);
-            events = new StreamWriter(Path.Combine(dir, "events.csv"), false, Utf8);
-            rig = new StreamWriter(Path.Combine(dir, "rig.csv"), false, Utf8);
+            try
+            {
+                steps = new StreamWriter(Path.Combine(dir, "steps.csv"), false, Utf8);
+                events = new StreamWriter(Path.Combine(dir, "events.csv"), false, Utf8);
+                rig = new StreamWriter(Path.Combine(dir, "rig.csv"), false, Utf8);
+            }
+            catch
+            {
+                if (steps != null) steps.Close();
+                if (events != null) events.Close();
+                throw;
+            }
             events.WriteLine("k,kind,name,detail");
             rig.WriteLine("f,frame,k,x,y,z,qx,qy,qz,qw,fov,free");
         }
@@ -390,9 +400,23 @@ namespace InsideDev.Det
             if (p.hasUpdate && r.rngUpdate != int.MinValue && r.rngUpdate != p.rngUpdate) { diff = true; if (kRngUpdate < 0) kRngUpdate = p.k; }
             if (r.rngLate != rngLate) { diff = true; if (kRngLate < 0) kRngLate = p.k; }
             int n = Math.Min(r.pos.Length, p.pos.Length);
+            if (r.pos.Length != p.pos.Length && !widthWarned)
+            {
+                widthWarned = true;
+                warnings.Add("live comparison: this run logs " + (p.pos.Length / 3).ToString(IC) + " positions per step, the source " + (r.pos.Length / 3).ToString(IC) + " (another chicken count); only the common ones are compared");
+            }
             bool posDiff = false;
             for (int i = 0; i + 2 < n; i += 3)
             {
+                // there in one run and gone in the other (the boy inactive, a destroyed chicken, no bale): a divergence
+                bool gone = float.IsNaN(p.pos[i]), goneRef = float.IsNaN(r.pos[i]);
+                if (gone != goneRef)
+                {
+                    posDiff = true;
+                    presence++;
+                    if (kPresence < 0) kPresence = p.k;
+                    continue;
+                }
                 double d = Dist(p.pos, r.pos, i);
                 if (double.IsNaN(d)) continue;
                 if (d > PosEps) posDiff = true;
@@ -415,6 +439,7 @@ namespace InsideDev.Det
         {
             if (reference == null) return "no live comparison";
             return "vs " + Path.GetFileName(refDir) + ": compared " + compared + " rows, k* " + K(kStar) + " (rng_fixed " + K(kRngFixed) + ", rng_update " + K(kRngUpdate) + ", rng_late " + K(kRngLate) + ", pos > 1e-4 m " + K(kPos) +
+                   (kPresence >= 0 ? ", object in one run only " + K(kPresence) + " x" + presence.ToString(IC) : "") +
                    "), max boy " + Mm(maxBoy) + " bale " + Mm(maxBale) + " chick " + Mm(maxChick);
         }
 
@@ -430,6 +455,9 @@ namespace InsideDev.Det
             File.WriteAllText(Path.Combine(dir, "inputs.csv"), sb.ToString(), Utf8);
         }
 
+        // the largest step / frame index a run file may name: 46 hours at 60 steps per second
+        const int MaxRow = 10000000;
+
         public static List<DetInput> ReadInputs(string dir, out string error)
         {
             error = null;
@@ -443,8 +471,11 @@ namespace InsideDev.Det
                 if (s.Length < 5) continue;
                 long k;
                 if (!long.TryParse(s[0], NumberStyles.Integer, IC, out k) || k < 0) continue;
+                if (k > MaxRow) { error = "inputs.csv line " + (i + 1).ToString(IC) + ": step " + k.ToString(IC) + " is out of range (the file is damaged)"; return null; }
+                float x = Flt(s[1]), y = Flt(s[2]);
+                if (float.IsNaN(x) || float.IsNaN(y)) { error = "inputs.csv line " + (i + 1).ToString(IC) + ": the stick value is not a number (the file is damaged)"; return null; }
                 while (list.Count <= k) list.Add(new DetInput());
-                list[(int)k] = new DetInput { x = Flt(s[1]), y = Flt(s[2]), jump = s[3] == "1", action = s[4] == "1" };
+                list[(int)k] = new DetInput { x = x, y = y, jump = s[3] == "1", action = s[4] == "1" };
             }
             return list;
         }
@@ -487,6 +518,7 @@ namespace InsideDev.Det
                 if (s.Length < 11) continue;
                 int f;
                 if (!int.TryParse(s[0], NumberStyles.Integer, IC, out f) || f < 0) continue;
+                if (f > MaxRow) { error = "rig.csv line " + (i + 1).ToString(IC) + ": frame " + f.ToString(IC) + " is out of range (the file is damaged)"; return null; }
                 var r = new DetRigRow { pos = new Vector3(Flt(s[3]), Flt(s[4]), Flt(s[5])), rot = new Quaternion(Flt(s[6]), Flt(s[7]), Flt(s[8]), Flt(s[9])), fov = Flt(s[10]) };
                 while (list.Count < f) list.Add(list.Count > 0 ? list[list.Count - 1] : r);
                 if (list.Count == f) list.Add(r); else list[f] = r;

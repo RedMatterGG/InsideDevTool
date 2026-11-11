@@ -159,10 +159,13 @@ namespace InsideDev.Play
             catch (NotImplementedException) { warnings.Add("pin_unavailable: stream pinning is not built yet"); }
         }
 
+        static readonly List<string> tickNotes = new List<string>();
+
         static void Tick()
         {
             if (++tickCount % 30 != 0) return;
-            var w = new List<string>();
+            var w = tickNotes;
+            w.Clear();
             try
             {
                 lock (gate)

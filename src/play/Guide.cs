@@ -37,6 +37,8 @@ namespace InsideDev.Play
 
         public static void Register()
         {
+            EditorState.Describe("guide", "play.guide_dir", "", "Folder of the guide playbooks (<group>/<topic>/SKILL.md); empty = the guide folder next to InsideDev.Play.dll. The environment variable INSIDEDEV_GUIDE_DIR comes first.");
+            EditorState.Describe("guide", "play.guide_max", GuideLevels.Solution, "The most the guide tool may reveal: hint, steps or solution.");
             PlayRegistry.Add(PlayShared.Def("guide", "Game guide", PlayShared.Play, Owner,
                 "Playbooks for INSIDE: without topic the index (chapters, mechanics, puzzles, known stuck spots); with topic one playbook at a spoiler level: hint (default), steps or solution. observe.checkpoint.guide names the topic for the current place; section picks one heading (a place such as riverWithDog, or Savepoints).",
                 Schema.Obj().Str("topic", "Topic id from the index or observe.checkpoint.guide (e.g. forest/overview). Empty = index.")
@@ -59,13 +61,15 @@ namespace InsideDev.Play
             PlayRegistry.Prompt(PlaytestDef(), GetPlaytest);
             PlayRegistry.Prompt(SolveDef(), GetSolve);
             PlayRegistry.Instructions(McpProfiles.Play, 20, "Call guide() first; observe.checkpoint.guide names the topic for the current place (guide {topic, level: hint | steps | solution}; ask for more only when stuck).");
-            PlayRegistry.OnTick("guide", Tick);
+            PlayRegistry.OnTick("guide", Tick, TickWhen.InUse);
+            PlayRegistry.OnWake(WakeRead);
             try { ScenarioRunner.Register(); }
             catch (Exception e) { PlayRegistry.Problems.Add("ScenarioRunner: " + e.GetType().Name + ": " + e.Message); }
         }
 
         static ToolResult Handle(Json.Obj a, CallContext ctx)
         {
+            Background.Touch();
             var book = Library(true);
             string topic = PlayShared.Str(a, "topic", "").Trim();
             string level = PlayShared.Str(a, "level", GuideLevels.Hint);
@@ -200,7 +204,7 @@ namespace InsideDev.Play
                 "1. notes {op:list}: moments I flagged (the screenshot and position show what I mean).\n" +
                 "2. guide {topic:\"mechanics/controls\"} once, then guide {topic:\"" + (topic ?? "<observe.checkpoint.guide>") + "\", level:\"hint\"}" + (t != null ? ", section \"" + SceneOf(sub) + "\"" : "") + ". Ask for steps or solution only after 3 failed tries.\n" +
                 "3. Load it: checkpoint {op:\"goto\", subscene:" + sub.ToString(IC) + ", savepoint:" + sp.ToString(IC) + "} (needs play.cheats; on the dev profile: level {op:\"load_checkpoint\", mode:\"respawn\"}). If loading is refused, tell me and play from where you are.\n" +
-                "4. Loop: observe -> act / move_to / interact / wait_until -> read outcome, changes and observe. Use ids from the latest observe only. Deaths are fine: wait_until {alive:true}.\n" +
+                "4. Loop: observe -> act / move_to / interact / wait_until -> read outcome, changes and observe. Use ids from the latest observe only. Deaths are fine: wait_until {any:[{alive:true}]}.\n" +
                 "5. In music-timed places (warning music_timed) switch to time {op:\"realtime\"}.\n" +
                 "6. When done or stuck for 10 calls, report what you tried and what happened, then call restore." });
             return pr;
@@ -246,9 +250,22 @@ namespace InsideDev.Play
             return string.IsNullOrEmpty(s) ? def : s.Length > 300 ? s.Substring(0, 300) : s;
         }
 
-        // main thread, every frame: once a second read the EditorState settings and the runtime subscene names
+        static bool asleep;
+
+        // main thread, when Play is used again: read the settings before the waking call (guide) needs them
+        static void WakeRead()
+        {
+            asleep = false;
+            ticks = 0;
+            Tick();
+        }
+
+        // main thread, every frame while Play is in use: once a second read the EditorState settings and the runtime
+        // subscene names (at once when use begins again)
         static void Tick()
         {
+            if (ticks > 0 && !Background.InUse) { asleep = true; return; }
+            if (asleep) { asleep = false; ticks = 0; }
             if (++ticks % 60 != 1) return;
             try
             {

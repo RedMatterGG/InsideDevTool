@@ -134,10 +134,10 @@ namespace InsideDev.Play
             return sb.ToString();
         }
 
-        public static string Line(NoteEntry e) { return JsonLine.Compact(e.ToJson()); }
+        public static string Line(NoteEntry e) { return NoteJson.Compact(e.ToJson()); }
     }
 
-    internal static class JsonLine
+    internal static class NoteJson
     {
         // one line of JSON: the core writer is pretty-printed, and raw newlines occur only as formatting there (string
         // newlines are escaped), so dropping them with the indentation that follows is exact

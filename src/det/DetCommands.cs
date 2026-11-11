@@ -82,10 +82,19 @@ namespace InsideDev.Det
             if (a.Count < 4 || !long.TryParse(a[2], NumberStyles.Integer, IC, out k) || k < 0) return "usage: det cue <k >= 0> <command>";
             if (DetRun.Busy) return "busy: det " + DetRun.state + " (cues are copied at run start)";
             var cmd = string.Join(" ", a.GetRange(3, a.Count - 3).ToArray());
+            string why = CueRefusal(cmd);
+            if (why != null) return "refused: " + why;
             int at = track.Count;
             while (at > 0 && track[at - 1].k > k) at--;
             track.Insert(at, new DetCue { k = k, cmd = cmd });
             return "cue k " + k + ": " + cmd + "\n" + CueText(track);
+        }
+
+        // a cue runs later, outside the call that stored it: RemotePolicy's list (quit included) is checked when it is
+        // added and again when it fires (cues also come from a run file)
+        public static string CueRefusal(string cmd)
+        {
+            return RemotePolicy.Refusal(cmd, false, EditorState.Get("play.save_guard", false));
         }
 
         public static string CueText(List<DetCue> list)
@@ -142,14 +151,14 @@ namespace InsideDev.Det
         public static string Start(bool replay, List<string> a)
         {
             if (Busy) return "busy: det " + state + " " + name + " (det abort stops it)";
-            string usage = replay ? "usage: det replay <source> <out> [cam=...] [kmax=n] [fps=n]" : "usage: det run <name> <out> [kmax] [kmax=n] [fps=n] [cam=...]";
+            string usage = replay ? "usage: det replay <source> <out> [cam=...] [kmax=n] [fps=n] [overwrite=on]" : "usage: det run <name> <out> [kmax] [kmax=n] [fps=n] [cam=...] [overwrite=on]";
             if (a.Count < 4) return usage;
             try { if (MultiCam.Running) return "busy: mcam is running"; } catch { }
             if (!G.SavepointsReady) return "savepoints not ready: start or continue a game first";
             string outFull;
             try { outFull = FullPath(a[3]); } catch (Exception e) { return "bad <out>: " + e.Message; }
             int km = DefaultKmax, f = 60;
-            bool kmaxSet = false;
+            bool kmaxSet = false, overwriteOk = false;
             string cam = null;
             for (int i = 4; i < a.Count; i++)
             {
@@ -169,6 +178,8 @@ namespace InsideDev.Det
                         i += 5;
                     }
                 }
+                else if (tl == "overwrite=on" || tl == "overwrite") overwriteOk = true;
+                else if (tl == "overwrite=off") overwriteOk = false;
                 else if (!replay && int.TryParse(t, NumberStyles.Integer, IC, out v) && v > 0) { km = v; kmaxSet = true; }
                 else return "unknown argument '" + t + "'\n" + usage;
             }
@@ -212,8 +223,9 @@ namespace InsideDev.Det
                 }
                 else return "bad cam= (cam=x,y,z,yaw,pitch,fov | cam=x y z yaw pitch fov | cam=<run>)";
             }
-            try { Directory.CreateDirectory(outFull); } catch (Exception e) { return "cannot create " + outFull + ": " + e.Message; }
             bool overwrite = File.Exists(Path.Combine(outFull, "steps.csv"));
+            if (overwrite && !overwriteOk) return "refused: " + outFull + " already holds a run (steps.csv); give another <out> or add overwrite=on";
+            try { Directory.CreateDirectory(outFull); } catch (Exception e) { return "cannot create " + outFull + ": " + e.Message; }
             mode = replay ? "replay" : "record";
             name = replay ? Path.GetFileName(outFull) : a[2];
             outDir = outFull; sourceDir = src ?? ""; kmax = km; fps = f; stopAtLand = !replay;
@@ -222,6 +234,7 @@ namespace InsideDev.Det
             sawPrepare = false; stopReason = null; abortReason = null; camSet = false;
             created = DateTime.Now.ToString("yyyy-MM-dd'T'HH:mm:ss", IC);
             prepAtRun = DetPrep.Text(); prepCounts = "";
+            log = null;
             try
             {
                 log = new DetLog(outFull);
@@ -422,13 +435,17 @@ namespace InsideDev.Det
                 lastK = k;
                 var fi = FilmInput.current;
                 bool has = fi != null && fi.lastK == k;
+                if (!has && abortReason == null && FilmInput.CurrentCore() != fi)
+                    abortReason = "the input core was replaced during the run (k " + k.ToString(IC) + "): another tool took the input, so the steps would no longer be fed or recorded";
                 log.Step(k, step, has, has ? fi.last : default(DetInput));
                 foreach (var c in cues)
                 {
                     if (c.k != k || c.lastFiredStep == step) continue;
                     c.lastFiredStep = step;
                     string r;
-                    try { r = Remote.RunCommand(c.cmd, core ?? DevCore.Instance); } catch (Exception e) { r = "ERROR " + e.GetType().Name + ": " + e.Message; }
+                    string why = DetCommands.CueRefusal(c.cmd);
+                    if (why != null) r = "refused: " + why;
+                    else try { r = Remote.RunCommand(c.cmd, core ?? DevCore.Instance); } catch (Exception e) { r = "ERROR " + e.GetType().Name + ": " + e.Message; }
                     cuesFired++;
                     log.Event(k, "cue", c.cmd, Short(r));
                 }
@@ -517,6 +534,8 @@ namespace InsideDev.Det
             {
                 if (log == null) return;
                 log.Event(lastK, ok ? "end" : "abort", reason ?? "", "");
+                // a second fixed step in the stop frame appends one input after the last logged step
+                if (fed != null && lastK >= 0 && fed.Count > lastK + 1) fed.RemoveRange((int)lastK + 1, fed.Count - (int)lastK - 1);
                 if (fed != null) DetLog.WriteInputs(outDir, fed);
                 if (missing > 0) log.warnings.Add(missing + " replay step(s) beyond the source inputs (neutral input fed)");
                 log.Close();
@@ -668,7 +687,7 @@ namespace InsideDev.Det
         {
             if (!G.SavepointsReady) return "savepoints not ready";
             if (!DetRun.Busy) ComputeZone(DetRun.LoadSub);
-            var sb = new StringBuilder("zone of load " + DetRun.LoadSub + " " + DetRun.LoadSp + ": " + (zoneOk ? "bounds " + zoneBounds.center.ToString("F1") + " size " + zoneBounds.size.ToString("F1") : "no area bounds") + ", " + zone.Count + " subscene culler(s)");
+            var sb = new StringBuilder("zone of load " + DetRun.LoadSub + " " + DetRun.LoadSp + ": " + (zoneOk ? "bounds " + Fmt.V3(zoneBounds.center, "F1") + " size " + Fmt.V3(zoneBounds.size, "F1") : "no area bounds") + ", " + zone.Count + " subscene culler(s)");
             int groups = 0, anims = 0, dripCount = 0;
             foreach (var c in zone)
             {

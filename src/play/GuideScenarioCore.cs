@@ -39,10 +39,6 @@ namespace InsideDev.Play
         public static readonly string[] Cmps = { "eq", "ne", "lt", "le", "gt", "ge", "exists", "missing", "contains" };
         public static readonly string[] LoadModes = { "respawn", "quiet", "chapter", "reload_respawn", "reload_chapter", "newgame" };
         public static readonly string[] ShotModes = { "preview", "full", "marked" };
-        // console commands that drive the OS, kill the server or quit (always refused), and game loads that skip the save
-        // backup and confirm (refused only with play.save_guard on, same rule as the dev command tool)
-        public static readonly string[] RefusedCommands = { "keyhold", "focustest", "remote off", "mcp off", "mcp port", "quit", "exit" };
-        public static readonly string[] LoadCommands = { "load", "spawn", "reload", "respawn", "cspawn go", "cspawn respawn" };
         static readonly string[] Keys = { "do", "label", "stick", "jump", "action", "steps", "seconds", "stop_on_death", "until", "within_s", "path", "cmp", "value",
             "tol", "mode", "subscene", "savepoint", "confirm", "shot", "cmd", "text" };
 
@@ -203,16 +199,12 @@ namespace InsideDev.Play
             return true;
         }
 
+        // RemotePolicy.Refusal (the core's one list, quit refused here): judged on the words the console will see, so quoting
+        // cannot hide a command
         public static bool CommandRefused(string cmd, bool saveGuard, out string why)
         {
-            why = null;
-            string c = " " + string.Join(" ", (cmd ?? "").Trim().ToLowerInvariant().Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries)) + " ";
-            foreach (var r in RefusedCommands)
-                if (c.StartsWith(" " + r + " ")) { why = "'" + r + "' is not allowed through MCP (OS input, server stop or quit); use act / restore instead"; return true; }
-            if (saveGuard)
-                foreach (var r in LoadCommands)
-                    if (c.StartsWith(" " + r + " ")) { why = "'" + r + "' loads without the save backup and confirm (chapter loads write INSIDE.sav and unlock chapters); use a load step {do:\"load\", mode, subscene, savepoint, confirm}"; return true; }
-            return false;
+            why = RemotePolicy.Refusal(cmd, false, saveGuard);
+            return why != null;
         }
 
         // dotted path into an observation: body.state, objects.0.kind, objects[0].kind, warnings.length
@@ -295,7 +287,7 @@ namespace InsideDev.Play
             if (v is bool) return (bool)v ? "true" : "false";
             var s = v as string;
             if (s != null) return s.Length > 80 ? s.Substring(0, 80) + "..." : s;
-            string j = JsonLine.Compact(v);
+            string j = NoteJson.Compact(v);
             return j.Length > 120 ? j.Substring(0, 120) + "..." : j;
         }
 

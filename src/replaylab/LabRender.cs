@@ -394,9 +394,16 @@ namespace InsideDev.ReplayLab
             return look;
         }
 
-        static void ShowParticles(List<ParticleSystem> l, bool on)
+        // off: every particle renderer off. on: back to what each one was when the test began (was), not simply on.
+        static void ShowParticles(List<ParticleSystem> l, Dictionary<Renderer, bool> was, bool on)
         {
-            foreach (var ps in l) { var r = ps != null ? ps.GetComponent<Renderer>() : null; if (r != null && r.enabled != on) r.enabled = on; }
+            foreach (var ps in l)
+            {
+                var r = ps != null ? ps.GetComponent<Renderer>() : null;
+                if (r == null) continue;
+                bool e = on && (!was.ContainsKey(r) || was[r]);
+                if (r.enabled != e) r.enabled = e;
+            }
         }
 
         static bool[] Dilate(bool[] m, int w, int h, int r)
@@ -448,6 +455,14 @@ namespace InsideDev.ReplayLab
             int size = Marshal.SizeOf(typeof(ParticleSystem.Particle));
             c.result["particleSize"] = size;
             var systems = FindSystems(c);
+            var shown = new Dictionary<Renderer, bool>();
+            foreach (var ps in systems)
+            {
+                var partRend = ps != null ? ps.GetComponent<Renderer>() : null;
+                if (partRend == null || shown.ContainsKey(partRend)) continue;
+                shown[partRend] = partRend.enabled;
+                c.SaveRenderer(partRend);
+            }
             if (systems.Count == 0) c.Prep("no particle system with live particles: freeze during suction (" + ChickenPrep + ", ToggleSuctionOn)");
             float off = c.F("off", 60f);
             int repeat = Math.Max(1, c.I("repeat", 10));
@@ -491,10 +506,10 @@ namespace InsideDev.ReplayLab
                 {
                     yield return c.Render(3);
                     bO2 = c.Grab(roiO, null, null);
-                    ShowParticles(systems, false);
+                    ShowParticles(systems, shown, false);
                     yield return c.Render(3);
                     hO = c.Grab(roiO, "hidden_offaxis.jpg", "off-axis camera, particle renderers off");
-                    ShowParticles(systems, true);
+                    ShowParticles(systems, shown, true);
                     yield return c.Render(3);
                 }
             }
@@ -508,10 +523,10 @@ namespace InsideDev.ReplayLab
                 if (bG == null) c.Prep("the systems are not on screen from the game camera (cam=)");
                 yield return c.Render(3);
                 bG2 = c.Grab(roiG, null, null);
-                ShowParticles(systems, false);
+                ShowParticles(systems, shown, false);
                 yield return c.Render(3);
                 hG = c.Grab(roiG, "hidden_game.jpg", "game camera, particle renderers off");
-                ShowParticles(systems, true);
+                ShowParticles(systems, shown, true);
                 yield return c.Render(3);
             }
             if (doO && !doG && bO == null) c.Prep("the off-axis camera does not see the systems");

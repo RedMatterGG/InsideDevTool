@@ -144,6 +144,13 @@ namespace InsideDev.ReplayLab
             string name = t.name != null ? t.name(probe) : t.id;
             if (name == null) return "usage: " + t.usage;
             string dir = Path.Combine(outRoot, name).Replace('\\', '/');
+            // the folder is archived (its files moved) before the test writes: it must be a folder of its own below outRoot
+            try
+            {
+                string root = Path.GetFullPath(outRoot).TrimEnd('\\', '/'), full = Path.GetFullPath(dir).TrimEnd('\\', '/');
+                if (!full.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return "refused: the output folder " + dir + " is not below " + outRoot;
+            }
+            catch (Exception e) { return "refused: bad output folder " + dir + ": " + e.Message; }
             var c = new LabContext(t.id, name, dir, a);
             if (c.cam == null) return "no gameplay camera (load a level first)";
             try { Archive(dir); Directory.CreateDirectory(dir); }
@@ -182,7 +189,7 @@ namespace InsideDev.ReplayLab
                 while (stack.Count > 0)
                 {
                     if (c.abort) { if (c.verdict == null) c.Info("aborted: " + c.abortReason); break; }
-                    if (Time.realtimeSinceStartup - c.startReal > c.timeout) { c.Fail("timeout after " + c.timeout + " s in phase " + c.phase); break; }
+                    if (Time.realtimeSinceStartup - c.startReal > c.timeout) { c.Fail("timeout after " + c.timeout.ToString("0.#", LabUtil.IC) + " s in phase " + c.phase); break; }
                     var top = stack.Peek();
                     bool more = false;
                     object cur = null;

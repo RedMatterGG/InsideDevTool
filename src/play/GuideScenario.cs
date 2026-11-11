@@ -166,7 +166,7 @@ namespace InsideDev.Play
             }
             if (wantObs)
             {
-                try { r["observe"] = ctx.Main(() => Observer.Concise(Tool)); }
+                try { r["observe"] = ctx.Main(() => Observer.Concise(Tool, ctx.Info.sessionId)); }
                 catch (NotImplementedException) { warnings.Add("observe_unavailable"); }
                 catch (McpException e) { warnings.Add("observe_failed: " + e.code + " " + e.Message); }
             }
@@ -224,7 +224,7 @@ namespace InsideDev.Play
                 }
                 case "observe":
                 {
-                    var obs = ctx.Main(() => Observer.Concise(Tool));
+                    var obs = ctx.Main(() => Observer.Concise(Tool, ctx.Info.sessionId));
                     row["value"] = Summary(obs);
                     row["detail"] = "observed";
                     return true;
@@ -244,6 +244,24 @@ namespace InsideDev.Play
                     if (ScenarioPlan.CommandRefused(s.cmd, Saves.Guard, out why)) { row["detail"] = "refused: " + why; return false; }
                     string line = s.cmd;
                     string output = ctx.Main(() => Remote.RunCommand(line, DevCore.Instance), 10000) ?? "";
+                    // "pano ... wait", "grec stop wait", "rec stop wait" answer with a last line "wait: <poll command>": the
+                    // step is done when that command no longer says pending
+                    int waitAt = output.LastIndexOf("\nwait: ", StringComparison.Ordinal);
+                    if (waitAt >= 0)
+                    {
+                        string poll = output.Substring(waitAt + 7).Trim();
+                        if (poll == "pano wait" || poll == "grec wait" || poll == "rec wait")
+                        {
+                            output = output.Substring(0, waitAt);
+                            while (ctx.RemainingMs > 3000 && ctx.Sleep(100))
+                            {
+                                string now = ctx.Main(() => Remote.RunCommand(poll, DevCore.Instance), 10000) ?? "";
+                                if (now.StartsWith("pending:", StringComparison.Ordinal)) continue;
+                                output = now;
+                                break;
+                            }
+                        }
+                    }
                     row["value"] = output.Length > 600 ? output.Substring(0, 600) + "..." : output;
                     string fail = CommandFailure(output);
                     row["detail"] = fail == null ? "ok" : "failed: " + fail;
@@ -346,13 +364,22 @@ namespace InsideDev.Play
             return o;
         }
 
-        static readonly string[] FailMarks = { "not found", "usage", "unknown", "busy", "no fsm", "component not found", "field not found", "property not found",
-            "no parameterless method", "no active character", "error in", "failed", "not built" };
+        // what a failed console command starts its reply with, and what may stand anywhere in its first line
+        static readonly string[] FailStarts = { "not found", "usage", "unknown ", "unknown:", "busy", "no fsm", "refused", "failed", "error:", "error in ", "error -", "cannot ", "can't ", "could not ",
+            "couldn't ", "no active ", "not built", "pending:" };
+        static readonly string[] FailMarks = { "component not found", "field not found", "property not found", "field/property not found", "no parameterless method", "no active character",
+            "error in ", " failed:", ": failed", ": busy", ": refused", "unknown option", "not built" };
 
+        // Judged on the first line of the reply only (the rest may be a dump that holds any word, a path or an object
+        // name), the way the MCP command tool reads replies; null = the command did its job.
         static string CommandFailure(string output)
         {
-            string o = (output ?? "").ToLowerInvariant();
-            foreach (var m in FailMarks) if (o.Contains(m)) return m;
+            string first = "";
+            foreach (var raw in (output ?? "").Split('\n')) { string l = raw.Trim(); if (l.Length > 0) { first = l; break; } }
+            string o = first.ToLowerInvariant();
+            foreach (var m in FailStarts) if (o.StartsWith(m, StringComparison.Ordinal)) return m.Trim();
+            foreach (var m in FailMarks) if (o.Contains(m)) return m.Trim();
+            if (o.EndsWith(" failed", StringComparison.Ordinal)) return "failed";
             return null;
         }
 
