@@ -291,7 +291,7 @@ namespace InsideDev.Play
         public static InteractMacro Build(MacroEnv e)
         {
             var m = new InteractMacro { verb = e.verb };
-            if (e.dead) return NA(m, "the body is dead: wait_until {alive:true}");
+            if (e.dead) return NA(m, "the body is dead: wait_until {any:[{alive:true}]}");
             bool inSub = e.special == "InsideSub";
             if (inSub && Array.IndexOf(SubVerbs, e.verb) < 0) return NA(m, "the boy is driving the submarine: only sub_boost and sub_exit work (steer with act)");
             if (!inSub && Array.IndexOf(SubVerbs, e.verb) >= 0) return NA(m, "not in the submarine (state " + e.state + ")");

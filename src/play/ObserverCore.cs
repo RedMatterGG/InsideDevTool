@@ -8,24 +8,36 @@ namespace InsideDev.Play
     // ObserverCore.cs (owner OBSERVE): the Unity-free parts of the observation, compiled directly by the offline tests
     // (qa/mcp/OBSERVE): the id registry (one counter that never restarts, epochs, liveness through a delegate), the
     // no-progress counter, state-name shortening, compact JSON size, the concise budget trimmer and the hazard order.
-    internal enum IdLookup { Ok, Stale, Destroyed, NotFound, Malformed }
+    internal enum IdLookup { Ok, Stale, Destroyed, NotFound, Malformed, Gone }
 
+    // Ids of the objects an agent was shown. A load (BumpEpoch) retires every id instead of forgetting it: the entry
+    // keeps the object's hierarchy path, and the id comes back for the object that sits at that path after the load.
+    // Two ways back: Assign gives a new object the retired id of its path (confirm = the caller checked that the path
+    // names exactly this object), and Lookup of a retired id asks the caller's resolver for the one object at the path
+    // (Rebind). An id whose object does not exist any more answers Gone; ids older than the kept epochs answer Stale.
     internal sealed class IdTable
     {
-        sealed class Entry { public string id; public long key; public object obj; }
+        sealed class Entry { public string id, path; public long key; public object obj; public int epoch; }
 
         readonly object gate = new object();
         readonly Dictionary<long, Entry> byKey = new Dictionary<long, Entry>();
         readonly Dictionary<string, Entry> byId = new Dictionary<string, Entry>();
+        readonly Dictionary<string, Entry> retired = new Dictionary<string, Entry>();
+        // "<prefix>:<sub>|<path>" -> the retired entry, null when several retired entries share the path
+        readonly Dictionary<string, Entry> retiredByPath = new Dictionary<string, Entry>();
         readonly Func<object, bool> alive;
-        long counter;
+        long counter, revived;
         volatile int epoch;
+
+        public const int KeptEpochs = 3, MaxRetired = 4000;
 
         public IdTable(Func<object, bool> alive) { this.alive = alive ?? (o => o != null); }
 
         public int Epoch { get { return epoch; } }
         public long Issued { get { lock (gate) return counter; } }
         public int Count { get { lock (gate) return byId.Count; } }
+        public int RetiredCount { get { lock (gate) return retired.Count; } }
+        public long Revived { get { lock (gate) return revived; } }
 
         public const int PrefixObject = 0, PrefixHazard = 1, PrefixBody = 2;
 
@@ -41,7 +53,17 @@ namespace InsideDev.Play
             return ((long)instanceId << 8) | (long)(((prefixCode & 0xF) << 4) | (sub & 0xF));
         }
 
-        public string Assign(long key, object obj, string prefix)
+        static string PathKey(long key, string path)
+        {
+            return ((key >> 4) & 0xF).ToString(CultureInfo.InvariantCulture) + ":" + (key & 0xF).ToString(CultureInfo.InvariantCulture) + "|" + path;
+        }
+
+        public string Assign(long key, object obj, string prefix) { return Assign(key, obj, prefix, null, null); }
+
+        // pathOf: the hierarchy path of obj, asked once when the entry is created (null = no path, the id cannot come
+        // back after a load). confirm(path): true when exactly obj sits at that path now; asked only when a retired id
+        // waits for the path.
+        public string Assign(long key, object obj, string prefix, Func<string> pathOf, Func<string, bool> confirm)
         {
             lock (gate)
             {
@@ -49,10 +71,28 @@ namespace InsideDev.Play
                 if (byKey.TryGetValue(key, out e))
                 {
                     if (ReferenceEquals(e.obj, obj) && alive(e.obj)) return e.id;
-                    byId.Remove(e.id);
+                    if (ReferenceEquals(byId.ContainsKey(e.id) ? byId[e.id] : null, e)) byId.Remove(e.id);
                 }
-                counter++;
-                e = new Entry { id = prefix + counter.ToString(CultureInfo.InvariantCulture), key = key, obj = obj };
+                string path = null;
+                if (pathOf != null) { try { path = pathOf(); } catch (Exception) { path = null; } }
+                string id = null;
+                if (!string.IsNullOrEmpty(path) && retired.Count > 0)
+                {
+                    Entry old;
+                    string pk = PathKey(key, path);
+                    if (retiredByPath.TryGetValue(pk, out old) && old != null && !byId.ContainsKey(old.id))
+                    {
+                        bool same = ReferenceEquals(old.obj, obj);
+                        if (!same && confirm != null) { try { same = confirm(path); } catch (Exception) { same = false; } }
+                        if (same) { id = old.id; retired.Remove(old.id); retiredByPath.Remove(pk); revived++; }
+                    }
+                }
+                if (id == null)
+                {
+                    counter++;
+                    id = prefix + counter.ToString(CultureInfo.InvariantCulture);
+                }
+                e = new Entry { id = id, key = key, obj = obj, path = path, epoch = epoch };
                 byKey[key] = e;
                 byId[e.id] = e;
                 return e.id;
@@ -71,7 +111,24 @@ namespace InsideDev.Play
 
         public IdLookup Lookup(string id, out object obj)
         {
+            string path;
+            long key;
+            int entryEpoch;
+            var r = Lookup(id, out obj, out path, out key, out entryEpoch);
+            if (r == IdLookup.Gone) { obj = null; return entryEpoch < epoch ? IdLookup.Stale : IdLookup.Destroyed; }
+            return r;
+        }
+
+        // Gone = the id is known but its object is not bound now (retired by a load, or destroyed without one): path
+        // is its hierarchy path, key its old key, entryEpoch the epoch it was given in, obj the old object when that
+        // one outlived the load. The caller finds the object (obj, or the one at path) and calls Rebind, or reports
+        // the id as gone; the id stays known either way.
+        public IdLookup Lookup(string id, out object obj, out string path, out long key, out int entryEpoch)
+        {
             obj = null;
+            path = null;
+            key = 0;
+            entryEpoch = 0;
             char p;
             long n;
             if (!Parse(id, out p, out n)) return IdLookup.Malformed;
@@ -80,11 +137,40 @@ namespace InsideDev.Play
                 Entry e;
                 if (byId.TryGetValue(id, out e))
                 {
-                    if (!alive(e.obj)) return IdLookup.Destroyed;
-                    obj = e.obj;
-                    return IdLookup.Ok;
+                    if (alive(e.obj)) { obj = e.obj; return IdLookup.Ok; }
+                    byId.Remove(id);
+                    Entry k;
+                    if (byKey.TryGetValue(e.key, out k) && ReferenceEquals(k, e)) byKey.Remove(e.key);
+                    retired[id] = e;
                 }
-                return n >= 1 && n <= counter ? IdLookup.Stale : IdLookup.NotFound;
+                else if (!retired.TryGetValue(id, out e)) return n >= 1 && n <= counter ? IdLookup.Stale : IdLookup.NotFound;
+                path = e.path;
+                key = e.key;
+                entryEpoch = e.epoch;
+                if (alive(e.obj)) obj = e.obj;
+                return IdLookup.Gone;
+            }
+        }
+
+        // a retired id is live again for obj (key = its current key); false when the id is not retired
+        public bool Rebind(string id, long key, object obj)
+        {
+            lock (gate)
+            {
+                Entry old;
+                if (!retired.TryGetValue(id, out old)) return false;
+                retired.Remove(id);
+                if (old.path != null)
+                {
+                    Entry byPath;
+                    string pk = PathKey(old.key, old.path);
+                    if (retiredByPath.TryGetValue(pk, out byPath) && ReferenceEquals(byPath, old)) retiredByPath.Remove(pk);
+                }
+                var e = new Entry { id = id, key = key, obj = obj, path = old.path, epoch = epoch };
+                byId[id] = e;
+                if (!byKey.ContainsKey(key)) byKey[key] = e;
+                revived++;
+                return true;
             }
         }
 
@@ -103,10 +189,40 @@ namespace InsideDev.Play
         {
             lock (gate)
             {
+                foreach (var kv in byId)
+                {
+                    var e = kv.Value;
+                    retired[e.id] = e;
+                    if (e.path == null) continue;
+                    string pk = PathKey(e.key, e.path);
+                    Entry other;
+                    if (retiredByPath.TryGetValue(pk, out other) && !ReferenceEquals(other, e)) retiredByPath[pk] = null;
+                    else retiredByPath[pk] = e;
+                }
                 byKey.Clear();
                 byId.Clear();
                 epoch++;
+                if (retired.Count > 0) Prune(epoch - KeptEpochs);
+                for (int back = KeptEpochs - 1; retired.Count > MaxRetired && back >= 0; back--) Prune(epoch - back);
                 return epoch;
+            }
+        }
+
+        // drops the retired entries of epochs before firstKept
+        void Prune(int firstKept)
+        {
+            List<string> drop = null;
+            foreach (var kv in retired)
+                if (kv.Value.epoch < firstKept) { if (drop == null) drop = new List<string>(); drop.Add(kv.Key); }
+            if (drop == null) return;
+            foreach (var id in drop)
+            {
+                var e = retired[id];
+                retired.Remove(id);
+                if (e.path == null) continue;
+                string pk = PathKey(e.key, e.path);
+                Entry byPath;
+                if (retiredByPath.TryGetValue(pk, out byPath) && (byPath == null || ReferenceEquals(byPath, e))) retiredByPath.Remove(pk);
             }
         }
 
@@ -178,6 +294,12 @@ namespace InsideDev.Play
         }
 
         public void Reset() { Count = 0; Deaths = 0; has = false; checkpoint = null; }
+
+        public void CopyFrom(StuckCounter o)
+        {
+            Count = o.Count; Deaths = o.Deaths; Guide = o.Guide; has = o.has; checkpoint = o.checkpoint;
+            minX = o.minX; maxX = o.maxX; minY = o.minY; maxY = o.maxY; minZ = o.minZ; maxZ = o.maxZ;
+        }
 
         public string Hint()
         {

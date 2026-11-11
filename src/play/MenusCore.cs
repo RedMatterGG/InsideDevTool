@@ -8,7 +8,9 @@ namespace InsideDev.Play
     // tests (qa/mcp/WORLD_A). MenuKinds maps the game's UIMenuItem classes (FP/*MenuItem.cs) to item kinds and flags the
     // destructive ones; MenuPolicy decides which presses are refused (destructive without allow_destructive, Yes in the
     // quit confirm always, raising the master volume always, storage messages through ui message_answer only);
-    // MenuIdTable hands out "m<n>" ids for one menu state; MenuScreen is the screen name when Observer is not built.
+    // MenuIdTable hands out "m<n>" ids: an item keeps its number for as long as the game keeps the item, a number is
+    // never given to another item, and an id resolves only while its item is in the current menu state (else stale);
+    // MenuScreen is the screen name when Observer is not built.
     internal static class MenuKinds
     {
         public const string Button = "button", Slider = "slider", Toggle = "toggle", Chapter = "chapter", Confirm = "confirm", Key = "key", Other = "other";
@@ -92,27 +94,42 @@ namespace InsideDev.Play
 
     internal sealed class MenuIdTable
     {
+        const int MaxKnown = 4096;
+        // every item that ever got an id: known[i] has the number first + i + 1
+        readonly List<object> known = new List<object>();
+        // the items of the current menu state, in list order
         readonly List<object> items = new List<object>();
-        int generation;
+        int generation, first;
 
         public int Generation { get { return generation; } }
         public int Count { get { return items.Count; } }
 
-        // a new table: ids m1..mN in list order
+        static int IndexOf(List<object> l, object o)
+        {
+            for (int i = 0; i < l.Count; i++) if (ReferenceEquals(l[i], o)) return i;
+            return -1;
+        }
+
+        // a new menu state: its items keep the ids they had, new items get the next numbers (the first state is m1..mN
+        // in list order)
         public void Reset(IList<object> objs)
         {
             items.Clear();
             if (objs != null) items.AddRange(objs);
             generation++;
+            // numbers are never reused: when the list of known items is dropped the numbering goes on behind it
+            if (known.Count > MaxKnown) { first += known.Count; known.Clear(); }
+            foreach (var o in items) if (o != null && IndexOf(known, o) < 0) known.Add(o);
         }
 
         public string IdOf(object o)
         {
-            int i = items.IndexOf(o);
-            return i < 0 ? null : "m" + (i + 1).ToString(CultureInfo.InvariantCulture);
+            if (o == null || IndexOf(items, o) < 0) return null;
+            int i = IndexOf(known, o);
+            return i < 0 ? null : "m" + (first + i + 1).ToString(CultureInfo.InvariantCulture);
         }
 
-        // -1 = malformed, -2 = not in the current table
+        // -1 = malformed, else the number - 1
         public static int Parse(string id)
         {
             if (string.IsNullOrEmpty(id) || id.Length < 2 || (id[0] != 'm' && id[0] != 'M')) return -1;
@@ -124,10 +141,13 @@ namespace InsideDev.Play
         public object Resolve(string id, out string error)
         {
             error = null;
-            int i = Parse(id);
-            if (i == -1) { error = "malformed menu item id '" + (id ?? "") + "' (ids look like m3)"; return null; }
-            if (i >= items.Count) { error = "menu item " + id + " is not in the current menu state"; return null; }
-            return items[i];
+            int n = Parse(id);
+            if (n == -1) { error = "malformed menu item id '" + (id ?? "") + "' (ids look like m3)"; return null; }
+            int i = n - first;
+            if (i < 0 || i >= known.Count) { error = "menu item " + id + " is not in the current menu state"; return null; }
+            var o = known[i];
+            if (IndexOf(items, o) < 0) { error = "menu item " + id + " is not in the current menu state (it belongs to an earlier one)"; return null; }
+            return o;
         }
     }
 

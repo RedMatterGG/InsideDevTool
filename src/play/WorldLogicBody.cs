@@ -12,7 +12,8 @@ namespace InsideDev.Play
     // given; Character.Teleport(pos) (Boy.Teleport clears the state machine, FP/Boy.cs:501-516; Huddle.Teleport shifts
     // cloth and spine but keeps its state, FP/Huddle.cs:354-379); Submarine.Teleport(pos, vel) (AC/Submarine.cs:464);
     // CameraScript.FastBlend (FP/CameraScript.cs:199-221); jumps over 25 m: freeze if running, RefreshVisibilityState +
-    // RefreshAllCullers, wait AllCullersFinished up to 10 s (FP/SubsceneCullingManager.cs:259-274), unfreeze. Only with
+    // RefreshAllCullers, wait AllCullersFinished up to 10 s (FP/SubsceneCullingManager.cs:259-274), unfreeze (through
+    // MainCleanup: a cancelled or timed-out call still unfreezes on the next frame). Only with
     // EditorState play.save_guard on (Saves.Guard): the save is backed up (Saves.EnsureBackup) before any teleport and a
     // destination inside a savepoint is refused unless the save lock is on (then it marks the lock, Saves.MarkCheat) or
     // force (needs the backup); with the guard off every destination is allowed (SavepointEntry). hat: MindHat.ForceAttach /
@@ -115,7 +116,7 @@ namespace InsideDev.Play
             if (b.ch != null && !b.ch.isCharacterActive) throw new McpException(McpErr.Refused, b.name + " is not active", "activate the body first (swap)");
             var boy = b.ch as Boy;
             var why = new List<string>();
-            if (b.ch != null && b.ch.isDead) why.Add("dead (wait_until {alive:true} or checkpoint reload)");
+            if (b.ch != null && b.ch.isDead) why.Add("dead (wait_until {any:[{alive:true}]} or checkpoint reload)");
             if (boy != null)
             {
                 if (boy.isMindControlling) why.Add("wearing a mind-control hat (body {op:\"hat\", hat_op:\"detach\"})");
@@ -165,7 +166,7 @@ namespace InsideDev.Play
             }
             ctx.MainDo(() =>
             {
-                if (GameManager.IsLoading()) throw new McpException(McpErr.Refused, "a load is in progress", "wait_until {ready:true} first");
+                if (GameManager.IsLoading()) throw new McpException(McpErr.Refused, "a load is in progress", "wait_until {any:[{ready:true}]} first");
                 body = ResolveBody(bodySpec, force, warnings);
                 from = body.Pos;
                 to = target(new Vector3(from.x, from.y, PlaneZ(body)));
@@ -208,9 +209,17 @@ namespace InsideDev.Play
                         try { Stepper.Freeze(); unfreeze = true; }
                         catch (NotImplementedException) { warnings.Add("freeze unavailable (time module not built): streaming catches up while the game runs"); }
                     }
-                    var cm = SubsceneCullingManager.instance;
-                    cm.RefreshVisibilityState();
-                    cm.RefreshAllCullers();
+                    try
+                    {
+                        var cm = SubsceneCullingManager.instance;
+                        cm.RefreshVisibilityState();
+                        cm.RefreshAllCullers();
+                    }
+                    catch (Exception)
+                    {
+                        if (unfreeze) { unfreeze = false; try { Stepper.Unfreeze(); } catch (Exception) { } }
+                        throw;
+                    }
                 }
                 after = body.Pos;
             });
@@ -226,7 +235,7 @@ namespace InsideDev.Play
             }
             finally
             {
-                if (unfreeze) { try { ctx.MainDo(() => Stepper.Unfreeze()); } catch (Exception e) { warnings.Add("unfreeze: " + e.Message); } }
+                if (unfreeze) MainCleanup.Run(ctx, "unfreeze", () => Stepper.Unfreeze(), warnings);
             }
             bool sameNow = (after - to).sqrMagnitude < 0.01f;
             bool later = World.WaitVerify(ctx, 2, warnings);
@@ -275,7 +284,7 @@ namespace InsideDev.Play
             }, PlayShared.Bool(a, "snap_camera", true), PlayShared.Bool(a, "wait_stream", true), force, warnings);
             var r = PlayShared.Env();
             foreach (var key in tr.order) r[key] = tr[key];
-            var obs = ctx.Main(() => World.Concise("body"));
+            var obs = ctx.Main(() => World.Concise("body", ctx));
             if (obs != null) r["observe"] = obs;
             if (warnings.Count > 0) r["warnings"] = World.Strs(warnings.Count > 20 ? warnings.GetRange(0, 20) : warnings);
             return ToolResult.Ok(r);
@@ -314,7 +323,7 @@ namespace InsideDev.Play
             bool want = hop == "attach", sameNow = false;
             ctx.MainDo(() =>
             {
-                if (GameManager.IsLoading()) throw new McpException(McpErr.Refused, "a load is in progress", "wait_until {ready:true} first");
+                if (GameManager.IsLoading()) throw new McpException(McpErr.Refused, "a load is in progress", "wait_until {any:[{ready:true}]} first");
                 hat = PickHat(spec, want);
                 var boy = ScriptGlobals.boy;
                 if (want)
@@ -336,29 +345,42 @@ namespace InsideDev.Play
                 }
             });
             bool later = World.WaitVerify(ctx, 2, warnings);
-            bool readK = false, sameK = false, frozen = false;
+            bool readK = false, sameK = false, frozen = false, hatLive = false;
             ctx.MainDo(() =>
             {
                 frozen = World.Frozen();
-                if (later && hat != null) { readK = true; sameK = (hat.GetBoyInHat() != null) == want; }
+                hatLive = hat != null;
+                if (later && hatLive) { readK = true; sameK = (hat.GetBoyInHat() != null) == want; }
                 r["hats"] = HatList();
             });
             bool checkLater = want || !frozen;
             if (!checkLater) warnings.Add("frozen: the detach finishes once game time runs (time step or act), so it is not re-checked");
             r["outcome"] = "done";
-            r["verdict"] = ReflectValues.Verdict(hat != null, sameNow, checkLater, readK, sameK);
+            r["verdict"] = ReflectValues.Verdict(hatLive, sameNow, checkLater, readK, sameK);
             warnings.Add("hats have no undo: detach (or reload the checkpoint) to get the boy back");
-            var obs = ctx.Main(() => World.Concise("body"));
+            var obs = ctx.Main(() => World.Concise("body", ctx));
             if (obs != null) r["observe"] = obs;
             r["warnings"] = World.Strs(warnings);
             return ToolResult.Ok(r);
         }
 
+        // the active mind-control hats, from Perception's component lists (no scene scan of its own)
+        static List<MindHat> Hats()
+        {
+            var l = new List<MindHat>();
+            Perception.RefreshIfStale(Perception.BuildSteps);
+            foreach (var x in Perception.Items(typeof(MindHat)))
+            {
+                var h = x as MindHat;
+                if (h != null && h.gameObject.activeInHierarchy) l.Add(h);
+            }
+            return l;
+        }
+
         static List<object> HatList()
         {
             var l = new List<object>();
-            var all = UnityEngine.Object.FindObjectsOfType(typeof(MindHat)) as MindHat[];
-            if (all != null) foreach (var h in all) if (h != null && l.Count < 16) l.Add(HatRow(h));
+            foreach (var h in Hats()) if (l.Count < 16) l.Add(HatRow(h));
             return l;
         }
 
@@ -372,7 +394,7 @@ namespace InsideDev.Play
                 if (h == null) throw new McpException(McpErr.NotFound, World.Path(go) + " is not a MindHat", "body {op:\"hat\", hat_op:\"status\"} lists the hats");
                 return h;
             }
-            var all = UnityEngine.Object.FindObjectsOfType(typeof(MindHat)) as MindHat[];
+            var all = Hats();
             MindHat best = null;
             float bd = float.MaxValue;
             Vector3 body;
@@ -403,7 +425,7 @@ namespace InsideDev.Play
             bool sameNow = false;
             ctx.MainDo(() =>
             {
-                if (GameManager.IsLoading()) throw new McpException(McpErr.Refused, "a load is in progress", "wait_until {ready:true} first");
+                if (GameManager.IsLoading()) throw new McpException(McpErr.Refused, "a load is in progress", "wait_until {any:[{ready:true}]} first");
                 var boy = ScriptGlobals.boy;
                 var hud = ScriptGlobals.huddle;
                 if (boy == null || hud == null) throw new McpException(McpErr.NotReady, "swap needs both the boy and the huddle in the scene", "the huddle exists once the master scene is loaded");
@@ -413,7 +435,7 @@ namespace InsideDev.Play
                 if (already) { warnings.Add("already the " + to); sameNow = true; after = before; return; }
                 if (!force)
                 {
-                    if (cur != null && cur.isDead) throw new McpException(McpErr.Refused, "the body is dead", "wait_until {alive:true}");
+                    if (cur != null && cur.isDead) throw new McpException(McpErr.Refused, "the body is dead", "wait_until {any:[{alive:true}]}");
                     if (boy.isMindControlling || boy.specialBoyMode != Boy.SpecialBoyMode.None) throw new McpException(McpErr.Refused, "the boy is in a hat or a special mode", "force:true skips this check");
                     throw new McpException(McpErr.Refused, "swapping outside the game's own swap triggers can break scripted scenes (the huddle chapters expect their own setup)", "force:true swaps anyway (MainCharacterSwap)");
                 }
@@ -431,7 +453,7 @@ namespace InsideDev.Play
             r["verdict"] = ReflectValues.Verdict(true, sameNow, true, readK, sameK);
             r["before"] = PlayShared.V(before);
             r["after"] = PlayShared.V(after);
-            var obs = ctx.Main(() => World.Concise("body"));
+            var obs = ctx.Main(() => World.Concise("body", ctx));
             if (obs != null) r["observe"] = obs;
             r["warnings"] = World.Strs(warnings);
             return ToolResult.Ok(r);

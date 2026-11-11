@@ -11,14 +11,19 @@ namespace InsideDev.Play
     // 2.72 m/s, jump height BoyUtils.GetJumpHeightEstimate. Small steps and obstacles are climbed by the game itself;
     // jump_gaps jumps gaps and low walls the slice says are passable. Outcomes: arrived, blocked (reason wall / pit /
     // obstacle / ledge_up / ledge_down / water), fell, died, timeout, cancelled, unreachable, loading. Takes the control lane.
-    // Loop (worker): slice around body -> goal (SliceJob chunks), NavPlan.Plan, then Stepper.Run segments of 30 steps
-    // whose stopCheck reads the body (NavBody) and lets NavLoop pick the next step's input, applied as one latched
-    // AgentCore frame; a stop code ends the segment (arrived, blocked, fell, replan ...). Re-plans after every landing or
-    // climb, when the route ends in front of the body, or on an unexpected edge / wall. Input is always released at the
-    // end (also on error and cancel), except a grab grip (interact grab, AgentCore.Grip): it stays held on arrived /
-    // blocked / fell / timeout / unreachable (the box comes along; warning grip_held) and is let go on cancel, death and
-    // loads. when (Waits.When) waits for one wait_until condition first, inside the same call. y and the result y use the
-    // body centre (boy.pos.y; feet = y - height / 2).
+    // Loop (worker): slice around body -> goal (SliceJob chunks), NavPlan.Plan, then one Stepper.Run until a stop code:
+    // its stopCheck reads the body (NavBody) after every logic step (a rendered frame without a new step decides
+    // nothing: the counters of NavLoop are logic steps, also in realtime at any frame rate) and lets NavLoop pick the next
+    // step's input, applied as one latched AgentCore frame; a stop code ends the run (arrived, blocked, fell, replan
+    // ...) and replan starts the next one after the new plan, with the first decision made in the visit of the main
+    // thread that starts it. Re-plans after every landing or climb, when the route ends in front of the body, or on an
+    // unexpected edge / wall. Input is released at the end (also on error and cancel) once the move started, except a
+    // grab grip (interact grab, AgentCore.Grip): it stays held on arrived / blocked / fell / timeout / unreachable (the
+    // box comes along; warning grip_held) and is let go on cancel, death and loads; an error before the move started (a
+    // stale target, no controllable body, a main thread that did not answer) leaves held input and the grip alone.
+    // when (Waits.When) waits for one wait_until condition first, inside the same call; wait_ready_s (Act.WaitReady) lets
+    // a game that does not take input yet run until it does. y and the result y use the body centre (boy.pos.y; feet =
+    // y - height / 2).
     public sealed class MoveRequest
     {
         // exactly one of target / x / dx
@@ -37,7 +42,7 @@ namespace InsideDev.Play
     {
         public const string Owner = "NAV";
         public static readonly string[] Outcomes = { "arrived", "blocked", "fell", "died", "timeout", "cancelled", "unreachable", "loading" };
-        const int SegmentSteps = 30, MaxReplans = 60, Horizon = 18;
+        const int MaxReplans = 60, Horizon = 18;
 
         public static void Register()
         {
@@ -51,10 +56,15 @@ namespace InsideDev.Play
                     .Bool("jump_gaps", "Jump gaps and low walls on the way.", true).Bool("climb", "Climb onto ledges in the way.", true)
                     .Obj("when", Waits.WhenText, Waits.WhenSchema())
                     .Num("when_timeout_s", "Longest wait for when (wall clock s).", Waits.WhenDefaultS, 0.1, Waits.WhenMaxS)
+                    .Num("wait_ready_s", Act.WaitReadyText, 0, 0, Act.WaitReadyMaxS)
                     .Enum("observe", "Observation in the result.", "concise", "concise", "none").Build(),
                 Schema.Obj().Enum("outcome", "How it ended.", null, Outcomes).Str("reason", "Why blocked / unreachable (wall, pit, obstacle, ledge_up, ledge_down, water ...).")
                     .Int("steps", "Logic steps run.", 0, 100000).Num("distance_left", "Metres to the goal.", 0, 1e5)
                     .Num("x", "Body x at the end.", -1e5, 1e5).Num("y", "Body y at the end.", -1e5, 1e5)
+                    .OutObj("goal", "Where it was going.", Schema.Obj().Num("x", "", -1e5, 1e5).Num("y", "", -1e5, 1e5).Int("face", "Facing wanted at the end.", -1, 1))
+                    .Str("state", "Body state class at the end.").Arr("route", "The last plan, step by step, one text per step (\"drop x=.. y=.. h=..\").", Schema.Str(), 0, 12)
+                    .Int("replans", "Plans made.", 0, 1000).Int("rays", "Collision rays cast for the plans.", 0, 100000000)
+                    .OutObj("when", "The when wait.", Waits.WhenOut()).OutObj("wait_ready", "The wait_ready_s wait.", Act.WaitReadyOut())
                     .Arr("events", "Jumps, climbs and stops on the way.", Schema.Str(), 0, 30).Arr("warnings", "", Schema.Str(), 0, 20)
                     .Prop("changes", null, ChangeLog.Ref())
                     .Prop("observe", null, Observer.ConciseRef()).BuildOutput()).AlwaysLoad(), Handle);
@@ -68,7 +78,9 @@ namespace InsideDev.Play
             var job = ctx.BeginJob(McpLanes.Control, out busy);
             if (job == null) return busy ?? ToolResult.Fail(McpErr.Busy, "busy: another action is running");
             var when = PlayShared.Obj(a, "when");
-            Json.Obj wb = null;
+            Json.Obj wb = null, rb = null;
+            double waitReady = PlayShared.Num(a, "wait_ready_s", 0);
+            if (waitReady > 0) rb = Act.ReadyOrWait(ctx, waitReady, WhenReserveMs(req.maxSteps), "move_to", null);
             if (when != null)
             {
                 string ws;
@@ -80,10 +92,11 @@ namespace InsideDev.Play
                     f["reason"] = "when: " + wb.Str("detail", ws);
                     f["steps"] = 0.0;
                     f["when"] = wb;
+                    if (rb != null) f["wait_ready"] = rb;
                     f["warnings"] = new List<object>();
                     if (PlayShared.Str(a, "observe", "concise") != "none" && !ctx.Cancelled)
                     {
-                        var o0 = ctx.Main(() => { try { return Observer.Concise("move_to"); } catch (NotImplementedException) { return null; } });
+                        var o0 = ctx.Main(() => { try { return Observer.Concise("move_to", ctx.Info.sessionId); } catch (NotImplementedException) { return null; } });
                         if (o0 != null) f["observe"] = o0;
                     }
                     return ToolResult.Ok(f);
@@ -91,9 +104,10 @@ namespace InsideDev.Play
             }
             var r = MoveTo(ctx, req);
             if (wb != null) r["when"] = wb;
+            if (rb != null) r["wait_ready"] = rb;
             if (PlayShared.Str(a, "observe", "concise") != "none" && !ctx.Cancelled)
             {
-                var o = ctx.Main(() => { try { return Observer.Concise("move_to"); } catch (NotImplementedException) { return null; } });
+                var o = ctx.Main(() => { try { return Observer.Concise("move_to", ctx.Info.sessionId); } catch (NotImplementedException) { return null; } });
                 if (o != null) r["observe"] = o;
             }
             return ToolResult.Ok(r);
@@ -138,7 +152,9 @@ namespace InsideDev.Play
             public float halfHeight = 0.665f;
             public NavBody last;
             public NavCmd applied;
-            public bool hasApplied;
+            public bool hasApplied, started;
+            // LogicManager.stepCount of the last decision
+            public long lastStep = long.MinValue;
             public int rays;
             public List<object> route = new List<object>();
             public readonly List<string> warnings = new List<string>();
@@ -163,7 +179,11 @@ namespace InsideDev.Play
             {
                 string early = ctx.Main(() => Setup(st));
                 if (early != null) Split(early, out run.outcome, out run.reason);
-                else Drive(ctx, st, run);
+                else
+                {
+                    st.started = true;
+                    Drive(ctx, st, run);
+                }
             }
             catch (McpException e)
             {
@@ -174,7 +194,11 @@ namespace InsideDev.Play
             {
                 string o = run.outcome;
                 bool keep = o == "arrived" || o == "blocked" || o == "fell" || o == "timeout" || o == "unreachable";
-                try { if (keep) AgentCore.ReleaseKeepGrip(); else AgentCore.Release(); } catch (Exception) { }
+                // an error before the move started changed nothing: what was held stays held
+                if (st.started || o != null)
+                {
+                    try { if (keep) AgentCore.ReleaseKeepGrip(); else AgentCore.Release(); } catch (Exception) { }
+                }
             }
             bool grip = false;
             try { grip = AgentCore.Grip; } catch (Exception) { }
@@ -189,11 +213,11 @@ namespace InsideDev.Play
             public int total;
         }
 
-        // worker: plan, decide, run segments until an outcome
+        // worker: plan, then run until a stop code; replan plans again and starts the next run
         static void Drive(CallContext ctx, MoveState st, RunInfo run)
         {
             var req = st.req;
-            int left = req.maxSteps, zeroRuns = 0, idlePlans = 0;
+            int left = req.maxSteps, idlePlans = 0;
             bool decide = true;
             while (run.outcome == null)
             {
@@ -206,24 +230,33 @@ namespace InsideDev.Play
                     if (pend != null) { Split(pend, out run.outcome, out run.reason); return; }
                     decide = true;
                 }
-                if (decide)
+                // the decision for the current state and the start of the run share one visit of the main thread
+                bool decideNow = decide;
+                decide = false;
+                string code = null;
+                RunResult rr = null;
+                if (left <= 0)
                 {
-                    decide = false;
-                    string code = ctx.Main(() => Decide(st));
-                    if (code == "replan")
-                    {
-                        st.loop.needPlan = true;
-                        if (++idlePlans > 3) { run.outcome = "unreachable"; run.reason = "no_route"; return; }
-                        continue;
-                    }
-                    if (code != null) { Split(code, out run.outcome, out run.reason); return; }
+                    if (decideNow) code = ctx.Main(() => Decide(st));
                 }
-                if (left <= 0) { run.outcome = "timeout"; run.reason = "max_steps"; return; }
-                var rr = Stepper.Run(ctx, new RunRequest
+                else
                 {
-                    maxSteps = Math.Min(left, SegmentSteps), timeoutMs = Math.Max(1000, ctx.RemainingMs - 2500),
-                    stopCheck = () => Check(st), stopOnDeath = true, stopOnLoad = true, label = "move_to"
-                });
+                    Func<bool> first = null;
+                    if (decideNow) first = () => { code = Decide(st); return code == null; };
+                    rr = Stepper.Run(ctx, new RunRequest
+                    {
+                        maxSteps = left, timeoutMs = Math.Max(1000, ctx.RemainingMs - 2500),
+                        stopCheck = () => Check(st), stopOnDeath = true, stopOnLoad = true, label = "move_to"
+                    }, first);
+                }
+                if (code == "replan")
+                {
+                    st.loop.needPlan = true;
+                    if (++idlePlans > 3) { run.outcome = "unreachable"; run.reason = "no_route"; return; }
+                    continue;
+                }
+                if (code != null) { Split(code, out run.outcome, out run.reason); return; }
+                if (rr == null) { run.outcome = "timeout"; run.reason = "max_steps"; return; }
                 run.total += rr.steps; left -= rr.steps;
                 if (rr.steps > 0) idlePlans = 0;
                 foreach (var w in rr.warnings) AddWarning(st, w);
@@ -239,9 +272,6 @@ namespace InsideDev.Play
                         if (rr.detail == "replan") { st.loop.needPlan = true; decide = true; }
                         else if (rr.detail == "error") throw new McpException(McpErr.GameError, "move_to: " + st.error);
                         else Split(rr.detail, out run.outcome, out run.reason);
-                        break;
-                    default:
-                        if (rr.steps == 0 && ++zeroRuns >= 3) { run.outcome = "timeout"; run.reason = "no steps ran"; }
                         break;
                 }
             }
@@ -308,7 +338,7 @@ namespace InsideDev.Play
                 string w = (why ?? "").ToLowerInvariant();
                 if (w.Contains("load")) return "loading:" + why;
                 if (w.Contains("dead")) return "died:" + why;
-                throw new McpException(McpErr.NotReady, "move_to needs a controllable body: " + why, "observe, or wait_until {ready:true}");
+                throw new McpException(McpErr.NotReady, "move_to needs a controllable body: " + why, "observe, or " + PlayShared.WaitReadyCall + ", or pass wait_ready_s");
             }
             var ch = NavGame.Active();
             if (ch == null) return "loading:no controlled body";
@@ -403,6 +433,7 @@ namespace InsideDev.Play
         {
             var b = Read(st);
             st.last = b;
+            st.lastStep = LogicManager.stepCount;
             var code = st.loop.Step(b);
             Apply(st);
             return code;
@@ -413,6 +444,9 @@ namespace InsideDev.Play
         {
             try
             {
+                long sc = LogicManager.stepCount;
+                if (sc == st.lastStep) return null;
+                st.lastStep = sc;
                 var b = Read(st);
                 st.last = b;
                 var code = st.loop.Step(b);
@@ -434,6 +468,18 @@ namespace InsideDev.Play
             AgentCore.ReleaseKeepGrip();
             if (!c.Neutral) AgentCore.Enqueue(new List<InputFrame> { new InputFrame { x = c.x, y = c.y, jump = c.jump, action = false, steps = 1 } }, true);
             st.applied = c; st.hasApplied = true;
+        }
+
+        static readonly Dictionary<Type, string> typeNames = new Dictionary<Type, string>();
+
+        // main thread: t.Name, kept per type (the body is read on every logic step)
+        static string TypeName(Type t)
+        {
+            string s;
+            if (typeNames.TryGetValue(t, out s)) return s;
+            s = t.Name;
+            typeNames[t] = s;
+            return s;
         }
 
         static NavBody Body(MoveState st)
@@ -461,14 +507,14 @@ namespace InsideDev.Play
                 {
                     b.huddle = true;
                     b.swimming = hud.isSwimming;
-                    b.state = hud.state != null ? hud.state.GetType().Name : "";
+                    b.state = hud.state != null ? TypeName(hud.state.GetType()) : "";
                 }
                 return b;
             }
             var pos = boy.pos; var vel = boy.velocity;
             b.x = pos.x; b.y = pos.y - hh; b.vx = vel.x; b.vy = vel.y; b.facing = boy.facing;
             var state = boy.state;
-            b.state = state != null ? state.GetType().Name : "";
+            b.state = state != null ? TypeName(state.GetType()) : "";
             b.swimming = state is BoySwimState;
             b.onLadder = state is BoyLadderState;
             b.onRope = state is BoyRopeState;

@@ -38,9 +38,12 @@ namespace InsideDev.Play
         static readonly Dictionary<Type, FieldInfo> valueFields = new Dictionary<Type, FieldInfo>();
         const BindingFlags Inst = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
 
-        public static ActBody Take(ActScope s)
+        public static ActBody Take(ActScope s) { return Take(s, new ActBody()); }
+
+        // fills b (reset first): the per-step checks pass their own buffers instead of a new object on every step
+        public static ActBody Take(ActScope s, ActBody b)
         {
-            var b = new ActBody();
+            b.Reset();
             if (s != null) s.reads++;
             try
             {
@@ -71,7 +74,7 @@ namespace InsideDev.Play
                 var h = ScriptGlobals.huddle;
                 b.has = true;
                 b.kind = "huddle";
-                b.state = h.state != null ? ActStateNames.Short(h.state.GetType().Name) : "";
+                b.state = h.state != null ? ActStateNames.Short(h.state.GetType()) : "";
                 b.dead = h.isDead;
                 var st = h.status;
                 b.grounded = st != null && st.hasFoothold;
@@ -101,7 +104,7 @@ namespace InsideDev.Play
                 return;
             }
             ReadBoy(b, boy);
-            if (boy.specialBoyMode != Boy.SpecialBoyMode.None) b.special = boy.specialBoyMode.ToString();
+            if (boy.specialBoyMode != Boy.SpecialBoyMode.None) b.special = SpecialName(boy.specialBoyMode);
             if (boy.specialBoyMode == Boy.SpecialBoyMode.InsideSub)
             {
                 b.kind = "submarine";
@@ -122,7 +125,7 @@ namespace InsideDev.Play
             b.kind = "boy";
             b.dead = boy.isDead;
             var state = boy.state;
-            b.state = state != null ? ActStateNames.Short(state.GetType().Name) : "";
+            b.state = state != null ? ActStateNames.Short(state.GetType()) : "";
             b.facing = boy.facing < 0f ? -1f : 1f;
             SetPos(b, boy.pos3, boy.velocity3);
             var st = boy.status;
@@ -141,6 +144,17 @@ namespace InsideDev.Play
             if (swim != null) b.atSurface = swim.atSurface;
             b.holding = BoyUtils.GetCurrentGrabBody(boy) != null;
             try { var bi = boy.input; if (bi != null) b.extraDeadZone = bi.GetExtraDeadZone(); } catch (Exception) { }
+        }
+
+        static readonly Dictionary<int, string> specialNames = new Dictionary<int, string>();
+
+        static string SpecialName(Boy.SpecialBoyMode m)
+        {
+            string s;
+            if (specialNames.TryGetValue((int)m, out s)) return s;
+            s = m.ToString();
+            specialNames[(int)m] = s;
+            return s;
         }
 
         static void SetPos(ActBody b, Vector3 p, Vector3 v)

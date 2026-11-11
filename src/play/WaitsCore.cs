@@ -70,6 +70,16 @@ namespace InsideDev.Play
                 try { c.cleanup(); } catch { }
             }
         }
+
+        // a condition installed something in the game (a signal tap): Cleanup must run on the main thread
+        public bool NeedsCleanup
+        {
+            get
+            {
+                foreach (var c in conds) if (c.cleanup != null) return true;
+                return false;
+            }
+        }
     }
 
     internal static class WaitPlan

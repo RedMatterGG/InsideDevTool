@@ -31,6 +31,20 @@ namespace InsideDev.Play
         }
 
         public float NearestEdge { get { return Math.Min(edgeLeft, edgeRight); } }
+
+        // back to the values of a new object (a reading that is taken on every logic step reuses its buffers)
+        public void Reset()
+        {
+            has = dead = grounded = inWater = atSurface = holding = mindControlling = obstructed = false;
+            loading = playing = inputEnabled = subOnSurface = subBoosting = false;
+            kind = "none"; state = ""; special = "None"; device = "";
+            x = y = z = vx = vy = extraDeadZone = 0f;
+            facing = 1f;
+            deviceValue = float.NaN;
+            edgeLeft = edgeRight = 1e6f;
+            sub = sp = -1;
+            step = 0;
+        }
     }
 
     internal sealed class ActWatch
@@ -50,6 +64,19 @@ namespace InsideDev.Play
 
     internal static class ActStateNames
     {
+        static readonly Dictionary<Type, string> byType = new Dictionary<Type, string>();
+
+        // main thread: Short(t.Name), kept per type (a state is read on every logic step)
+        public static string Short(Type t)
+        {
+            if (t == null) return "";
+            string s;
+            if (byType.TryGetValue(t, out s)) return s;
+            s = Short(t.Name);
+            byType[t] = s;
+            return s;
+        }
+
         public static string Short(string typeName)
         {
             if (string.IsNullOrEmpty(typeName)) return "";
@@ -114,6 +141,25 @@ namespace InsideDev.Play
                 return frames;
             }
             totalSteps = (int)total;
+            return frames;
+        }
+
+        // the ctl seq script (CtlCore.ParseSeq: R L U D <t>[@0.3..1], J [<t>], A [<t>], G <t>, W <t>, joined with +) as act
+        // frames: an atom without a stick is a neutral stick. warnings = the script's own (a jump that is no new press)
+        public static List<InputFrame> ParseSeq(string script, List<string> warnings, out int totalSteps, out string error)
+        {
+            totalSteps = 0;
+            var ctl = new List<CtlFrame>();
+            int total, segments;
+            if (!CtlCore.ParseSeq(script, ctl, warnings, out total, out segments, out error)) return new List<InputFrame>();
+            if (total > MaxSteps)
+            {
+                error = total + " steps in total, at most " + MaxSteps + " per call (10 s): split it into several act calls, or use hold";
+                return new List<InputFrame>();
+            }
+            var frames = new List<InputFrame>();
+            foreach (var f in CtlCore.Merge(ctl, default(InputFrame), false, false)) frames.Add(AgentQueue.Shape(f));
+            totalSteps = total;
             return frames;
         }
 

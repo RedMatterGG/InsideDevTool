@@ -22,12 +22,20 @@ namespace InsideDev.Play
     // normalised).
     // Install moves the old core's state into the new one (enabled flag, suppressAction, the 100-step command history and
     // the PlayerGrabInput, so a held jump or a tap in progress survives) and keeps the previous core for Uninstall, which
-    // moves the state back. It sets Application.runInBackground (restored by the Restorer key "input"). Tick (main thread,
-    // every frame) and a RuntimeCallbacks.fixedUpdate hook (every logic step) reinstall the core when something else
-    // replaced GameInput.mCore (Playdead SessionManager) and note input_hijacked once per install. Another InsideDev core
-    // (InsideDev.Det.FilmInput, a replay) is never fought: AgentCore steps aside as in human mode. Uninstall does not put
-    // back a foreign core whose owner has finished (its type's static current no longer points to it, FilmInput.cs:19,
-    // 44-49): a fresh GameInput.Core gets the state instead.
+    // moves the state back. It keeps Application.runInBackground on (KeepAlive, restored by the Restorer key "input").
+    // Tick (main thread, every frame while the core is installed, off otherwise) and a RuntimeCallbacks.fixedUpdate hook
+    // (every logic step, also only while installed) reinstall the core when something else replaced GameInput.mCore
+    // (Playdead SessionManager) and note input_hijacked once per install. Another InsideDev core
+    // (InsideDev.Det.FilmInput, a replay) is never fought: Install answers busy while it owns the input, and a core
+    // that is replaced by one steps aside as in human mode. Uninstall does not put back a foreign core whose owner has
+    // finished (its type's static current no longer points to it, FilmInput.cs:19, 44-49): a fresh GameInput.Core gets
+    // the state instead. While an input track records, Uninstall only switches to human mode and keeps the core in
+    // place (it is the recorder's tap on the pad); the uninstall happens when the recording ends.
+    // Held input without a caller: a latch (act hold, ctl hold) and the grip are let go when the body that holds them
+    // dies, is re-created or a load starts (changes note). An optional safety release (dead man, off by default): with
+    // editor.cfg play.hold_timeout_s > 0, when the last use of Play was a client's tool call, held input is let go after
+    // that many seconds without a call while the game runs in realtime and no job runs it, so a client that went away
+    // does not leave the body running (mcp.idle_restore_s also restores it later). Input held with ctl is never timed.
     // Input tracks (ActTrack.cs): while a track plays, UpdateCommand takes the step's frame from ActTrack.Next instead of
     // the queue (the same mix / gate rules apply); CommandReceived hands every fed command to ActTrack.Record while a
     // track records. Describe adds track {recording | playing, step, of} while one of them runs.
@@ -50,15 +58,17 @@ namespace InsideDev.Play
         static GameInput.Core previous;
         static InputFrame lastFed;
         static long lastFedStep = -1, gatedSteps;
-        static bool runInBackgroundSaved, runInBackgroundBefore;
         static FieldInfo fCore, fEnabled, fSuppress, fBuffer, fCursor, fFilled;
-        static bool fieldsLooked;
+        static bool fieldsLooked, uninstallDeferred;
         static volatile int gripBody;
+        static int latchBody, holdCheck;
+        static PlayTick tick;
+        public const double HoldTimeoutDefaultS = 0;
 
-        // main thread from PlayExtension.Start: OnTick("input", Tick)
+        // main thread from PlayExtension.Start; the tick runs only while the core is installed
         public static void Register()
         {
-            PlayRegistry.OnTick("input", Tick);
+            tick = PlayRegistry.OnTick("input", Tick, TickWhen.OnDemand).Critical();
         }
 
         public static AgentCore Instance { get { return instance; } }
@@ -76,6 +86,9 @@ namespace InsideDev.Play
             var inst = instance;
             if (inst == null || !ReferenceEquals(cur, inst))
             {
+                if (IsInsideDevCore(cur) && !Stale(cur))
+                    throw new McpException(McpErr.Busy, "busy: the game input is owned by " + cur.GetType().Name + " (another InsideDev tool, a replay, drives the body)",
+                        "wait for the replay to end, or stop it; nothing was changed");
                 var core = new AgentCore();
                 if (cur != null)
                 {
@@ -90,10 +103,13 @@ namespace InsideDev.Play
                 hijackNoted = false;
             }
             else mode = (int)m;
-            if (m != InputMode.Human) KeepRunningInBackground();
+            uninstallDeferred = false;
+            if (m != InputMode.Human) KeepAlive.Acquire(RestoreKey);
             RegisterRestore();
             EnsureHooks();
             CacheController();
+            var t = tick;
+            if (t != null) t.Active = true;
             if (controllerCache == "Digital")
                 return "controller_digital: the keyboard was the last device used, so the submarine boost and exit, valves, swim climb-out and drop use their keyboard rules (touch a pad or leave the keyboard alone)";
             return null;
@@ -105,6 +121,14 @@ namespace InsideDev.Play
             var inst = instance;
             if (inst == null) return;
             queue.Release();
+            latchBody = 0;
+            if (ActTrack.Recording && ReferenceEquals(CurrentCore(), inst))
+            {
+                mode = (int)InputMode.Human;
+                uninstallDeferred = true;
+                return;
+            }
+            uninstallDeferred = false;
             if (ReferenceEquals(CurrentCore(), inst))
             {
                 var back = previous;
@@ -116,6 +140,15 @@ namespace InsideDev.Play
             instance = null;
             previous = null;
             mode = (int)InputMode.Human;
+            Idle();
+        }
+
+        // main thread: nothing of ours is installed: no step hook, no tick
+        static void Idle()
+        {
+            DropHooks();
+            var t = tick;
+            if (t != null) t.Active = false;
         }
 
         // any thread: append frames; latchLast keeps the last frame applied after the queue empties (hold)
@@ -225,34 +258,83 @@ namespace InsideDev.Play
             return o;
         }
 
-        // main thread, every frame
+        // main thread, every frame while the core is installed
         public static void Tick()
         {
-            EnsureHooks();
-            CacheController();
-            CheckGrip();
             var inst = instance;
-            if (inst == null) return;
+            if (inst == null) { Idle(); return; }
+            if (uninstallDeferred && !ActTrack.Recording) { Uninstall(); return; }
+            CacheController();
+            CheckHeld();
             if (!ReferenceEquals(CurrentCore(), inst)) Reclaim();
-            if (mode != (int)InputMode.Human && !Application.runInBackground) Application.runInBackground = true;
+            if (instance == null) { Idle(); return; }
+            if (mode != (int)InputMode.Human) KeepAlive.Hold();
+            if (++holdCheck >= 30)
+            {
+                holdCheck = 0;
+                DeadMan();
+            }
         }
 
-        static void CheckGrip()
+        // the grip and a latch belong to the body that held them: gone when it dies, is re-created or a load starts
+        static void CheckHeld()
         {
-            if (!queue.Grip) return;
-            string why = null;
+            bool grip = queue.Grip, latch = queue.HasLatch;
+            if (!latch) latchBody = 0;
+            if (!grip && !latch) return;
+            string gripWhy = null, latchWhy = null;
             try
             {
                 var ch = ScriptGlobals.mainCharacter;
-                if (GameManager.IsLoading()) why = "a load started";
-                else if (ch == null) why = "no body";
-                else if (ch.isDead) why = "the body died";
-                else if (ch.GetInstanceID() != gripBody) why = "the body was re-created";
+                int id = ch != null ? ch.GetInstanceID() : 0;
+                bool loading = GameManager.IsLoading(), dead = ch != null && ch.isDead;
+                if (grip)
+                {
+                    if (loading) gripWhy = "a load started";
+                    else if (ch == null) gripWhy = "no body";
+                    else if (dead) gripWhy = "the body died";
+                    else if (id != gripBody) gripWhy = "the body was re-created";
+                }
+                if (latch)
+                {
+                    if (latchBody == 0 && id != 0 && !dead && !loading) latchBody = id;
+                    else if (loading && latchBody != 0) latchWhy = "a load started";
+                    else if (dead && latchBody != 0) latchWhy = "the body died";
+                    else if (latchBody != 0 && id != 0 && id != latchBody) latchWhy = "the body was re-created";
+                }
             }
-            catch (Exception) { why = null; }
-            if (why == null) return;
-            queue.SetGrip(false);
-            Note("note", "grip released: " + why + " (the grab from interact grab ended)");
+            catch (Exception) { return; }
+            if (gripWhy != null)
+            {
+                queue.SetGrip(false);
+                Note("note", "grip released: " + gripWhy + " (the grab from interact grab ended)");
+            }
+            if (latchWhy != null)
+            {
+                latchBody = 0;
+                if (queue.Unlatch()) Note("note", "hold released: " + latchWhy + " (the held input from act hold / ctl hold ended; hold again after the respawn)");
+            }
+        }
+
+        // a client that went away must not leave the body running: release what is held when the last use of Play was a
+        // tool call, the game runs in realtime, no job runs it and nothing called for play.hold_timeout_s seconds
+        static void DeadMan()
+        {
+            if (!queue.Held || !PlayRegistry.LastUseWasTool) return;
+            double limit = HoldTimeoutDefaultS;
+            try { limit = EditorState.Get("play.hold_timeout_s", (float)HoldTimeoutDefaultS); } catch (Exception) { }
+            if (limit <= 0) return;
+            double idle = PlayRegistry.IdleSeconds;
+            if (idle < limit) return;
+            try
+            {
+                if (Stepper.Frozen || Stepper.Clock.WantFrozen || Stepper.Running || ActTrack.Playing) return;
+                if (HostJobs.Running(McpLanes.Control) != null) return;
+            }
+            catch (Exception) { return; }
+            queue.Release();
+            latchBody = 0;
+            Note("note", "hold released: no tool call for " + PlayShared.F(Math.Round(idle)) + " s while the game ran in realtime (editor.cfg play.hold_timeout_s = " + PlayShared.F(limit) + ", 0 = never)");
         }
 
         static void OnFixedStep()
@@ -280,6 +362,8 @@ namespace InsideDev.Play
             {
                 instance = null;
                 previous = null;
+                uninstallDeferred = false;
+                if (ActTrack.Recording) ActTrack.InputLost("the game input was replaced by " + who);
                 return;
             }
             if (other != null)
@@ -303,14 +387,12 @@ namespace InsideDev.Play
             catch (Exception e) { DevLog.Error("[play] AgentCore fixedUpdate hook", e); }
         }
 
-        static void KeepRunningInBackground()
+        static void DropHooks()
         {
-            if (!runInBackgroundSaved)
-            {
-                runInBackgroundSaved = true;
-                runInBackgroundBefore = Application.runInBackground;
-            }
-            if (!Application.runInBackground) Application.runInBackground = true;
+            if (!hooked) return;
+            hooked = false;
+            try { RuntimeCallbacks.fixedUpdate -= OnFixedStep; }
+            catch (Exception) { }
         }
 
         static void RegisterRestore()
@@ -326,15 +408,9 @@ namespace InsideDev.Play
             Release();
             Uninstall();
             string r = was ? "human control" : "human control (already)";
-            if (runInBackgroundSaved)
-            {
-                runInBackgroundSaved = false;
-                if (Application.runInBackground != runInBackgroundBefore)
-                {
-                    Application.runInBackground = runInBackgroundBefore;
-                    r += ", runInBackground " + (runInBackgroundBefore ? "on" : "off");
-                }
-            }
+            if (instance != null) r += " (the core stays in place as the tap of the running input track recording)";
+            string k = KeepAlive.Release(RestoreKey);
+            if (k != null) r += ", " + k;
             return r;
         }
 

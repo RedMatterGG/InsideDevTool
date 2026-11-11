@@ -68,7 +68,17 @@ namespace InsideDev.Play
                     .Arr("savepoints", "op savepoints_near.", Schema.OutOf(Schema.Obj().Str("id", "").Int("subscene", "", -1, 999).Int("savepoint", "", -1, 999)
                         .Str("name", "").Num("dist", "", 0, 1e5).Bool("checkpoint_only", "").Bool("dynamic", "").Bool("enabled", "")), 0, 100)
                     .Arr("warnings", "", Schema.Str(), 0, 20).BuildOutput()).Destructive(), Handle);
-            PlayRegistry.OnTick("saves", Tick);
+            // the guard is read on the main thread: at start, when Play is used again after a quiet stretch (before the
+            // call that woke it goes on) and twice a second while Play is in use
+            PlayRegistry.OnTick("saves", Tick, TickWhen.InUse);
+            PlayRegistry.OnWake(ReadGuard);
+            try { ReadGuard(); } catch { }
+        }
+
+        static void ReadGuard()
+        {
+            ticks = 0;
+            try { guard = EditorState.Get("play.save_guard", false); } catch { }
         }
 
         static ToolResult Handle(Json.Obj a, CallContext ctx)
@@ -153,7 +163,7 @@ namespace InsideDev.Play
 
         public static string BackupPath { get { return backupPath; } }
 
-        // any thread: EditorState play.save_guard (default off), read on the main thread every 30 frames; off = no save
+        // any thread: EditorState play.save_guard (default off), read on the main thread (see Register); off = no save
         // backup, no save confirm, no save refusal, the lock is never kept for a cheat
         public static bool Guard { get { return guard; } }
 
@@ -183,6 +193,7 @@ namespace InsideDev.Play
                     lockedByUs = true;
                     cheatReason = null;
                     RegisterLockUndo();
+                    HookQuit();
                 }
                 return true;
             }
@@ -255,12 +266,16 @@ namespace InsideDev.Play
             public string problem;
         }
 
+        // main thread, every frame while Play is in use
         static void Tick()
         {
-            if (++ticks % 30 == 1)
-            {
-                try { guard = EditorState.Get("play.save_guard", false); } catch { }
-            }
+            if (++ticks % 30 != 1) return;
+            try { guard = EditorState.Get("play.save_guard", false); } catch { }
+        }
+
+        // the quit hook matters only once the lock is ours (OnQuit releases it)
+        static void HookQuit()
+        {
             if (hooked) return;
             hooked = true;
             try { RuntimeCallbacks.applicationQuit += OnQuit; }
@@ -328,7 +343,7 @@ namespace InsideDev.Play
             {
                 Directory.CreateDirectory(dir);
                 string path = BackupNames.Unique(dir, DateTime.Now, File.Exists);
-                File.WriteAllBytes(path, data);
+                SafeFile.WriteAllBytes(path, data, false);
                 return new Backup { path = path, bytes = data.Length, source = source, from = from };
             }
             catch (Exception e) { throw new McpException(McpErr.GameError, "no backup could be made: " + e.GetType().Name + ": " + e.Message, "refusing the save write"); }
@@ -484,7 +499,7 @@ namespace InsideDev.Play
             if (Guard) EnsureBackup(ctx);
             return ToolResult.Ok(ctx.Main(() =>
             {
-                if (PlayLevels.Loading || PlayLevels.GM() == null || PlayLevels.LoadingNow()) throw new McpException(McpErr.Busy, "busy: a load is in progress", "wait_until {ready:true}, then retry");
+                if (PlayLevels.Loading || PlayLevels.GM() == null || PlayLevels.LoadingNow()) throw new McpException(McpErr.Busy, "busy: a load is in progress", PlayShared.WaitReadyCall + ", then retry");
                 if (kind == "secret")
                 {
                     User.Achievement.ResetProgression();
@@ -496,7 +511,7 @@ namespace InsideDev.Play
                     w.Add("restart: new game started (spawn and progression 0:0 in INSIDE.sav; unlocked chapters and orb bits stay)");
                 }
                 GameEventManager.StartNewGame();
-                w.Add("loading: wait_until {ready:true}; at the title the boy waits for a button: menu {op:\"submit\"} starts the intro");
+                w.Add("loading: " + PlayShared.WaitReadyCall + "; at the title the boy waits for a button: menu {op:\"submit\"} starts the intro");
                 return Result("done", true, true, w);
             }));
         }
@@ -506,7 +521,7 @@ namespace InsideDev.Play
             var o = PlayShared.Env();
             o["outcome"] = "done";
             var ch = ScriptGlobals.mainCharacter;
-            if (ch == null) throw new McpException(McpErr.NotReady, "no active character", "wait_until {ready:true}");
+            if (ch == null) throw new McpException(McpErr.NotReady, "no active character", PlayShared.WaitReadyCall);
             var p = ch.transform.position;
             var rows = new List<KeyValuePair<double, Json.Obj>>();
             foreach (var x in UnityEngine.Object.FindObjectsOfType(typeof(Savepoint)))

@@ -11,7 +11,8 @@ namespace InsideDev.Play
     // per-step mix rule of the three modes and the input gate (GameInput disabled or not playing = neutral agent input).
     // Grip: the action button held for a grab (interact grab). While it is on, every step's agent frame has action
     // pressed (queue, latch and neutral alike), so the next act / move_to does not drop the grab. Release() clears it
-    // with the rest; ReleaseKeepGrip() clears only the queue and the latch; SetGrip(false) only the grip.
+    // with the rest; ReleaseKeepGrip() clears only the queue and the latch; SetGrip(false) only the grip; Unlatch() only
+    // the latch (queued frames go on).
     public enum InputMode { Human, Agent, Mix }
 
     public struct InputFrame
@@ -175,6 +176,22 @@ namespace InsideDev.Play
         }
 
         public bool Idle { get { lock (gate) return queued == 0 && !hasLatch && !grip; } }
+
+        public bool HasLatch { get { lock (gate) return hasLatch; } }
+        // something stays pressed without a caller feeding it (a latch or the grip)
+        public bool Held { get { lock (gate) return hasLatch || grip; } }
+
+        // drop the latched frame only; true when there was one
+        public bool Unlatch()
+        {
+            lock (gate)
+            {
+                bool had = hasLatch;
+                hasLatch = false;
+                latch = default(InputFrame);
+                return had;
+            }
+        }
 
         public long Consumed { get { lock (gate) return consumed; } }
         public long FromQueue { get { lock (gate) return fromQueue; } }

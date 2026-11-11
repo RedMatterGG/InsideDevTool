@@ -598,14 +598,19 @@ namespace InsideDev.Play
                     PlayMakerFSM fsm = null;
                     if (existing.fsmIn != null) fsm = existing.fsmIn.Owner as PlayMakerFSM;
                     Disconnect(existing);
-                    World.Restore(key, "signal unwire " + label, () =>
-                    {
-                        if (from == null || to == null) return "endpoints gone";
-                        if (FindWire(from, output, to, input) != null) return "already wired again";
-                        World.Signals().CreateConnection(from, output, to, input, fsm);
-                        return "wired again";
-                    });
-                    r["note"] = "unwired " + label;
+                    string wireKey = "logic:wire:" + from.GetInstanceID() + "." + output + ">" + to.GetInstanceID() + "." + input;
+                    bool ours = false;
+                    try { ours = Restorer.IsSet(wireKey); } catch (NotImplementedException) { }
+                    if (ours) World.Forget(wireKey);
+                    else
+                        World.Restore(key, "signal unwire " + label, () =>
+                        {
+                            if (from == null || to == null) return "endpoints gone";
+                            if (FindWire(from, output, to, input) != null) return "already wired again";
+                            World.Signals().CreateConnection(from, output, to, input, fsm);
+                            return "wired again";
+                        });
+                    r["note"] = "unwired " + label + (ours ? " (a wire made through MCP: nothing left to undo)" : "");
                 }
                 var now = FindWire(from, output, to, input);
                 r["after"] = now != null ? "wired" : "not wired";
@@ -681,53 +686,67 @@ namespace InsideDev.Play
             new KeyValuePair<Type, string>(typeof(JetCrate), "jetcrate"), new KeyValuePair<Type, string>(typeof(PersistentBool), "flag"),
         };
 
+        static readonly Dictionary<Type, int> interactIndex = new Dictionary<Type, int>();
+
+        // the InteractTypes row of a component class (the class itself, else the first listed base class), -1 = none
+        static int InteractRow(Type t)
+        {
+            int i;
+            if (interactIndex.TryGetValue(t, out i)) return i;
+            i = -1;
+            for (int k = 0; k < InteractTypes.Length && i < 0; k++) if (InteractTypes[k].Key == t) i = k;
+            for (int k = 0; k < InteractTypes.Length && i < 0; k++) if (InteractTypes[k].Key.IsAssignableFrom(t)) i = k;
+            interactIndex[t] = i;
+            return i;
+        }
+
+        // one main-thread item and one pass over the active scripts (every row comes from the same frame)
         static ToolResult InteractablesNear(Json.Obj a, CallContext ctx)
         {
             var kinds = Kinds(a);
             float radius = (float)PlayShared.Num(a, "radius", 15);
             string filter = PlayShared.Str(a, "filter", null), spec = PlayShared.Str(a, "object", null);
             int limit = PlayShared.Int(a, "limit", 40), offset = PlayShared.Int(a, "offset", 0);
-            Vector3 center = Vector3.zero;
-            World.Ports ports = null;
-            ctx.MainDo(() => { center = World.Center(spec); ports = World.ScanPorts(); });
             var rows = new List<KeyValuePair<float, Json.Obj>>();
             float r2 = radius * radius;
-            foreach (var kv0 in InteractTypes)
+            ctx.MainDo(() =>
             {
-                var kv = kv0;
-                if (kinds.Count > 0 && !kinds.Contains(kv.Value)) continue;
-                ctx.MainDo(() =>
+                Vector3 center = World.Center(spec);
+                World.Ports ports = World.ScanPorts();
+                var all = UnityEngine.Object.FindObjectsOfType(typeof(MonoBehaviour));
+                if (all == null) return;
+                foreach (var x in all)
                 {
-                    var all = UnityEngine.Object.FindObjectsOfType(kv.Key) as MonoBehaviour[];
-                    if (all == null) return;
-                    foreach (var c in all)
+                    var c = x as MonoBehaviour;
+                    if (c == null) continue;
+                    int at = InteractRow(c.GetType());
+                    if (at < 0) continue;
+                    var kv = InteractTypes[at];
+                    if (kinds.Count > 0 && !kinds.Contains(kv.Value)) continue;
+                    var p = c.transform.position;
+                    if ((p - center).sqrMagnitude > r2) continue;
+                    if (!NameMatch(filter, c.gameObject.name, kv.Key.Name)) continue;
+                    var row = new Json.Obj();
+                    row["id"] = World.Id(c.gameObject, "o");
+                    row["kind"] = kv.Value;
+                    row["class"] = kv.Key.Name;
+                    row["name"] = c.gameObject.name;
+                    row["path"] = World.Path(c.gameObject);
+                    World.Dist(row, p, center);
+                    var pb = c as PersistentBool;
+                    if (pb != null)
                     {
-                        if (c == null) continue;
-                        var p = c.transform.position;
-                        if ((p - center).sqrMagnitude > r2) continue;
-                        if (!NameMatch(filter, c.gameObject.name, kv.Key.Name)) continue;
-                        var row = new Json.Obj();
-                        row["id"] = World.Id(c.gameObject, "o");
-                        row["kind"] = kv.Value;
-                        row["class"] = kv.Key.Name;
-                        row["name"] = c.gameObject.name;
-                        row["path"] = World.Path(c.gameObject);
-                        World.Dist(row, p, center);
-                        var pb = c as PersistentBool;
-                        if (pb != null)
-                        {
-                            row["state"] = "value=" + (pb.current ? "true" : "false");
-                            row["flag"] = pb.booleanName;
-                            row["unique_id"] = pb.uniqueID;
-                        }
-                        else row["state"] = World.ShortState(c);
-                        row["inputs"] = World.PortNames(ports.In(c.gameObject));
-                        row["outputs"] = World.PortNames(ports.Out(c.gameObject));
-                        row["wires_out"] = (double)ports.From(c.gameObject).Count;
-                        rows.Add(new KeyValuePair<float, Json.Obj>((p - center).magnitude, row));
+                        row["state"] = "value=" + (pb.current ? "true" : "false");
+                        row["flag"] = pb.booleanName;
+                        row["unique_id"] = pb.uniqueID;
                     }
-                });
-            }
+                    else row["state"] = World.ShortState(c);
+                    row["inputs"] = World.PortNames(ports.In(c.gameObject));
+                    row["outputs"] = World.PortNames(ports.Out(c.gameObject));
+                    row["wires_out"] = (double)ports.From(c.gameObject).Count;
+                    rows.Add(new KeyValuePair<float, Json.Obj>((p - center).magnitude, row));
+                }
+            });
             rows.Sort((x, y) => x.Key.CompareTo(y.Key));
             var list = new List<Json.Obj>();
             foreach (var kv in rows) list.Add(kv.Value);

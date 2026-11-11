@@ -10,7 +10,9 @@ namespace InsideDev.Play
     // UI switches without a mouse (report 03 section 3). Navigation = ExecuteEvents on
     // EventSystem.current.currentSelectedGameObject (submitHandler, cancelHandler, an INavigationHandler function with
     // MenuInputModule.NavigationEventData, MenuExecuteEvents.toggleGameMenuHandler), open / close = MenuManager.Open /
-    // CloseAll. Item ids are "m<n>", valid until the next menu state change. Destructive items (Quit and its confirm,
+    // CloseAll. Item ids are "m<n>": an item keeps its id across menu states, and an id whose item is not in the current
+    // state is refused as stale_id (it never selects another item). A menu that op open opened is closed again by
+    // restore (key "menu_open", dropped as soon as the menu closes). Destructive items (Quit and its confirm,
     // Reset To Defaults, a chapter load over progress, Savepoints cheat) are hidden and refused without
     // allow_destructive. Menus run on unscaled time, so they work while the game is frozen.
     // More rules: Yes in the quit confirm is refused even with allow_destructive (no tool quits the game); raising the
@@ -58,6 +60,8 @@ namespace InsideDev.Play
                     .OutObj("chapter", "Chapter menu selection.", Schema.Obj().Int("index", "", 0, 99).Str("name", "").Bool("unlocked", ""))
                     .Arr("warnings", "", Schema.Str(), 0, 20).BuildOutput()), HandleMenu);
 
+            openTick = PlayRegistry.OnTick("menu_open", WatchOpened, TickWhen.OnDemand);
+
             PlayRegistry.Add(PlayShared.Def("ui", "UI switches", PlayShared.Dev, Owner,
                 "Game UI switches: menu_lock (MenuManager.reserveMenu: Esc does nothing), title_hide (TitleManager.HideAll), overlay_text (MessageOverlay.Show), settings (volume 0 only = mute, brightness, rumble, fullscreen, resolution; brightness / rumble write INSIDE.sav), message_answer (storage error prompt), savepoint_menu (Playdead's dev savepoint picker, INFERRED; it reads the physical controller).",
                 Schema.Obj().Enum("op", "menu_lock, title_hide, overlay_text, settings, message_answer or savepoint_menu.", null,
@@ -77,6 +81,27 @@ namespace InsideDev.Play
         // ---------------------------------------------------------------- menu
         static readonly MenuIdTable ids = new MenuIdTable();
         static readonly object idGate = new object();
+        static PlayTick openTick;
+        const string OpenKey = "menu_open";
+
+        // main thread, every frame while a menu that op open opened is up: once it closes (the player, the game or op
+        // close) restore has nothing to close any more, and must not close a menu the player opens later
+        static void WatchOpened()
+        {
+            bool open = false;
+            try { open = MenuManager.isActive; } catch { }
+            if (open) return;
+            Restorer.Forget(OpenKey);
+            if (openTick != null) openTick.Active = false;
+        }
+
+        static string CloseOpened()
+        {
+            if (openTick != null) openTick.Active = false;
+            if (!MenuOpen()) return "the menu was closed already";
+            MenusUi.CloseAll();
+            return "pause menu closed";
+        }
 
         sealed class PressPlan
         {
@@ -109,7 +134,12 @@ namespace InsideDev.Play
             }
             if (op == "close")
             {
-                ctx.MainDo(() => { if (MenuOpen()) MenusUi.CloseAll(); else w.Add("close: no menu was open"); });
+                ctx.MainDo(() =>
+                {
+                    if (MenuOpen()) MenusUi.CloseAll(); else w.Add("close: no menu was open");
+                    Restorer.Forget(OpenKey);
+                    if (openTick != null) openTick.Active = false;
+                });
                 ctx.WaitFrames(2, 2000);
                 return ToolResult.Ok(ctx.Main(() => State("done", allow, w)));
             }
@@ -179,6 +209,8 @@ namespace InsideDev.Play
             MenusUi.Open();
             MenusUi.Pump();
             if (!MenuOpen()) { w.Add("open: MenuManager.Open did not open the menu"); return "refused"; }
+            Restorer.Register(OpenKey, "pause menu opened by menu {op:\"open\"}", CloseOpened);
+            if (openTick != null) openTick.Active = true;
             return "done";
         }
 
@@ -251,7 +283,7 @@ namespace InsideDev.Play
             MenusUi.Pump();
             if (info.type == "ChapterUIMenuItem" && op == "submit")
             {
-                w.Add("chapter: the chapter load started; it writes INSIDE.sav" + (Saves.BackupPath != null ? " (backup " + Saves.BackupPath + ")" : "") + "; wait_until {ready:true}");
+                w.Add("chapter: the chapter load started; it writes INSIDE.sav" + (Saves.BackupPath != null ? " (backup " + Saves.BackupPath + ")" : "") + "; " + PlayShared.WaitReadyCall);
                 return "loading";
             }
             if ((info.type == "BrightnessMenuItem" || info.type == "RumbleMenuItem") && op != "up" && op != "down") w.Add("settings: " + (info.type == "BrightnessMenuItem" ? "brightness" : "rumble") + " is stored in INSIDE.sav");
@@ -381,7 +413,8 @@ namespace InsideDev.Play
             {
                 var c = (Component)comps[k];
                 var info = Describe(c);
-                string id = "m" + (k + 1);
+                string id;
+                lock (idGate) id = ids.IdOf(c) ?? "m" + (k + 1);
                 bool isSel = c == selectedItem;
                 if (isSel) selectedId = id;
                 if (info.kind == MenuKinds.Chapter && isSel) chapter = ChapterJson(c);
@@ -599,7 +632,7 @@ namespace InsideDev.Play
                 {
                     ctx.Main(() =>
                     {
-                        if (PlayLevels.Loading) throw new McpException(McpErr.Busy, "busy: a load is in progress", "wait_until {ready:true}");
+                        if (PlayLevels.Loading) throw new McpException(McpErr.Busy, "busy: a load is in progress", PlayShared.WaitReadyCall);
                         if (!GameManager.GameIsStarted()) throw new McpException(McpErr.NotReady, "the game is still booting");
                         if (SavepointsMenu() == null) throw new McpException(McpErr.NotFound, "the Savepoints Menu item is not in the menu tree");
                         return true;
@@ -648,10 +681,22 @@ namespace InsideDev.Play
             if ((hasBri || hasRum) && guard) Saves.EnsureBackup(ctx);
             return ToolResult.Ok(ctx.Main(() =>
             {
+                // every argument is checked before the first write: a bad one changes nothing
+                if (hasRes)
+                {
+                    int n = ScreenSettings.resolutionCount;
+                    if (res < 0 || res >= n) throw new McpException(McpErr.BadArgs, "resolution " + res + " is out of range (0.." + (n - 1) + ")", "nothing was changed");
+                }
                 if (hasVol)
                 {
+                    float was = GameSystem.Settings.volume.value;
                     GameSystem.Settings.volume.value = 0f;
-                    w.Add("volume: 0 (muted, stored in the registry); restore never raises it");
+                    if (was > 0f)
+                    {
+                        volumeWas = was;
+                        Restorer.Keep("settings:volume", VolumeNote);
+                    }
+                    w.Add("volume: 0 (muted, stored in the registry" + (was > 0f ? ", was " + PlayShared.F(was) : "") + "); restore never raises it");
                 }
                 if (hasBri)
                 {
@@ -675,8 +720,6 @@ namespace InsideDev.Play
                 }
                 if (hasRes)
                 {
-                    int n = ScreenSettings.resolutionCount;
-                    if (res < 0 || res >= n) throw new McpException(McpErr.BadArgs, "resolution " + res + " is out of range (0.." + (n - 1) + ")");
                     int orig = ScreenSettings.GetCurrentResolutionIndex();
                     ScreenSettings.SetResolution(res);
                     if (orig >= 0) PlayLevels.Reg("settings:resolution", "screen resolution", () => { ScreenSettings.SetResolution(orig); return "resolution back to " + ScreenSettings.GetResolutionName(orig); });
@@ -684,6 +727,17 @@ namespace InsideDev.Play
                 }
                 return UiResult("done", w);
             }));
+        }
+
+        static float volumeWas;
+
+        // main thread: the line restore lists in kept while the mute of ui settings is still in force
+        static string VolumeNote()
+        {
+            float now = 0f;
+            try { now = GameSystem.Settings.volume.value; } catch { return null; }
+            if (now > 0f) return null;
+            return "master volume 0, was " + PlayShared.F(volumeWas) + ": restore never raises the volume, raise it in the game's menu";
         }
 
         static Json.Obj UiResult(string outcome, List<string> warnings)

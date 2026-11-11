@@ -4,8 +4,9 @@ using System.Collections.Generic;
 namespace InsideDev.Play
 {
     // NavigatorLoop.cs (owner NAV): the pure per-step controller of move_to, tested offline in qa/mcp/NAV. Navigator reads
-    // the body into a NavBody after every logic step (Stepper stopCheck, main thread), NavLoop.Step decides the input for
-    // the next step (cmd: stick + jump level) from the body and the planned NavRoute, and returns a stop code or null:
+    // the body into a NavBody after every logic step (Stepper stopCheck, main thread; never twice for one step: every
+    // counter below is in logic steps), NavLoop.Step decides the input for the next step (cmd: stick + jump level) from
+    // the body and the planned NavRoute, and returns a stop code or null:
     //   arrived | blocked:<reason> | fell | died | lost | replan (the worker slices and plans again, then continues)
     // Game rules it follows (report 02 section 2.2): stick |x| > 0.8 runs; jump is a rising edge (one released step
     // before every press) and holding it gives the full height; at a ledge hang stick up (looseDir.y > 0.5) climbs; an
@@ -56,6 +57,8 @@ namespace InsideDev.Play
         public int steps, replans;
         public string phase = "walk";
         int phaseSteps, jumpTimer, retries, settle, faceSteps, edgeReplans, stuckReplans, noProgress;
+        // gap jumps that turned around: a goal inside a gap makes the body jump it back and forth
+        int gapReversals; float lastGapDir;
         float lastGroundY, airStartY, expectedDrop, jumpStartY, jumpLandY, progressX, progressY;
         bool haveGround, haveProgress, pressedThisJump;
         string jumpKind;
@@ -275,7 +278,17 @@ namespace InsideDev.Play
                         break;
                     case "jump_gap":
                         mag = Math.Max(mag, 1f);
-                        if (dm <= 0.3f || (b.Edge(dir) && b.EdgeDist(dir) < 0.3f)) { StartJump(m, b, dir); Set(dir, 0f, false); return null; }
+                        if (dm <= 0.3f || (b.Edge(dir) && b.EdgeDist(dir) < 0.3f))
+                        {
+                            if (lastGapDir != 0f && lastGapDir != dir && ++gapReversals >= 2)
+                            {
+                                Set(0f, 0f, false);
+                                Note("the goal x=" + PlayShared.F(goal.x) + " lies in a gap: stopped at its edge");
+                                return adg <= 1.0f ? Stop("arrived") : "blocked:goal_in_gap";
+                            }
+                            lastGapDir = dir;
+                            StartJump(m, b, dir); Set(dir, 0f, false); return null;
+                        }
                         break;
                     case "ladder":
                         if (Math.Abs(m.x - b.x) < 0.25f)

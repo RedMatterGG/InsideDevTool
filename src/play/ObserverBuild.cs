@@ -11,24 +11,27 @@ namespace InsideDev.Play
     // disabled while playing, or a scripted custom animation), in_world. Ready = PlayLevels.Ready (own predicate when
     // WORLD_A is not built: playing, title gone, fader done, input enabled, body active) plus body alive and no menu.
     // Extra output fields: body.depth (full), objects[].state "in_reach", truncated in concise when the budget cut
-    // something, perf {main_ms, scan_*} (full), warnings scan_pending / reflection_missing.
+    // something, perf {main_ms, sections_ms, scan_*} (full), warnings scan_stale / reflection_missing.
+    // Build runs in one main-thread item: it first brings the component lists up to date (Perception.RefreshIfStale),
+    // so the objects and hazards of every observation, the one inside an action result included, are the ones that
+    // exist at that moment. Events, the no-progress counter and the delta base are per client (View, PpcXObserve.cs).
     public static partial class Observer
     {
-        static readonly StuckCounter stuck = new StuckCounter();
-        static readonly HashSet<string> stuckSeen = new HashSet<string>();
-        static long eventsCursor;
-        static long stuckMark;
-        static string stuckCheckpoint;
-
         static Json.Obj Build(ObserveOptions o, bool actionResult)
         {
             var sw = Stopwatch.StartNew();
             ChangeLog.Touch();
-            bool full = o.detail == "full";
+            bool full = o.detail == "full", delta = o.detail == "delta";
+            bool wide = full || delta;
+            var view = ViewFor(o.session);
             var warnings = new List<object>();
+            Json.Obj times = full ? new Json.Obj() : null;
             var r = new Json.Obj();
             r["frame"] = (double)Time.frameCount;
             r["step"] = (double)LogicManager.stepCount;
+            bool scanned = false;
+            Safe(warnings, times, sw, "scan", () => scanned = Perception.RefreshIfStale(Perception.BuildSteps));
+            double t0 = sw.Elapsed.TotalMilliseconds;
             string reason;
             bool ready = ReadyNow(out reason);
             string screen = ScreenNow();
@@ -36,11 +39,12 @@ namespace InsideDev.Play
             r["ready"] = ready;
             r["reason"] = ready ? "" : reason;
             if (!ready) { string next = PlayShared.NextFor(reason, screen); if (next != null) r["next"] = next; }
-            Safe(warnings, "time", () => r["time"] = TimeBlock());
+            if (times != null) times["ready"] = PlayShared.R(sw.Elapsed.TotalMilliseconds - t0, 2);
+            Safe(warnings, times, sw, "time", () => r["time"] = TimeBlock());
             Perception.Ctl c = null;
             Json.Obj body = null;
-            Safe(warnings, "body", () => { c = Perception.Controlled(); body = Perception.Body(full); if (body != null) r["body"] = body; });
-            Safe(warnings, "checkpoint", () => { var cp = Checkpoint(full); if (cp != null) r["checkpoint"] = cp; });
+            Safe(warnings, times, sw, "body", () => { c = Perception.Controlled(); body = Perception.Body(full); if (body != null) r["body"] = body; });
+            Safe(warnings, times, sw, "checkpoint", () => { var cp = Checkpoint(full); if (cp != null) r["checkpoint"] = cp; });
 
             var lt = new Latest { epoch = ids.Epoch, frame = Time.frameCount };
             int objTotal = 0, hazTotal = 0;
@@ -53,101 +57,116 @@ namespace InsideDev.Play
                 lt.bodyId = body != null ? body.Str("id", null) : null;
                 float radius = Mathf.Clamp(o.radius, 1f, 60f);
                 int maxObj = Mathf.Clamp(o.maxObjects, 0, 40);
-                Safe(warnings, "objects", () =>
+                Safe(warnings, times, sw, "objects", () =>
                 {
                     lt.objects = Perception.ObjectsCounted(c.pos, radius, maxObj, out objTotal);
-                    foreach (var x in lt.objects) objs.Add(ObjJson(x, full));
+                    foreach (var x in lt.objects) objs.Add(ObjJson(x, full, wide));
                 });
-                Safe(warnings, "hazards", () =>
+                Safe(warnings, times, sw, "hazards", () =>
                 {
                     lt.hazards = Perception.HazardsCounted(c.pos, Mathf.Max(radius, 20f), full ? 20 : 6, out hazTotal);
-                    foreach (var x in lt.hazards) hazs.Add(HazJson(x, full));
+                    foreach (var x in lt.hazards) hazs.Add(HazJson(x, full, wide));
                 });
             }
             latest = lt;
+            int objListed = objs.Count, hazListed = hazs.Count;
+            Json.Obj deltaInfo = null, gone = null;
+            if (delta) Safe(warnings, times, sw, "delta", () => deltaInfo = DeltaRows(view, lt, objs, hazs, out gone));
+            bool partial = deltaInfo != null && !(deltaInfo["full"] is bool && (bool)deltaInfo["full"]);
             r["objects"] = objs;
             r["hazards"] = hazs;
+            if (gone != null) r["gone"] = gone;
 
             int evCut = 0;
             var evl = new List<object>();
-            Safe(warnings, "events", () =>
+            Safe(warnings, times, sw, "events", () =>
             {
                 long upTo;
-                var evs = ChangeLog.EventsForObserve(eventsCursor, actionResult ? 8 : 20, actionResult, out evCut, out upTo);
-                eventsCursor = upTo;
+                var evs = ChangeLog.EventsForObserve(view.eventsCursor, actionResult ? 8 : 20, actionResult, out evCut, out upTo);
+                view.eventsCursor = upTo;
                 foreach (var e in evs) evl.Add(e);
             });
             r["events"] = evl;
 
-            if (actionResult) Safe(warnings, "stuck", () => UpdateStuck(c, r["checkpoint"] as Json.Obj));
+            if (actionResult) Safe(warnings, times, sw, "stuck", () => UpdateStuck(view, c, r["checkpoint"] as Json.Obj));
             var st = new Json.Obj();
-            st["calls_without_progress"] = (double)stuck.Count;
-            if (stuck.Deaths > 0) st["deaths_here"] = (double)stuck.Deaths;
-            string hint = stuck.Hint();
+            st["calls_without_progress"] = (double)view.stuck.Count;
+            if (view.stuck.Deaths > 0) st["deaths_here"] = (double)view.stuck.Deaths;
+            string hint = view.stuck.Hint();
             if (hint != null) st["hint"] = hint;
             r["stuck"] = st;
 
-            Safe(warnings, "warnings", () => Warnings(warnings, c));
+            Safe(warnings, times, sw, "warnings", () => Warnings(warnings, c));
             r["warnings"] = warnings;
+            if (deltaInfo != null) r["delta"] = deltaInfo;
 
             if (full)
             {
-                Safe(warnings, "input", () => r["input"] = InputBlock());
-                Safe(warnings, "bodies", () =>
+                Safe(warnings, times, sw, "input", () => r["input"] = InputBlock());
+                Safe(warnings, times, sw, "bodies", () =>
                 {
                     var bl = new List<object>();
                     foreach (var b in Perception.Bodies()) bl.Add(BodyJson(b));
                     r["bodies"] = bl;
                 });
-                Safe(warnings, "menu", () => r["menu"] = MenuBlock());
-                Safe(warnings, "camera", () => r["camera"] = CameraBlock());
+                Safe(warnings, times, sw, "menu", () => r["menu"] = MenuBlock());
+                Safe(warnings, times, sw, "camera", () => r["camera"] = CameraBlock());
                 var tr = new Json.Obj();
-                if (objTotal > objs.Count) tr["objects"] = (double)(objTotal - objs.Count);
-                if (hazTotal > hazs.Count) tr["hazards"] = (double)(hazTotal - hazs.Count);
+                if (objTotal > objListed) tr["objects"] = (double)(objTotal - objListed);
+                if (hazTotal > hazListed) tr["hazards"] = (double)(hazTotal - hazListed);
                 if (evCut > 0) tr["events"] = (double)evCut;
                 r["truncated"] = tr;
-                Safe(warnings, "perf", () =>
+                Safe(warnings, null, sw, "perf", () =>
                 {
                     var perf = Perception.Perf();
+                    perf["scanned_now"] = scanned;
+                    perf["ids_live"] = (double)ids.Count;
+                    perf["ids_carried"] = (double)IdsCarried;
+                    perf["sections_ms"] = times;
                     perf["main_ms"] = PlayShared.R(sw.Elapsed.TotalMilliseconds, 2);
                     r["perf"] = perf;
                 });
             }
             else
             {
-                if (objTotal > objs.Count) JsonEdit.AddTruncated(r, "objects", objTotal - objs.Count);
-                if (hazTotal > hazs.Count) JsonEdit.AddTruncated(r, "hazards", hazTotal - hazs.Count);
+                if (objTotal > objListed) JsonEdit.AddTruncated(r, "objects", objTotal - objListed);
+                if (hazTotal > hazListed) JsonEdit.AddTruncated(r, "hazards", hazTotal - hazListed);
                 if (evCut > 0) JsonEdit.AddTruncated(r, "events", evCut);
                 ConciseBudget.Fit(r, ConciseBudget.MaxChars);
             }
+            Safe(warnings, null, sw, "base", () => Remember(view, r, lt, partial));
             return r;
         }
 
-        // one section of the observation; a game exception there becomes a warning instead of failing observe
-        static void Safe(List<object> warnings, string section, Action fn)
+        // one section of the observation; a game exception there becomes a warning instead of failing observe. times
+        // (full only) gets the milliseconds the section took.
+        static void Safe(List<object> warnings, Json.Obj times, Stopwatch sw, string section, Action fn)
         {
+            double t0 = times != null ? sw.Elapsed.TotalMilliseconds : 0;
             try { fn(); }
             catch (Exception e)
             {
                 if (warnings.Count < 12) warnings.Add("section_failed: " + section + ": " + e.GetType().Name + ": " + StateNames.Clip(e.Message, 120));
             }
+            if (times != null) times[section] = PlayShared.R(sw.Elapsed.TotalMilliseconds - t0, 2);
         }
 
         // progress = new ground, a new checkpoint or a near-body event not seen before at this checkpoint (ChangeLog
         // NovelSince); deaths since the last update are counted per checkpoint
-        static void UpdateStuck(Perception.Ctl c, Json.Obj cp)
+        static void UpdateStuck(View v, Perception.Ctl c, Json.Obj cp)
         {
             string key = cp != null ? ((int)cp.Num("subscene", -1)).ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + ((int)cp.Num("savepoint", -1)).ToString(System.Globalization.CultureInfo.InvariantCulture) : null;
-            if (key != null && key != stuckCheckpoint) { stuckSeen.Clear(); stuckCheckpoint = key; }
-            bool changed = ChangeLog.NovelSince(stuckMark, stuckSeen) > 0;
-            int deaths = ChangeLog.CountSince(stuckMark, ChangeLog.DeathTypes);
-            stuck.Guide = cp != null ? cp.Str("guide", null) : null;
-            if (c != null) stuck.Update(true, c.pos.x, c.pos.y, c.pos.z, changed, key, deaths);
-            else stuck.Update(false, 0, 0, 0, changed, key, deaths);
-            stuckMark = ChangeLog.Seq;
+            if (key != null && key != v.stuckCheckpoint) { v.stuckSeen.Clear(); v.stuckCheckpoint = key; }
+            bool changed = ChangeLog.NovelSince(v.stuckMark, v.stuckSeen) > 0;
+            int deaths = ChangeLog.CountSince(v.stuckMark, ChangeLog.DeathTypes);
+            v.stuck.Guide = cp != null ? cp.Str("guide", null) : null;
+            if (c != null) v.stuck.Update(true, c.pos.x, c.pos.y, c.pos.z, changed, key, deaths);
+            else v.stuck.Update(false, 0, 0, 0, changed, key, deaths);
+            v.stuckMark = ChangeLog.Seq;
         }
 
-        static Json.Obj ObjJson(ObjInfo x, bool full)
+        // world = also the absolute position (full and delta): x = body.x + dx at the moment of the observation
+        static Json.Obj ObjJson(ObjInfo x, bool full, bool world)
         {
             var o = new Json.Obj();
             o["id"] = x.id;
@@ -157,13 +176,14 @@ namespace InsideDev.Play
             o["dy"] = PlayShared.R(x.dy);
             if (Math.Abs(x.dz) >= 0.01f) o["dz"] = PlayShared.R(x.dz);
             o["dist"] = PlayShared.R(x.dist);
+            if (world) { o["x"] = PlayShared.R(x.pos.x); o["y"] = PlayShared.R(x.pos.y); }
             if (x.actions.Count > 0 || full) o["actions"] = PlayShared.L(x.actions);
             if (!string.IsNullOrEmpty(x.state)) o["state"] = x.state;
             if (full) o["path"] = x.path;
             return o;
         }
 
-        static Json.Obj HazJson(HazardInfo x, bool full)
+        static Json.Obj HazJson(HazardInfo x, bool full, bool world)
         {
             var o = new Json.Obj();
             o["id"] = x.id;
@@ -172,6 +192,7 @@ namespace InsideDev.Play
             o["dx"] = PlayShared.R(x.dx);
             o["dy"] = PlayShared.R(x.dy);
             o["dist"] = PlayShared.R(x.dist);
+            if (world) { o["x"] = PlayShared.R(x.pos.x); o["y"] = PlayShared.R(x.pos.y); }
             o["state"] = x.state ?? "";
             o["eta_s"] = x.etaS < 0 ? -1.0 : PlayShared.R(x.etaS, 1);
             o["threat"] = x.threat;
@@ -374,7 +395,8 @@ namespace InsideDev.Play
             if (installed && ObserverLinks.Controller() == "Digital") w.Add("controller_digital: the keyboard was used, swim / valve / submarine input branches differ");
             string focus = ObserverLinks.FocusState();
             if (focus != null) w.Add(focus);
-            if (Perception.ScanPending) w.Add("scan_pending: some object types were not rescanned since the last load");
+            string stale = Perception.StaleWarning();
+            if (stale != null) w.Add(stale);
             if (Perception.Failures.Count > 0) w.Add("perception_failed: " + StateNames.Clip(Perception.Failures[0], 140) + (Perception.Failures.Count > 1 ? " (+" + (Perception.Failures.Count - 1) + ")" : ""));
             if (Perception.MissingMembers.Count > 0) w.Add("reflection_missing: " + Perception.MissingMembers[0] + (Perception.MissingMembers.Count > 1 ? " (+" + (Perception.MissingMembers.Count - 1) + ")" : ""));
             if (Perception.MissingTypes.Count > 0) w.Add("types_missing: " + string.Join(", ", Perception.MissingTypes.ToArray()) + " (not in this game build: not scanned)");

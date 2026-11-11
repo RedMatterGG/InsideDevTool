@@ -27,6 +27,7 @@ namespace InsideDev.Play
             var warnings = new List<string>();
             var r = Result(warnings);
             GameObject clone = null;
+            bool made = false;
             ctx.MainDo(() =>
             {
                 var orig = World.Target(PlayShared.Str(a, "object", null), "object");
@@ -49,6 +50,8 @@ namespace InsideDev.Play
                 clone = Dynamics.Create(orig, p, q);
                 if (clone == null) throw new McpException(McpErr.GameError, "Dynamics.Create returned nothing");
                 clone.name = orig.name + " (mcp clone)";
+                made = true;
+                Perception.InvalidateAll();
                 int calls = 0, errors = 0, comps = 0;
                 if (pre)
                 {
@@ -76,6 +79,7 @@ namespace InsideDev.Play
                 {
                     if (go == null) return "already gone (cleared by a load)";
                     UnityEngine.Object.Destroy(go);
+                    Perception.InvalidateAll();
                     return "destroyed";
                 });
                 var row = new Json.Obj();
@@ -92,7 +96,7 @@ namespace InsideDev.Play
             bool later = k > 0 && World.WaitVerify(ctx, k, warnings);
             bool alive = false;
             if (later) ctx.MainDo(() => { alive = clone != null; if (alive) r["after_k"] = PlayShared.V(clone.transform.position); });
-            r["verdict"] = ReflectValues.Verdict(clone != null, true, k > 0, later, alive);
+            r["verdict"] = ReflectValues.Verdict(made, true, k > 0, later, alive);
             r["note"] = "clone under _Dynamics: it is destroyed by the next load (or by restore); streaming never culls it";
             Finish(r, warnings);
             return ToolResult.Ok(r);
@@ -128,6 +132,7 @@ namespace InsideDev.Play
             var warnings = new List<string>();
             var r = Result(warnings);
             Rigidbody rb = null;
+            bool found = false;
             var now = new List<string>();
             ctx.MainDo(() =>
             {
@@ -136,6 +141,7 @@ namespace InsideDev.Play
                 if (rb == null) rb = go.GetComponentInChildren<Rigidbody>();
                 if (rb == null) rb = go.GetComponentInParent<Rigidbody>();
                 if (rb == null) throw new McpException(McpErr.NotFound, World.Path(go) + " has no Rigidbody", "body_set moves physics objects (crates, debris); body {op:\"teleport\"} moves characters");
+                found = true;
                 if (rb.GetComponentInParent<Character>() != null) warnings.Add("this rigidbody belongs to a character: its controller overwrites it every step");
                 r["before"] = RbState(rb);
                 if (hasKin)
@@ -165,7 +171,7 @@ namespace InsideDev.Play
                     r["after_k"] = RbState(rb);
                     if (hasKin && rb.isKinematic != kin) sameK = false;
                 });
-            r["verdict"] = ReflectValues.Verdict(rb != null, now.Count == 0, k > 0 && hasKin, readK, sameK);
+            r["verdict"] = ReflectValues.Verdict(found, now.Count == 0, k > 0 && hasKin, readK, sameK);
             if (now.Count > 0) r["note"] = "not applied: " + string.Join(", ", now.ToArray());
             else r["note"] = "velocities change by physics as soon as time runs; the verdict checks them right after the write and kinematic after verify_frames";
             Finish(r, warnings);
@@ -206,13 +212,14 @@ namespace InsideDev.Play
             var r = Result(warnings);
             Animation anim = null;
             string name = null;
-            bool sameNow = true;
+            bool sameNow = true, found = false;
             ctx.MainDo(() =>
             {
                 var go = World.Target(PlayShared.Str(a, "object", null), "object");
                 anim = go.GetComponent<Animation>();
                 if (anim == null) anim = go.GetComponentInChildren<Animation>();
                 if (anim == null) throw new McpException(McpErr.NotFound, World.Path(go) + " has no legacy Animation", "doors, lifts and platforms usually carry one; logic {op:\"interactables_near\"} lists them");
+                found = true;
                 if (!anim.gameObject.activeInHierarchy) throw new McpException(McpErr.Refused, World.Path(anim.gameObject) + " is inactive: Animation calls on inactive objects do nothing", "activate it first (set_active) or pick an active object");
                 name = !string.IsNullOrEmpty(clip) ? clip : anim.clip != null ? anim.clip.name : null;
                 if (name == null) throw new McpException(McpErr.BadArgs, "the Animation has no default clip: pass clip");
@@ -276,7 +283,7 @@ namespace InsideDev.Play
                     if (hasPlay && anim.IsPlaying(name) != play) sameK = false;
                     if (hasSpeed && Mathf.Abs(st.speed - speed) > 1e-4f) sameK = false;
                 });
-            r["verdict"] = ReflectValues.Verdict(anim != null, sameNow, k > 0 && (hasPlay || hasSpeed), readK, sameK);
+            r["verdict"] = ReflectValues.Verdict(found, sameNow, k > 0 && (hasPlay || hasSpeed), readK, sameK);
             r["note"] = "FSMs re-drive animations (PlayAnimation, SetAnimationTime): reverted_by_game means one did; time is checked only right after the write";
             Finish(r, warnings);
             return ToolResult.Ok(r);

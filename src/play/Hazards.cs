@@ -27,7 +27,10 @@ namespace InsideDev.Play
     public static class Hazards
     {
         public const string Owner = "WORLD_B";
+        // the actions hazard set switches off in a kill FSM. Which FSM is a kill FSM is decided by KillerKinds.IsKillAction
+        // alone (the same rule as observe): an FSM that only has KillBoyWithVoiceEmotion sets a death voice, it kills nobody
         static readonly string[] KillActions = { "PD_KillBoy", "KillBoyWithVoiceEmotion", "RopeGunShootAndKillMainCharacter" };
+        static int killFsmEpoch = -1;
 
         sealed class Sw
         {
@@ -59,7 +62,16 @@ namespace InsideDev.Play
                     .Arr("changed", "op set.", Schema.OutOf(Schema.Obj().Str("id", "").Str("kind", "").Str("how", "Call used.").Enum("verdict", "", null, Reflect.Verdicts)), 0, 50)
                     .OutObj("air", "op air.", Schema.Obj().Bool("infinite", "").Num("left_s", "", -1, 1e4).Num("max_s", "", 0, 1e4)).Bool("god", "Invincible now.")
                     .Arr("warnings", "Partial disables can soft-lock scenes that wait for the kill.", Schema.Str(), 0, 20).BuildOutput()), Handle);
-            PlayRegistry.OnTick("hazard_air", AirTick);
+            airTick = PlayRegistry.OnTick("hazard_air", AirTick, TickWhen.OnDemand);
+        }
+
+        static PlayTick airTick;
+
+        // the air tick runs only while infinite air is held
+        static void SyncAirTick()
+        {
+            var t = airTick;
+            if (t != null) t.Active = airHeld;
         }
 
         static ToolResult Handle(Json.Obj a, CallContext ctx)
@@ -212,9 +224,15 @@ namespace InsideDev.Play
                 bool k;
                 if (killFsm.TryGetValue(id, out k)) return k;
             }
-            bool r = KillActionsOf(f).Count > 0;
+            bool r = false;
+            foreach (var act in KillActionsOf(f)) if (KillerKinds.IsKillAction(act.GetType().Name)) { r = true; break; }
             var fsm = f.Fsm;
-            if (fsm != null && fsm.Initialized) lock (gate) killFsm[id] = r;
+            if (fsm != null && fsm.Initialized)
+                lock (gate)
+                {
+                    if (killFsmEpoch != Observer.Epoch || killFsm.Count > 20000) { killFsm.Clear(); killFsmEpoch = Observer.Epoch; }
+                    killFsm[id] = r;
+                }
             return r;
         }
 
@@ -222,8 +240,7 @@ namespace InsideDev.Play
         {
             if (f == null || !IsKillFsm(f)) return null;
             var acts = KillActionsOf(f);
-            string name = f.gameObject.name.ToLowerInvariant();
-            string kind = name.Contains("guard") || name.Contains("man") ? "guard" : name.Contains("rope") ? "rope_gun" : "other";
+            string kind = KillerKinds.FsmKind(f.gameObject.name);
             return new Sw
             {
                 comp = f, kind = kind, offHow = "kill actions disabled (" + acts.Count + " in FSM " + f.FsmName + ")", onHow = "kill actions enabled (FSM " + f.FsmName + ")",
@@ -243,6 +260,13 @@ namespace InsideDev.Play
 
         static string Key(string id) { return "hazard:" + id; }
 
+        // every row with an id (the rows are shown to the caller and can be switched by id)
+        static List<HazardInfo> HazardList(Vector3 body, float radius)
+        {
+            int total;
+            return Perception.HazardsCounted(body, radius, 50, out total, Perception.ForObserve);
+        }
+
         // ---------------------------------------------------------------- near
         static ToolResult Near(Json.Obj a, CallContext ctx)
         {
@@ -254,7 +278,7 @@ namespace InsideDev.Play
                 if (!World.BodyPos(out body)) throw new McpException(McpErr.NotReady, "no controlled body", "wait until the game is ready");
                 var rows = new List<object>();
                 var seen = new HashSet<int>();
-                foreach (var h in Perception.Hazards(body, radius, 50))
+                foreach (var h in HazardList(body, radius))
                 {
                     if (rows.Count >= 50) break;
                     var row = new Json.Obj();
@@ -336,7 +360,7 @@ namespace InsideDev.Play
                     Vector3 body;
                     if (!World.BodyPos(out body)) throw new McpException(McpErr.NotReady, "no controlled body", "wait until the game is ready");
                     var seen = new HashSet<int>();
-                    foreach (var h in Perception.Hazards(body, radius, 50))
+                    foreach (var h in HazardList(body, radius))
                     {
                         if (h.go == null || !seen.Add(h.go.GetInstanceID()) || h.kind == "drowning" || h.kind == "fall") continue;
                         var sw = SwitchFor(h.go);
@@ -464,6 +488,7 @@ namespace InsideDev.Play
                     }
                     if (hasInf || (hasMax && water != null)) World.Restore("air", "air (infinite / dive limits)", UndoAir);
                     if (airHeld && !airInfinite && airInfiniteBefore == false && diveBefore.Count == 0) { airHeld = false; World.Forget("air"); }
+                    SyncAirTick();
                 }
                 var o = PlayShared.Env();
                 o["outcome"] = "done";
@@ -498,6 +523,7 @@ namespace InsideDev.Play
                 }
                 airHeld = false;
                 airInfinite = false;
+                SyncAirTick();
                 int n = 0;
                 foreach (var kv in diveBefore.Values) if (kv.Key != null) { kv.Key.maxDivingTime = kv.Value; n++; }
                 diveBefore.Clear();

@@ -14,8 +14,9 @@ namespace InsideDev.Play
     public static class PlayShared
     {
         public const McpProfiles Play = McpProfiles.Play, Dev = McpProfiles.Dev, Both = McpProfiles.Both;
-        // the version of this Play build; the build id is the first 8 hex digits of the DLL's SHA-256 (McpBuild)
-        public const string BuildVersion = "0.7.0";
+        // the version of this Play build = the release (the core's Boot.Version); the build id is the first 8 hex digits
+        // of the DLL's SHA-256 (McpBuild)
+        public const string BuildVersion = Boot.Version;
         static readonly CultureInfo IC = CultureInfo.InvariantCulture;
 
         // any thread: "<version>+<id>" of InsideDev.Play.dll
@@ -101,17 +102,20 @@ namespace InsideDev.Play
         public static string NextFor(string reason, string screen)
         {
             if (screen == "message") return "menu {op:\"message_answer\", answer:\"cancel\", confirm:true} (a storage message waits for a button)";
-            if (screen == "credits") return "the credits are rolling: wait_until {seconds:10}, then observe (they end at the title)";
+            if (screen == "credits") return "the credits are rolling: wait_until {any:[{seconds:10}]}, then observe (they end at the title)";
             if (string.IsNullOrEmpty(reason)) return null;
             switch (reason)
             {
                 case "title": return "menu {op:\"submit\"} (the title waits for a button; it starts the game)";
                 case "paused": return "menu {op:\"close\"} (the pause menu is open)";
-                case "dead": return "wait_until {alive:true} (the game respawns the body at the checkpoint)";
+                case "dead": return "wait_until {any:[{alive:true}]} (the game respawns the body at the checkpoint)";
             }
             if (reason.StartsWith("unreadable", StringComparison.Ordinal)) return "observe again";
-            return "wait_until {ready:true}";
+            return WaitReadyCall;
         }
+
+        // the exact call that waits for a playable game (hints and "next" fields must validate against the schema)
+        public const string WaitReadyCall = "wait_until {any:[{ready:true}]}";
 
         // hierarchy path "Root/Child/Leaf" of a live object ("" for null)
         public static string PathOf(Transform t)

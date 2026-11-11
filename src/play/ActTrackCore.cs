@@ -12,7 +12,9 @@ namespace InsideDev.Play
     // forced by the game, huddle grabbing, no body). InputTrack appends frames with a strictly rising k (a repeated or
     // older LogicManager.stepCount still advances k by one; a jump leaves a gap), trims to a step range and sums itself
     // up. TrackFile is the file format of _mod/input_tracks/<name>.json: line 1 {"header":{...}, (op list reads only this
-    // line), line 2 the column names, then one JSON array per frame. TrackCursor schedules playback the way Playdead's
+    // line), line 2 the column names, then one JSON array per frame. ReadLines reads that layout line by line without
+    // building a JSON tree (a 20-minute track is 72000 lines); Read parses a whole text and is the fallback for a file
+    // that was reformatted by hand. A file larger than MaxFileBytes is not read. TrackCursor schedules playback the way Playdead's
     // Playback.InputRecorder.Replayer does: relative step j plays the last frame with k <= j (gaps hold the previous
     // input), and a correction target exists only on steps that were recorded (k == j). TrackCorrect is the per-step
     // blend of the InputRecorder.AdjustPosition pattern (lerp position and velocity toward the recorded body by gain),
@@ -205,7 +207,7 @@ namespace InsideDev.Play
     internal static class TrackFile
     {
         public const string Extension = ".json";
-        public const int MaxName = 64;
+        public const int MaxName = 64, MaxFileBytes = 16 * 1024 * 1024, MaxLineChars = 4096;
         public static readonly string[] Columns = { "k", "t", "sx", "sy", "b", "px", "py", "pz", "vx", "vy", "vz", "f" };
         static readonly CultureInfo IC = CultureInfo.InvariantCulture;
         const string HeaderStart = "{\"header\":";
@@ -301,7 +303,7 @@ namespace InsideDev.Play
             catch (Exception e) { error = "not JSON: " + e.Message; return null; }
             var h = root != null ? root["header"] as Json.Obj : null;
             if (h == null || h.Str("format") != TrackHeader.Format) { error = "not an input track (header.format is not " + TrackHeader.Format + ")"; return null; }
-            if (h.Num("version", 0) > TrackHeader.Version) { error = "track version " + h.Num("version", 0) + " is newer than " + TrackHeader.Version; return null; }
+            if (h.Num("version", 0) > TrackHeader.Version) { error = "track version " + h.Num("version", 0).ToString(IC) + " is newer than " + TrackHeader.Version; return null; }
             var cols = root["columns"] as List<object>;
             var rows = root["frames"] as List<object>;
             if (cols == null || rows == null) { error = "columns or frames missing"; return null; }
@@ -320,15 +322,168 @@ namespace InsideDev.Play
                 double[] v;
                 if (r == null || !Numbers(r, at, out v)) { error = "frames[" + i + "]: expected " + Columns.Length + " numbers"; return null; }
                 int k = (int)v[0];
-                if (k != v[0] || k < 0 || (i == 0 && k != 0) || (i > 0 && k <= prev)) { error = "frames[" + i + "]: k " + v[0] + " must start at 0 and rise"; return null; }
-                prev = k;
-                int b = (int)v[4];
-                t.frames.Add(new TrackFrame
+                if (!AddFrame(t, v, i, ref prev, out error)) return null;
+            }
+            return t;
+        }
+
+        // v = the 12 values of one frame in the order of Columns
+        static bool AddFrame(InputTrack t, double[] v, int i, ref int prev, out string error)
+        {
+            error = null;
+            int k = (int)v[0];
+            if (k != v[0] || k < 0 || (i == 0 && k != 0) || (i > 0 && k <= prev)) { error = "frames[" + i + "]: k " + v[0].ToString(IC) + " must start at 0 and rise"; return false; }
+            prev = k;
+            int b = (int)v[4];
+            t.frames.Add(new TrackFrame
+            {
+                k = k, t = (float)v[1], sx = (float)v[2], sy = (float)v[3], jump = (b & 1) != 0, action = (b & 2) != 0,
+                px = (float)v[5], py = (float)v[6], pz = (float)v[7], vx = (float)v[8], vy = (float)v[9], vz = (float)v[10], flags = (int)v[11]
+            });
+            if (t.Count > InputTrack.MaxFrames) { error = "more than " + InputTrack.MaxFrames + " frames"; return false; }
+            return true;
+        }
+
+        // one line of rd without its line end, at most cap characters of it (the rest of a longer line is skipped and
+        // tooLong says so); null at the end of the text
+        public static string ReadLineCapped(System.IO.TextReader rd, int cap, out bool tooLong)
+        {
+            tooLong = false;
+            int c = rd.Read();
+            if (c < 0) return null;
+            var sb = new StringBuilder(96);
+            while (c >= 0 && c != '\n')
+            {
+                if (c != '\r')
                 {
-                    k = k, t = (float)v[1], sx = (float)v[2], sy = (float)v[3], jump = (b & 1) != 0, action = (b & 2) != 0,
-                    px = (float)v[5], py = (float)v[6], pz = (float)v[7], vx = (float)v[8], vy = (float)v[9], vz = (float)v[10], flags = (int)v[11]
-                });
-                if (t.Count > InputTrack.MaxFrames) { error = "more than " + InputTrack.MaxFrames + " frames"; return null; }
+                    if (sb.Length < cap) sb.Append((char)c);
+                    else tooLong = true;
+                }
+                c = rd.Read();
+            }
+            return sb.ToString();
+        }
+
+        static readonly double[] Pow10 = { 1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22 };
+
+        // the JSON number at s[i] (digits, a fraction, an exponent); i moves behind it. With up to 15 digits and an
+        // exponent within 22 the result is the correctly rounded double (one exact division or multiplication).
+        public static bool Number(string s, ref int i, out double v)
+        {
+            v = 0;
+            int n = s.Length, start = i, digits = 0, scale = 0;
+            bool neg = false;
+            if (i < n && s[i] == '-') { neg = true; i++; }
+            double m = 0;
+            while (i < n && s[i] >= '0' && s[i] <= '9') { m = m * 10 + (s[i] - '0'); i++; digits++; }
+            if (i < n && s[i] == '.')
+            {
+                i++;
+                while (i < n && s[i] >= '0' && s[i] <= '9') { m = m * 10 + (s[i] - '0'); i++; digits++; scale++; }
+            }
+            if (digits == 0) { i = start; return false; }
+            int exp = 0;
+            if (i < n && (s[i] == 'e' || s[i] == 'E'))
+            {
+                int j = i + 1, ed = 0;
+                bool eneg = false;
+                if (j < n && (s[j] == '+' || s[j] == '-')) { eneg = s[j] == '-'; j++; }
+                while (j < n && s[j] >= '0' && s[j] <= '9' && ed < 4) { exp = exp * 10 + (s[j] - '0'); j++; ed++; }
+                if (ed == 0 || (j < n && s[j] >= '0' && s[j] <= '9')) { i = start; return false; }
+                if (eneg) exp = -exp;
+                i = j;
+            }
+            exp -= scale;
+            if (digits > 15 || exp < -22 || exp > 22)
+            {
+                // beyond what the short path gets exactly: the library's parser
+                if (!double.TryParse(s.Substring(start, i - start), System.Globalization.NumberStyles.Float, IC, out v)) { i = start; return false; }
+                return true;
+            }
+            v = exp < 0 ? m / Pow10[-exp] : m * Pow10[exp];
+            if (neg) v = -v;
+            return true;
+        }
+
+        // the numbers of one frame line "[a,b,...]" with an optional trailing comma into v (Columns.Length of them)
+        static bool FrameLine(string line, double[] raw, int want)
+        {
+            int i = 0, n = line.Length, got = 0;
+            while (i < n && (line[i] == ' ' || line[i] == '\t')) i++;
+            if (i >= n || line[i] != '[') return false;
+            i++;
+            while (true)
+            {
+                while (i < n && line[i] == ' ') i++;
+                if (got >= want || !Number(line, ref i, out raw[got])) return false;
+                got++;
+                while (i < n && line[i] == ' ') i++;
+                if (i < n && line[i] == ',') { i++; continue; }
+                break;
+            }
+            if (i >= n || line[i] != ']' || got != want) return false;
+            i++;
+            while (i < n && (line[i] == ' ' || line[i] == ',' || line[i] == '\t')) i++;
+            return i == n;
+        }
+
+        // the file as Write lays it out, line by line. null + error when the track is bad; null + layout false when the
+        // text is not in that layout (the caller may then try Read on the whole text)
+        public static InputTrack ReadLines(System.IO.TextReader rd, out string error, out bool layout)
+        {
+            error = null;
+            layout = false;
+            bool tooLong;
+            var h = HeaderOfLine(ReadLineCapped(rd, 65536, out tooLong));
+            if (h == null || tooLong) { error = "not an input track (line 1 is not its header)"; return null; }
+            if (h.Num("version", 0) > TrackHeader.Version) { layout = true; error = "track version " + h.Num("version", 0).ToString(IC) + " is newer than " + TrackHeader.Version; return null; }
+            string l2 = ReadLineCapped(rd, MaxLineChars, out tooLong);
+            const string ColStart = "\"columns\":";
+            List<object> cols = null;
+            if (l2 != null && !tooLong)
+            {
+                l2 = l2.Trim();
+                if (l2.StartsWith(ColStart, StringComparison.Ordinal) && l2.EndsWith(",", StringComparison.Ordinal))
+                {
+                    try { cols = Json.Parse(l2.Substring(ColStart.Length, l2.Length - ColStart.Length - 1)) as List<object>; } catch (Exception) { }
+                }
+            }
+            string l3 = ReadLineCapped(rd, MaxLineChars, out tooLong);
+            if (cols == null || l3 == null || l3.Trim() != "\"frames\":[") { error = "not in the one-frame-per-line layout"; return null; }
+            layout = true;
+            var at = new int[Columns.Length];
+            int width = 0;
+            for (int c = 0; c < Columns.Length; c++)
+            {
+                at[c] = cols.IndexOf(Columns[c]);
+                if (at[c] < 0) { error = "column " + Columns[c] + " missing"; return null; }
+                width = Math.Max(width, at[c] + 1);
+            }
+            if (cols.Count > 64) { error = "more than 64 columns"; return null; }
+            var t = new InputTrack();
+            t.header = HeaderFrom(h);
+            var raw = new double[cols.Count];
+            var v = new double[Columns.Length];
+            int prev = -1, row = 0;
+            while (true)
+            {
+                string line = ReadLineCapped(rd, MaxLineChars, out tooLong);
+                if (line == null) { error = "the file ends inside frames (truncated)"; return null; }
+                if (line.Length == 0) continue;
+                if (line[0] == ']') break;
+                if (tooLong || !FrameLine(line, raw, raw.Length))
+                {
+                    error = rd.Peek() < 0 ? "the file ends inside frames (truncated)" : "frames[" + row + "]: expected " + cols.Count + " numbers on one line";
+                    return null;
+                }
+                for (int c = 0; c < v.Length; c++)
+                {
+                    double d = raw[at[c]];
+                    if (double.IsNaN(d) || double.IsInfinity(d)) { error = "frames[" + row + "]: expected " + Columns.Length + " numbers"; return null; }
+                    v[c] = d;
+                }
+                if (!AddFrame(t, v, row, ref prev, out error)) return null;
+                row++;
             }
             return t;
         }
@@ -526,7 +681,7 @@ namespace InsideDev.Play
         public static string LoadHint(TrackHeader h)
         {
             if (h.subscene < 0) return "load the checkpoint the track was recorded from, then play right after it is ready";
-            return "level {op:\"load_checkpoint\", subscene:" + h.subscene + ", savepoint:" + Math.Max(0, h.savepoint) + "} (or checkpoint goto), wait_until {ready:true}, then play";
+            return "level {op:\"load_checkpoint\", subscene:" + h.subscene + ", savepoint:" + Math.Max(0, h.savepoint) + "} (or checkpoint goto), wait_until {any:[{ready:true}]}, then play";
         }
     }
 }

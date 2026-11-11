@@ -96,5 +96,44 @@ namespace InsideDev.Play
         public static string ComponentLabel(string typeName, int index) { return index > 0 ? typeName + "[" + index.ToString(IC) + "]" : typeName; }
 
         public static string FieldName(string raw) { return ReflectValues.CleanName(raw); }
+
+        // a difference that says nothing about game logic: an Animation clip time, a Rigidbody's velocity / angular
+        // velocity / sleeping flag, or a Transform value that moved by at most 0.02 in every component
+        public static bool IsNoise(string component, string field, string before, string after)
+        {
+            string c = component ?? "", f = field ?? "";
+            int br = c.IndexOf('[');
+            if (br > 0) c = c.Substring(0, br);
+            if (c == "Animation") return f.StartsWith("time.", StringComparison.Ordinal);
+            if (c == "Rigidbody") return f == "velocity" || f == "angular" || f == "sleeping";
+            if (c == "Transform" && (f == "position" || f == "euler" || f == "scale"))
+            {
+                var x = Numbers(before);
+                var y = Numbers(after);
+                if (x == null || y == null || x.Count != y.Count || x.Count == 0) return false;
+                for (int i = 0; i < x.Count; i++) if (Math.Abs(x[i] - y[i]) > 0.0201) return false;
+                return true;
+            }
+            return false;
+        }
+
+        // the numbers in a value text ("(1.5, -2, 0)" -> 1.5, -2, 0); null for null
+        public static List<double> Numbers(string s)
+        {
+            if (s == null) return null;
+            var l = new List<double>();
+            int i = 0;
+            while (i < s.Length)
+            {
+                char ch = s[i];
+                if (!(char.IsDigit(ch) || ((ch == '-' || ch == '.') && i + 1 < s.Length && (char.IsDigit(s[i + 1]) || s[i + 1] == '.')))) { i++; continue; }
+                int j = i + 1;
+                while (j < s.Length && (char.IsDigit(s[j]) || s[j] == '.' || ((s[j] == 'E' || s[j] == 'e') && j + 1 < s.Length) || ((s[j] == '-' || s[j] == '+') && (s[j - 1] == 'E' || s[j - 1] == 'e')))) j++;
+                double d;
+                if (double.TryParse(s.Substring(i, j - i), System.Globalization.NumberStyles.Float, IC, out d)) l.Add(d);
+                i = j;
+            }
+            return l;
+        }
     }
 }

@@ -12,12 +12,15 @@ namespace InsideDev.Play
     // the main-thread tick, so a cancelled or abandoned call never leaves culling switched off; a game load that starts
     // meanwhile ends it (the load owns culling then). The freeze keeper switches culling off again after a load that
     // turned it back on (GameManager.ReloadOnlySubscenes sets CullingActive true, FP/GameManager.cs:474-503).
+    // CullingActive is held off through one shared record (Hold / Release): the first holder remembers the value, the
+    // last one puts it back, so an op that outlives its call (timeout, cancel) and a freeze or a second op that arrive
+    // meanwhile cannot remember "off" as the original. One stream load at a time: a second one answers busy.
     internal static class PlayLevelsStream
     {
         sealed class Op
         {
             public int sub, phase;
-            public bool activate, cullingWas, touched;
+            public bool activate, touched;
             public SubsceneCuller culler;
             public double startMs;
             public volatile bool done;
@@ -30,8 +33,39 @@ namespace InsideDev.Play
         static readonly System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
         const double TimeoutMs = 30000;
 
-        public static bool Frozen { get { return frozen; } set { frozen = value; } }
+        public static bool Frozen { get { return frozen; } set { frozen = value; if (value) PlayLevels.TickOn(); } }
         public static bool Busy { get { lock (ops) return ops.Count > 0; } }
+
+        // main thread: the shared hold on CullingActive
+        static int holders;
+        static bool cullingBefore = true;
+
+        static void Hold(SubsceneCullingManager mgr)
+        {
+            if (holders++ == 0) cullingBefore = mgr.CullingActive;
+            mgr.CullingActive = false;
+        }
+
+        // apply false = a game load took streaming over: it sets CullingActive itself
+        static void Release(bool apply)
+        {
+            if (holders <= 0) return;
+            if (--holders > 0 || !apply) return;
+            try { SubsceneCullingManager.instance.CullingActive = frozen ? false : cullingBefore; } catch { }
+        }
+
+        // main thread: the CullingActive value that counts as "before" for a freeze that starts now (live = the
+        // manager's value): while a stream load holds culling off it is the value from before that load
+        internal static bool Original(bool live) { return holders > 0 ? cullingBefore : live; }
+
+        // main thread, end of a freeze: true = the caller sets CullingActive to value now; false = a stream load still
+        // holds culling off and will put value back when it ends
+        internal static bool ThawNow(bool value)
+        {
+            if (holders <= 0) return true;
+            cullingBefore = value;
+            return false;
+        }
 
         // worker thread; the caller holds the control lane
         public static string Load(CallContext ctx, int sub, bool activate, List<string> warnings)
@@ -39,10 +73,12 @@ namespace InsideDev.Play
             var op = new Op { sub = sub, activate = activate, startMs = clock.Elapsed.TotalMilliseconds };
             ctx.MainDo(() =>
             {
-                if (PlayLevels.Loading) throw new McpException(McpErr.Busy, "busy: a load is in progress", "wait_until {ready:true}, then retry");
+                if (PlayLevels.Loading) throw new McpException(McpErr.Busy, "busy: a load is in progress", "wait_until {any:[{ready:true}]}, then retry");
+                if (Busy) throw new McpException(McpErr.Busy, "busy: a stream load is still running (an earlier call ended before it did)", "it finishes or gives up within 30 s; stream {op:\"status\"} shows the state, then retry");
                 op.culler = SavepointManager.GetCuller(sub);
                 if (op.culler == null) throw new McpException(McpErr.NotFound, "no culler for subscene " + sub);
                 lock (ops) ops.Add(op);
+                PlayLevels.TickOn();
             });
             int ms = (int)Math.Min(TimeoutMs + 2000, ctx.RemainingMs - 1500);
             bool ok = ms > 0 && ctx.WaitUntil(() => op.done, ms);
@@ -79,16 +115,21 @@ namespace InsideDev.Play
         static bool Step(Op op, bool gameLoading)
         {
             var c = op.culler;
-            if (c == null) { op.outcome = "refused"; Note(op, "load: the culler is gone"); return true; }
-            if (gameLoading && op.phase > 0) { op.outcome = "refused"; Note(op, "load: a game load started and took over streaming"); return true; }
+            if (c == null) { op.outcome = "refused"; Note(op, "load: the culler is gone"); Restore(op); return true; }
+            if (gameLoading && op.phase > 0)
+            {
+                op.outcome = "refused";
+                Note(op, "load: a game load started and took over streaming");
+                if (op.touched) { op.touched = false; Release(false); }
+                return true;
+            }
             if (clock.Elapsed.TotalMilliseconds - op.startMs > TimeoutMs) { op.outcome = "timeout"; Note(op, "load: gave up after 30 s (" + c.LoadedState + ")"); Restore(op); return true; }
             var mgr = SubsceneCullingManager.instance;
             switch (op.phase)
             {
                 case 0:
-                    op.cullingWas = mgr.CullingActive;
+                    Hold(mgr);
                     op.touched = true;
-                    mgr.CullingActive = false;
                     op.phase = 1;
                     return false;
                 case 1:
@@ -114,7 +155,7 @@ namespace InsideDev.Play
         {
             if (!op.touched) return;
             op.touched = false;
-            try { SubsceneCullingManager.instance.CullingActive = frozen ? false : op.cullingWas; } catch { }
+            Release(true);
         }
 
         static void Note(Op op, string s) { lock (op.warnings) op.warnings.Add(s); }

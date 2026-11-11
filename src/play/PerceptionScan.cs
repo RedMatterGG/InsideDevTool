@@ -9,14 +9,7 @@ using UObj = UnityEngine.Object;
 namespace InsideDev.Play
 {
     // PerceptionScan.cs (owner OBSERVE): what is around the body.
-    //   Component caches: ONE Object.FindObjectsOfType(MonoBehaviour) pass fills every type at once (active objects
-    //   only; each concrete class is matched to the tracked types once and remembered), a separate FindObjectsOfType only
-    //   for a tracked type that is not a MonoBehaviour. A per-type pass walked all ~25 000 scene objects for each of ~40
-    //   types, one every other frame for 90 s after any agent call: ~6.5 ms of every frame and a GC every few seconds.
-    //   No background refresh by default (one pass is ~20 ms at 25 000 objects, a dropped frame each time): observe
-    //   rescans inline what is older than 120 steps or from another epoch, while the game waits for the agent anyway.
-    //   editor.cfg play.perception_bg_s = N > 0 refreshes stale caches in the background every N s of real time (never
-    //   while the real-time recorder films). The pass cost is kept for observe full (perf).
+    //   Component caches and the rescan rules: PpcXScan.cs.
     //   Objects: cached interactables + grabbable rigidbodies from one Physics.OverlapSphere (BoyGrabState.IsGrabCollider)
     //   + ledges from the boy's status (edges below the boy = drops, obstructionPlateau = a climbable top). Every Device
     //   subclass comes from one Device scan plus the non-Device classes of DeviceKinds.ScanTypes (PerceptionKinds.cs):
@@ -30,16 +23,6 @@ namespace InsideDev.Play
     //   properties.death.fallSpeedLimit).
     public static partial class Perception
     {
-        sealed class TypeCache
-        {
-            public Type type;
-            public UObj[] items = new UObj[0];
-            public int epoch = -1, frame = -100000;
-            public long step = -1;
-            public double ms;
-            public bool invalid = true;
-        }
-
         internal static readonly List<string> MissingTypes = new List<string>();
 
         static readonly Type[] ObjectTypes = WithNamed(new[]
@@ -70,188 +53,6 @@ namespace InsideDev.Play
         }
 
         static readonly Type[] OtherTypes = { typeof(SubmarineBoyInteraction), typeof(MindHatReceiver), typeof(ElevatorFall) };
-
-        static readonly Dictionary<Type, TypeCache> caches = new Dictionary<Type, TypeCache>();
-        static readonly List<TypeCache> order = new List<TypeCache>();
-        static int lastTickScan = -100000;
-        static float lastFullAt = -100f;
-        static double lastFullMs;
-        const int StaleSteps = 30;
-        static int bgCheck;
-        static float bgSeconds;
-        static readonly Dictionary<Type, int[]> matches = new Dictionary<Type, int[]>();
-        static readonly List<int> loose = new List<int>();
-
-        static void InitCaches()
-        {
-            if (order.Count > 0) return;
-            foreach (var t in ObjectTypes) AddCache(t);
-            foreach (var t in HazardTypes) AddCache(t);
-            foreach (var t in OtherTypes) AddCache(t);
-        }
-
-        static void AddCache(Type t)
-        {
-            if (caches.ContainsKey(t)) return;
-            var c = new TypeCache { type = t };
-            caches[t] = c;
-            order.Add(c);
-            if (!typeof(MonoBehaviour).IsAssignableFrom(t)) loose.Add(order.Count - 1);
-        }
-
-        static bool Stale(TypeCache c) { return Stale(c, StaleSteps); }
-
-        static bool Stale(TypeCache c, int steps)
-        {
-            if (c.invalid || c.epoch != Observer.Epoch) return true;
-            return LogicManager.stepCount - c.step >= steps && Time.frameCount - c.frame >= steps;
-        }
-
-        static void Scan(TypeCache c)
-        {
-            ScanAll();
-        }
-
-        static void ScanAll()
-        {
-            var sw = Stopwatch.StartNew();
-            UObj[] all;
-            try { all = UObj.FindObjectsOfType(typeof(MonoBehaviour)); }
-            catch { all = null; }
-            var lists = new List<UObj>[order.Count];
-            if (all != null)
-            {
-                foreach (var o in all)
-                {
-                    if (o == null) continue;
-                    var ct = o.GetType();
-                    int[] idx;
-                    if (!matches.TryGetValue(ct, out idx)) { idx = Match(ct); matches[ct] = idx; }
-                    for (int k = 0; k < idx.Length; k++)
-                    {
-                        int i = idx[k];
-                        if (lists[i] == null) lists[i] = new List<UObj>();
-                        lists[i].Add(o);
-                    }
-                }
-            }
-            foreach (int i in loose)
-            {
-                UObj[] found;
-                try { found = UObj.FindObjectsOfType(order[i].type); }
-                catch { found = null; }
-                if (found != null) lists[i] = new List<UObj>(found);
-            }
-            double ms = sw.Elapsed.TotalMilliseconds;
-            for (int i = 0; i < order.Count; i++)
-            {
-                var c = order[i];
-                c.items = lists[i] != null ? lists[i].ToArray() : new UObj[0];
-                c.epoch = Observer.Epoch;
-                c.step = LogicManager.stepCount;
-                c.frame = Time.frameCount;
-                c.invalid = false;
-                c.ms = ms / Math.Max(1, order.Count);
-            }
-            lastFullMs = ms;
-            lastFullAt = Time.realtimeSinceStartup;
-        }
-
-        static int[] Match(Type ct)
-        {
-            var l = new List<int>();
-            for (int i = 0; i < order.Count; i++) if (order[i].type.IsAssignableFrom(ct)) l.Add(i);
-            return l.ToArray();
-        }
-
-        // a cache from an older epoch is rescanned inline while this frame's inline budget (8 ms) lasts; beyond it the
-        // old list is returned (objects destroyed by the load drop out through the Unity null checks) and observe warns
-        // scan_pending
-        const double InlineBudgetMs = 8;
-        static int inlineFrame = -1, scanPendingFrame = -1;
-        static double inlineMs;
-
-        internal static bool ScanPending { get { return scanPendingFrame == Time.frameCount; } }
-
-        internal static UObj[] Items(Type t)
-        {
-            InitCaches();
-            TypeCache c;
-            if (!caches.TryGetValue(t, out c)) return new UObj[0];
-            if (c.invalid || c.epoch != Observer.Epoch)
-            {
-                int f = Time.frameCount;
-                if (f != inlineFrame) { inlineFrame = f; inlineMs = 0; }
-                if (inlineMs < InlineBudgetMs) { ScanAll(); inlineMs += lastFullMs; }
-                else scanPendingFrame = f;
-            }
-            return c.items;
-        }
-
-        static void EnsureFresh(Type t)
-        {
-            InitCaches();
-            TypeCache c;
-            if (caches.TryGetValue(t, out c) && Stale(c)) Scan(c);
-        }
-
-        // main thread (observe, before it builds): rescan up to n types from another epoch or older than 120 steps (the
-        // tick keeps every type under about 62 steps while the game runs, so this normally only runs after a load);
-        // true when more remain
-        const int ObserveStaleSteps = 120;
-
-        internal static bool RefreshSome(int n)
-        {
-            InitCaches();
-            foreach (var c in order)
-            {
-                if (!Stale(c, ObserveStaleSteps)) continue;
-                ScanAll();
-                return false;
-            }
-            return false;
-        }
-
-        internal static void InvalidateAll()
-        {
-            foreach (var c in order) c.invalid = true;
-        }
-
-        static void TickRefresh()
-        {
-            InitCaches();
-            if (--bgCheck <= 0) { bgCheck = 120; try { bgSeconds = EditorState.Get("play.perception_bg_s", 0f); } catch { bgSeconds = 0f; } }
-            if (bgSeconds <= 0f || Time.realtimeSinceStartup - lastFullAt < bgSeconds || Recorder.On) return;
-            foreach (var c in order)
-            {
-                if (!Stale(c)) continue;
-                ScanAll();
-                lastTickScan = Time.frameCount;
-                return;
-            }
-        }
-
-        internal static Json.Obj Perf()
-        {
-            InitCaches();
-            var o = new Json.Obj();
-            double total = 0, worst = 0;
-            int stale = 0;
-            string worstName = "";
-            foreach (var c in order)
-            {
-                total += c.ms;
-                if (c.ms > worst) { worst = c.ms; worstName = c.type.Name; }
-                if (Stale(c)) stale++;
-            }
-            o["scan_ms_total"] = PlayShared.R(lastFullMs, 2);
-            o["scan_pass"] = "one FindObjectsOfType(MonoBehaviour) for all types";
-            o["scan_ms_worst"] = PlayShared.R(worst, 2);
-            o["scan_worst_type"] = worstName;
-            o["stale_types"] = (double)stale;
-            o["types"] = (double)order.Count;
-            return o;
-        }
 
         // ---------------------------------------------------------------- reflection on private game members
         static readonly Dictionary<string, FieldInfo> fields = new Dictionary<string, FieldInfo>();
@@ -497,7 +298,10 @@ namespace InsideDev.Play
             if (comp is Submarine) return "submarine";
             if (comp is BoyWater) return "water";
             if (comp is Savepoint) return "savepoint";
-            return DeviceKinds.KindOf(comp.GetType().Name);
+            var t = comp.GetType();
+            string k;
+            if (!kindByType.TryGetValue(t, out k)) { k = DeviceKinds.KindOf(t.Name); kindByType[t] = k; }
+            return k;
         }
 
         static bool IsDeviceKind(string kind)
@@ -671,21 +475,43 @@ namespace InsideDev.Play
         // ---------------------------------------------------------------- hazards
         static readonly List<HazardInfo> lastHazards = new List<HazardInfo>();
 
+        // who asks: ForObserve = an observation (every row gets an id, the list is what DeathCause reads); ForQuery =
+        // the public Hazards API (ids for threats and the rows an observation would show, other rows keep the id they
+        // already have; the list feeds DeathCause only when it is centred on the body); Quiet = internal readers
+        // (the geometry overlay: no new ids, DeathCause untouched)
+        internal const int ForObserve = 0, ForQuery = 1, Quiet = 2;
+
         internal static List<HazardInfo> HazardsCounted(Vector3 center, float radius, int limit, out int total)
         {
+            return HazardsCounted(center, radius, limit, out total, ForObserve);
+        }
+
+        internal static List<HazardInfo> HazardsCounted(Vector3 center, float radius, int limit, out int total, int mode)
+        {
+            RefreshIfStale(mode == ForObserve ? BuildSteps : RunSteps);
             var l = new List<HazardInfo>();
             var c = Controlled();
             Vector3 body = c != null ? c.pos : center;
             Vector3 bvel = c != null ? c.vel : Vector3.zero;
             float r2 = radius * radius;
+            float reach = Mathf.Max(2f * radius, 60f);
+            float reach2 = reach * reach;
+            EnsureLoaded();
             foreach (var t in HazardTypes)
             {
-                foreach (var x in Items(t))
+                var rows = Rows(t);
+                for (int i = 0; i < rows.Length; i++)
                 {
-                    var comp = x as Behaviour;
+                    var row = rows[i];
+                    var comp = row.comp;
                     if (comp == null || !comp.isActiveAndEnabled) continue;
                     HazardInfo h;
-                    try { h = HazardOf(comp, body, bvel); }
+                    try
+                    {
+                        Vector3 p = RowPos(row, body);
+                        if ((p - center).sqrMagnitude > reach2) continue;
+                        h = HazardOf(comp, body, bvel, p, row.boxed);
+                    }
                     catch (Exception e) { NoteFailure("hazard " + t.Name, e); continue; }
                     if (h == null) continue;
                     float near = h.kind == "other" ? Mathf.Max(radius, 60f) : radius;
@@ -710,9 +536,18 @@ namespace InsideDev.Play
             l.Sort((a, b) => HazardRank.Compare(a.threat, a.etaS, a.dist, b.threat, b.etaS, b.dist));
             total = l.Count;
             if (limit >= 0 && l.Count > limit) l.RemoveRange(limit, l.Count - limit);
-            foreach (var h in l) if (h.id == null) h.id = Observer.IdFor(h.go, "h");
-            lastHazards.Clear();
-            lastHazards.AddRange(l);
+            for (int i = 0; i < l.Count; i++)
+            {
+                var h = l[i];
+                if (h.id != null) continue;
+                if (mode == ForObserve || (mode == ForQuery && (h.threat || (i < 6 && h.dist <= 20f)))) h.id = Observer.IdFor(h.go, "h");
+                else h.id = Observer.ExistingId(h.go, "h");
+            }
+            if (mode == ForObserve || (mode == ForQuery && (center - body).sqrMagnitude < 1f))
+            {
+                lastHazards.Clear();
+                lastHazards.AddRange(l);
+            }
             return l;
         }
 
@@ -721,7 +556,8 @@ namespace InsideDev.Play
             return new HazardInfo { kind = kind, name = comp.gameObject.name, go = comp.gameObject, pos = pos, state = "", dist = -1 };
         }
 
-        static HazardInfo HazardOf(Behaviour comp, Vector3 body, Vector3 bvel)
+        // at = the row position (RowPos); boxed = at is the nearest point of the collider bounds
+        static HazardInfo HazardOf(Behaviour comp, Vector3 body, Vector3 bvel, Vector3 at, bool boxed)
         {
             var dog = comp as Hulv;
             if (dog != null)
@@ -805,7 +641,7 @@ namespace InsideDev.Play
             }
             if (comp is Killer || comp is DelayedKiller || comp is WaterFlushKiller || comp is HeadlessKillTrigger)
             {
-                Vector3 p = ClosestOn(comp, body);
+                Vector3 p = boxed ? at : ClosestOn(comp, body);
                 var h = New("kill_zone", comp, p);
                 bool on = true;
                 var k = comp as Killer;
@@ -819,7 +655,7 @@ namespace InsideDev.Play
             }
             if (comp is GateCrush || comp is CityGateCrush || comp is WagonCrush)
             {
-                Vector3 p = ClosestOn(comp, body);
+                Vector3 p = boxed ? at : ClosestOn(comp, body);
                 var h = New("crusher", comp, p);
                 h.state = StateNames.Lower(comp.GetType().Name);
                 return h;
@@ -837,7 +673,7 @@ namespace InsideDev.Play
             string tn = comp.GetType().Name;
             if (KillerKinds.Known(tn))
             {
-                Vector3 p = ClosestOn(comp, body);
+                Vector3 p = boxed ? at : ClosestOn(comp, body);
                 var h = New(KillerKinds.KindOf(tn), comp, p);
                 float d = (p - body).magnitude;
                 h.dist = d;
@@ -870,26 +706,27 @@ namespace InsideDev.Play
                 if (acts == null) continue;
                 foreach (var a in acts) if (a != null && KillerKinds.IsKillAction(a.GetType().Name)) { k = true; break; }
             }
-            if (killFsms.Count > 4000) killFsms.Clear();
+            if (killFsms.Count > 20000) killFsms.Clear();
             killFsms[id] = k;
             return k;
         }
 
         static void AddKillFsms(List<HazardInfo> l, Vector3 body, Vector3 center, float radius)
         {
-            var list = PlayMakerFSM.FsmList;
-            if (list == null) return;
+            SettleFsms();
+            if (fsmKill.Count == 0) return;
             float far = radius + 30f;
             float r2 = radius * radius;
             var seen = new HashSet<int>();
             foreach (var h in l) if (h.go != null) seen.Add(h.go.GetInstanceID());
-            for (int i = 0; i < list.Count; i++)
+            for (int i = fsmKill.Count - 1; i >= 0; i--)
             {
-                var f = list[i];
-                if (f == null || !f.enabled) continue;
+                var f = fsmKill[i];
+                if (f == null) { fsmKill.RemoveAt(i); continue; }
+                if (!f.enabled) continue;
                 var go = f.gameObject;
                 if (!go.activeInHierarchy || (go.transform.position - center).sqrMagnitude > far * far) continue;
-                if (seen.Contains(go.GetInstanceID()) || !IsKillFsm(f)) continue;
+                if (seen.Contains(go.GetInstanceID())) continue;
                 Vector3 p = ClosestOn(f, body);
                 if ((p - center).sqrMagnitude > r2) continue;
                 seen.Add(go.GetInstanceID());

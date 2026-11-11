@@ -9,9 +9,11 @@ namespace InsideDev.Play
     // the detached control-lane job that Ctl.cs took on the main thread. Input commands: CtlGame.Prepare (main thread)
     // checks that the game takes play input, installs AgentCore (agent mode unless mix was chosen), keeps the clock as it
     // is (step mode stays step mode; an untouched or running realtime clock is chosen as realtime, so ctl does not freeze
-    // a game that a person plays) and queues the frames with the held input (ctl hold) merged in and kept after them,
-    // without a gap; Stepper.Run then advances (step mode) or watches (realtime) the game for exactly those steps and
-    // stops on death and load. Any end other than done releases all input (like act). stopat runs toward x with plain
+    // a game that a person plays; the same choice is made before goto) and queues the frames with the held input (ctl
+    // hold) merged in and kept after them, without a gap; Stepper.Run then advances (step mode) or watches (realtime)
+    // the game for exactly those steps and stops on death and load; Prepare and the start of the run share one visit of
+    // the main thread. Any end other than done releases all input (like act); an error before anything was queued
+    // leaves what ctl hold holds. stopat runs toward x with plain
     // stick input and drops the stick in the step that crosses x (its stop check, main thread). Tool-backed commands
     // (goto = move_to, time step, track play) call the Play tool handler with the job's own CallContext, so the tool's
     // BeginJob gets the same job and shares the lane; a track playback is finished by ActTrack's tick, not here.
@@ -25,6 +27,7 @@ namespace InsideDev.Play
         static readonly Dictionary<string, string> whats = new Dictionary<string, string>();
         static readonly Queue<string> order = new Queue<string>();
         static volatile string last;
+        static volatile int watching;
         const int KeepWhats = 200;
 
         internal static string LastId { get { return last; } }
@@ -40,6 +43,7 @@ namespace InsideDev.Play
             lock (gate)
             {
                 watched.Add(new Watched { job = job, what = what });
+                watching = watched.Count;
                 whats[job.Id] = what;
                 order.Enqueue(job.Id);
                 while (order.Count > KeepWhats) whats.Remove(order.Dequeue());
@@ -50,6 +54,7 @@ namespace InsideDev.Play
         // main thread, every frame
         internal static void Tick()
         {
+            if (watching == 0) return;
             List<Watched> ended = null;
             lock (gate)
             {
@@ -60,6 +65,7 @@ namespace InsideDev.Play
                     ended.Add(watched[i]);
                 }
                 if (ended != null) foreach (var w in ended) watched.Remove(w);
+                watching = watched.Count;
             }
             if (ended == null) return;
             foreach (var w in ended) DevLog.Write("ctl " + w.job.Id + " " + CtlCore.JobText(w.job.State, w.what, w.job.Result));
@@ -69,9 +75,11 @@ namespace InsideDev.Play
         internal static void Run(CtlPlan p, HostCallContext ctx, McpJob job)
         {
             Json.Obj r;
-            try { r = p.kind == CtlKind.Tool ? RunTool(p, ctx) : RunInput(p, ctx, job); }
-            catch (McpException e) { Release(); r = Failed(e.code, e.Message, e.hint); }
-            catch (Exception e) { Release(); r = Failed(McpErr.Internal, e.GetType().Name + ": " + e.Message, null); }
+            // an error releases the input only when this command queued some (a tool releases its own)
+            var queued = new bool[1];
+            try { r = p.kind == CtlKind.Tool ? RunTool(p, ctx) : RunInput(p, ctx, job, queued); }
+            catch (McpException e) { if (queued[0]) Release(); r = Failed(e.code, e.Message, e.hint); }
+            catch (Exception e) { if (queued[0]) Release(); r = Failed(McpErr.Internal, e.GetType().Name + ": " + e.Message, null); }
             if (r == null) return;
             if (!r.Bool("ok", false))
             {
@@ -95,6 +103,9 @@ namespace InsideDev.Play
 
         static Json.Obj RunTool(CtlPlan p, HostCallContext ctx)
         {
+            // goto drives through move_to: the same clock choice as a timed input command, so a game that a person plays
+            // in realtime is not left frozen in step mode when the body arrives
+            if (p.tool == "move_to") ctx.MainDo(CtlGame.ChooseClock);
             var tr = CtlCommands.CallTool(p.tool, p.args, ctx);
             var s = tr.structured ?? new Json.Obj();
             if (tr.isError)
@@ -110,9 +121,20 @@ namespace InsideDev.Play
             return r;
         }
 
-        static Json.Obj RunInput(CtlPlan p, HostCallContext ctx, McpJob job)
+        static Json.Obj RunInput(CtlPlan p, HostCallContext ctx, McpJob job, bool[] queued)
         {
-            var prep = ctx.Main(() => CtlGame.Prepare(p));
+            CtlPrep prep = null;
+            var req = new RunRequest { stopOnDeath = true, stopOnLoad = true, label = "ctl " + job.Id };
+            var rr = Stepper.Run(ctx, req, () =>
+            {
+                prep = CtlGame.Prepare(p);
+                queued[0] = prep.queued;
+                if (prep.error != null || prep.done != null) return false;
+                req.maxSteps = prep.steps;
+                req.timeoutMs = prep.timeoutMs;
+                req.stopCheck = prep.stopCheck;
+                return true;
+            });
             if (prep.error != null) return Failed(prep.code, prep.error, prep.hint);
             var r = PlayShared.Env();
             if (prep.done != null)
@@ -121,24 +143,6 @@ namespace InsideDev.Play
                 r["steps"] = 0.0;
                 r["line"] = prep.done;
                 return r;
-            }
-            RunResult rr;
-            try
-            {
-                rr = Stepper.Run(ctx, new RunRequest
-                {
-                    maxSteps = prep.steps,
-                    timeoutMs = prep.timeoutMs,
-                    stopOnDeath = true,
-                    stopOnLoad = true,
-                    label = "ctl " + job.Id,
-                    stopCheck = prep.stopCheck
-                });
-            }
-            catch (Exception)
-            {
-                Release();
-                throw;
             }
             string outcome = CtlCore.Outcome(rr.stop, p.kind == CtlKind.StopAt);
             if (outcome == "not_reached") { try { ctx.MainDo(() => CtlGame.Rest(prep)); } catch (Exception) { Release(); } }
@@ -162,7 +166,7 @@ namespace InsideDev.Play
         public int steps, timeoutMs;
         public Func<string> stopCheck;
         public InputFrame after;
-        public bool hasAfter;
+        public bool hasAfter, queued;
     }
 
     // game side of ctl, main thread only
@@ -174,7 +178,7 @@ namespace InsideDev.Play
             return AgentCore.Install(m);
         }
 
-        static void ChooseClock()
+        internal static void ChooseClock()
         {
             if (Stepper.Mode == StepMode.Realtime && !Stepper.Frozen) Stepper.SetMode(StepMode.Realtime);
         }
@@ -232,6 +236,7 @@ namespace InsideDev.Play
                 double dx = p.target - pos.x;
                 if (Math.Abs(dx) <= CtlCore.StopAtTolerance)
                 {
+                    r.queued = true;
                     Rest(r);
                     r.done = "done: " + p.what + ": already there (x=" + CtlCore.F(pos.x) + ")";
                     return r;
@@ -252,6 +257,7 @@ namespace InsideDev.Play
                 };
             }
             else frames = CtlCore.Merge(p.frames, held, hasHeld, true);
+            r.queued = true;
             AgentCore.Release();
             AgentCore.Enqueue(frames, p.kind != CtlKind.StopAt && hasHeld);
             r.timeoutMs = CtlCore.TimeoutMs(p.steps, Stepper.Mode == StepMode.Step, Stepper.Speed);
@@ -326,7 +332,13 @@ namespace InsideDev.Play
             return "ok: input mode " + p.mode + (m == InputMode.Mix ? " (ctl input and the pad together)" : " (only ctl and MCP input reach the game)") + Note(w);
         }
 
-        internal static string StatusJson() { return JsonOut.Write(Observer.Concise(null)); }
+        // the concise observation plus ctl {lane, job, last_job}
+        internal static string StatusJson()
+        {
+            var o = Observer.Concise(null);
+            try { o["ctl"] = CtlCommands.StatusBlock(); } catch (Exception) { }
+            return JsonOut.Write(o);
+        }
 
         static string ModeName(InputMode m) { return m == InputMode.Agent ? "agent" : m == InputMode.Mix ? "mix" : "human"; }
 

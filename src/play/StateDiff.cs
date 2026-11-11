@@ -18,7 +18,10 @@ namespace InsideDev.Play
     // game MonoBehaviours: leaves as text, collections as Type[count], game classes / structs one level deep ("a.b").
     // Radius mode walks the active objects within the radius plus the inactive subtrees under them and skips the
     // controlled characters and the camera (they change every frame); root mode walks everything under the root,
-    // inactive included. Paths carry "[n]" for same-named siblings so keys stay stable between snapshots.
+    // inactive included. Paths carry "[n]" for same-named siblings so keys stay stable between snapshots (the
+    // ordinals of a parent's children are counted once, in one pass over them).
+    // diff options: ignore_noise leaves out what changes by itself (StateDiffText.IsNoise), group writes each object
+    // path once with its changes under it, rolling makes the fresh snapshot the new base of the name.
     public sealed class Snapshot
     {
         public string name;
@@ -64,7 +67,9 @@ namespace InsideDev.Play
     {
         public const string Owner = "WORLD_B";
         public const int MaxSnapshots = 8;
-        public const double ChunkMs = 3.0;
+        // main-thread milliseconds per chunk of a capture: while the game runs, and while it is frozen between calls
+        // (fewer items, and the snapshot spans fewer frames)
+        public const double ChunkMs = 3.0, FrozenChunkMs = 12.0;
 
         static readonly object gate = new object();
         static readonly List<Snapshot> store = new List<Snapshot>();
@@ -77,13 +82,20 @@ namespace InsideDev.Play
                     .Str("name", "Snapshot name.", "a").Str("against", "op diff: compare with this snapshot instead of a new one.")
                     .Str("center", "Object id or path (default the body).").Num("radius", "Metres.", 8, 1, 50).Str("root", "Hierarchy path: everything under it instead of a radius.")
                     .Arr("components", "Only these component types.", Schema.Str(), 0, 20).Int("max_fields", "Field cap per snapshot.", 5000, 100, 50000)
-                    .Int("limit", "op diff: rows.", 100, 1, 500).Build(),
+                    .Int("limit", "op diff: rows.", 100, 1, 500)
+                    .Bool("ignore_noise", "op diff: leave out what changes by itself: Animation clip times, Rigidbody velocity / angular / sleeping, Transform changes of at most 0.02.", false)
+                    .Bool("group", "op diff: one entry per object with its changes (objects[]) instead of flat rows (diff[]).", false)
+                    .Bool("rolling", "op diff without against: the fresh snapshot replaces the named one, so the next diff shows what changed since this one.", false).Build(),
                 Schema.Obj().OutObj("snapshot", "", Schema.Obj().Str("name", "").Int("objects", "", 0, 1000000).Int("components", "", 0, 1000000).Int("fields", "", 0, 10000000)
                         .Int("frame", "", 0, long.MaxValue).Int("step", "", 0, long.MaxValue))
                     .Arr("snapshots", "op list.", Schema.OutOf(Schema.Obj().Str("name", "").Int("fields", "", 0, 10000000).Int("frame", "", 0, long.MaxValue)), 0, 8)
                     .Arr("diff", "op diff.", Schema.OutOf(Schema.Obj().Str("object", "").Str("component", "").Str("field", "").Str("before", "").Str("after", "")
                         .Enum("change", "changed, added (no before) or removed (no after).", null, "changed", "added", "removed")), 0, 500)
-                    .Int("total", "Differences before the limit.", 0, 10000000).Bool("truncated", "max_fields was hit.")
+                    .Arr("objects", "op diff with group: changes per object, in path order.", Schema.OutOf(Schema.Obj().Str("object", "Hierarchy path.")
+                        .Arr("changes", "", Schema.OutOf(Schema.Obj().Str("component", "").Str("field", "").Str("before", "").Str("after", "")
+                            .Enum("change", "", null, "changed", "added", "removed")), 0, 500)), 0, 500)
+                    .Int("total", "Differences before the limit (after ignore_noise).", 0, 10000000).Int("ignored", "Differences left out by ignore_noise.", 0, 10000000)
+                    .Bool("rolled", "The fresh snapshot is now the named one.").Bool("truncated", "max_fields was hit.")
                     .Arr("warnings", "", Schema.Str(), 0, 20).BuildOutput()).Idempotent(), Handle);
         }
 
@@ -132,29 +144,53 @@ namespace InsideDev.Play
                     p.comps = new List<string>(before.comps);
                     after = Take(ctx, p, null, false);
                 }
-                int total;
-                var rows = Snapshot.Diff(before, after, PlayShared.Int(a, "limit", 100), out total);
+                bool quiet = PlayShared.Bool(a, "ignore_noise", false), group = PlayShared.Bool(a, "group", false);
+                bool rolling = PlayShared.Bool(a, "rolling", false) && string.IsNullOrEmpty(against);
+                int limit = PlayShared.Int(a, "limit", 100);
+                int total, ignored = 0;
+                var rows = Snapshot.Diff(before, after, quiet ? int.MaxValue : limit, out total);
                 var l = new List<object>();
+                var groups = new List<object>();
+                Json.Obj cur = null;
+                List<object> curRows = null;
+                string curPath = null;
+                int shown = 0;
                 foreach (var d in rows)
                 {
                     string path, comp, field;
                     StateDiffText.Split(d.key, out path, out comp, out field);
+                    if (quiet && StateDiffText.IsNoise(comp, field, d.before, d.after)) { ignored++; continue; }
+                    if (shown >= limit) continue;
+                    shown++;
                     var o = new Json.Obj();
-                    o["object"] = path;
+                    if (!group) o["object"] = path;
                     o["component"] = comp;
                     o["field"] = field;
                     if (d.before != null) o["before"] = d.before;
                     if (d.after != null) o["after"] = d.after;
                     o["change"] = d.before == null ? "added" : d.after == null ? "removed" : "changed";
-                    l.Add(o);
+                    if (!group) { l.Add(o); continue; }
+                    if (cur == null || curPath != path)
+                    {
+                        cur = new Json.Obj();
+                        curRows = new List<object>();
+                        curPath = path;
+                        cur["object"] = path;
+                        cur["changes"] = curRows;
+                        groups.Add(cur);
+                    }
+                    curRows.Add(o);
                 }
+                total -= ignored;
+                if (rolling) { after.name = name; Keep(after); r["rolled"] = true; }
                 r["snapshot"] = Summary(after);
-                r["diff"] = l;
+                if (group) r["objects"] = groups; else r["diff"] = l;
                 r["total"] = (double)total;
+                if (quiet) r["ignored"] = (double)ignored;
                 r["truncated"] = before.truncated || after.truncated;
                 var w = new List<object>();
                 if (before.truncated || after.truncated) w.Add("max_fields was hit: raise it or narrow with components / radius, or the diff may miss fields");
-                if (total > l.Count) w.Add("showing " + l.Count + " of " + total + " differences (limit)");
+                if (total > shown) w.Add("showing " + shown + " of " + total + " differences (limit)");
                 if (w.Count > 0) r["warnings"] = w;
                 return ToolResult.Ok(r);
             }
@@ -208,12 +244,18 @@ namespace InsideDev.Play
         static Snapshot Take(CallContext ctx, Snapshot s, string centerSpec, bool resolveCenter)
         {
             var cap = new Capture(s);
-            ctx.MainDo(() => cap.Begin(centerSpec, resolveCenter));
+            double chunk = ChunkMs;
+            ctx.MainDo(() =>
+            {
+                cap.Begin(centerSpec, resolveCenter);
+                try { if (World.Frozen() && !Recorder.On) chunk = FrozenChunkMs; } catch (Exception) { }
+                if (!cap.done) cap.Step(chunk);
+            });
             while (!cap.done)
             {
                 ctx.ThrowIfCancelled();
                 if (ctx.RemainingMs < 2500) { s.truncated = true; break; }
-                ctx.MainDo(() => cap.Step(ChunkMs));
+                ctx.MainDo(() => cap.Step(chunk));
             }
             return s;
         }
@@ -356,18 +398,40 @@ namespace InsideDev.Play
                 }
             }
 
+            readonly Dictionary<int, Dictionary<int, int>> ordinals = new Dictionary<int, Dictionary<int, int>>();
+
+            // how many earlier siblings carry the same name: counted for all children of a parent in one pass
+            int Before(Transform parent, int childId)
+            {
+                int pid = parent.GetInstanceID();
+                Dictionary<int, int> map;
+                if (!ordinals.TryGetValue(pid, out map))
+                {
+                    map = new Dictionary<int, int>();
+                    var counts = new Dictionary<string, int>();
+                    int n = parent.childCount;
+                    for (int i = 0; i < n; i++)
+                    {
+                        var c = parent.GetChild(i);
+                        string nm = c.name;
+                        int k;
+                        counts.TryGetValue(nm, out k);
+                        if (k > 0) map[c.GetInstanceID()] = k;
+                        counts[nm] = k + 1;
+                    }
+                    ordinals[pid] = map;
+                }
+                int b;
+                return map.TryGetValue(childId, out b) ? b : 0;
+            }
+
             string PathKey(Transform t)
             {
                 string p;
                 int id = t.GetInstanceID();
                 if (pathCache.TryGetValue(id, out p)) return p;
                 var parent = t.parent;
-                int before = 0;
-                if (parent != null)
-                {
-                    int idx = t.GetSiblingIndex();
-                    for (int i = 0; i < idx && i < parent.childCount; i++) if (parent.GetChild(i).name == t.name) before++;
-                }
+                int before = parent != null ? Before(parent, id) : 0;
                 var seg = StateDiffText.Segment(t.name, before);
                 p = parent == null ? seg : PathKey(parent) + "/" + seg;
                 pathCache[id] = p;

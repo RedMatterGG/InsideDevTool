@@ -141,8 +141,28 @@ namespace InsideDev.Play
             string n = (goName ?? "").ToLowerInvariant();
             if (n.Contains("spotlight")) return "spotlight";
             if (n.Contains("rope") || n.Contains("shoot")) return "rope_gun";
-            if (n.Contains("guard") || n.Contains("man")) return "guard";
+            if (n.Contains("guard") || HasWord(goName, "man") || HasWord(goName, "men")) return "guard";
             return "kill_zone";
+        }
+
+        // word = a whole part of an object name: parts end at a character that is not a letter and at a lower-to-upper
+        // step ("GuardMan_01" has the word man, "Manager" and "Command" do not)
+        public static bool HasWord(string name, string word)
+        {
+            if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(word)) return false;
+            int start = -1;
+            for (int i = 0; i <= name.Length; i++)
+            {
+                bool letter = i < name.Length && char.IsLetter(name[i]);
+                bool step = letter && start >= 0 && i > start && char.IsUpper(name[i]) && char.IsLower(name[i - 1]);
+                if (start >= 0 && (!letter || step))
+                {
+                    if (i - start == word.Length && string.Compare(name, start, word, 0, word.Length, StringComparison.OrdinalIgnoreCase) == 0) return true;
+                    start = -1;
+                }
+                if (letter && start < 0) start = i;
+            }
+            return false;
         }
     }
 

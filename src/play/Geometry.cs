@@ -12,7 +12,8 @@ namespace InsideDev.Play
     // InsideDev.Geometry exists in the core): occupancy slice of the level at the body's depth plane. Cells are raycast /
     // overlap tested at z = boy.plane.posz with CollisionUtils.Layers.defaultCollisionMask (Ungrouped | Environment |
     // Item | Default), triggers ignored except water. At most about 2000 queries per call, split into main-thread chunks
-    // of at most 2 ms. GridSlice is pure data (offline-testable).
+    // of 1.5 ms while the game runs and 8 ms while it is frozen between calls (nothing is waiting for the frame then).
+    // GridSlice is pure data (offline-testable).
     //   cell chars: '#' solid, '.' free, '~' water, 'H' ladder, '|' rope, 'B' body, '^' hazard, '?' not loaded
     // How a slice is built (SliceJob): every column is cast down and up and every row left and right, each ray going on
     // past the surfaces it hits (triggers skipped), plus an overlap test at each line start; NavScan turns the hits into
@@ -84,7 +85,7 @@ namespace InsideDev.Play
     {
         public const string Owner = "NAV";
         internal const int RayBudget = 1900, MaxCols = 256, MaxRows = 128;
-        internal const double ChunkMs = 1.5;
+        internal const double ChunkMs = 1.5, FrozenChunkMs = 8;
 
         public static void Register()
         {
@@ -92,10 +93,15 @@ namespace InsideDev.Play
                 "Occupancy slice of the level around the body (or a point) at its depth plane: text rows with # solid, . free, ~ water, H ladder, | rope, B body, ^ hazard, ? not loaded; plus ledges. Look ahead before move_to (pits, walls, ledges up), plan routes, debug blocked moves.",
                 Schema.Obj().Enum("op", "slice, ledges or probe (one column under / over a point).", "slice", "slice", "ledges", "probe")
                     .Str("center", "Object id or path (default the body).").Num("x", "World x instead of center.", -1e5, 1e5).Num("y", "World y.", -1e5, 1e5)
-                    .Num("width", "Slice width (m).", 16, 2, 64).Num("height", "Slice height (m).", 8, 2, 32).Num("cell", "Cell size (m).", 0.25, 0.1, 1).Build(),
+                    .Num("width", "Slice width (m).", 16, 2, 64).Num("height", "Slice height (m).", 8, 2, 32).Num("cell", "Cell size (m).", 0.25, 0.1, 1)
+                    .Enum("format", "op slice: rows = one character per cell; runs = each row run-length coded, count then character, runs separated by a space (\"12# 30. 4~\").", "rows", "rows", "runs")
+                    .Bool("crop", "op slice: drop the border rows and columns that hold only . or ? (origin, cols and rows describe what is left).", false).Build(),
                 Schema.Obj().OutObj("origin", "World position of the bottom-left cell.", Schema.Obj().Num("x", "", -1e5, 1e5).Num("y", "", -1e5, 1e5).Num("z", "", -1e5, 1e5))
                     .Num("cell", "Cell size (m).", 0, 10).Int("cols", "", 0, 1000).Int("rows", "", 0, 1000)
-                    .Arr("grid", "Text rows, top first.", Schema.Str(), 0, 400)
+                    .Arr("grid", "Text rows, top first (format runs: run-length coded).", Schema.Str(), 0, 400)
+                    .Enum("format", "How grid rows are written.", null, "rows", "runs").Bool("cropped", "Empty border rows / columns were dropped.")
+                    .OutObj("center", "The point the slice was asked around.", Schema.Obj().Num("x", "", -1e5, 1e5).Num("y", "", -1e5, 1e5).Str("from", "body, object or point."))
+                    .Int("rays", "Physics queries used.", 0, 100000).Str("legend", "Cell characters.").Arr("notes", "Limits that were hit.", Schema.Str(), 0, 20)
                     .Arr("ledges", "Grabbable ledges.", Schema.OutOf(Schema.Obj().Num("x", "", -1e5, 1e5).Num("y", "", -1e5, 1e5).Enum("side", "", null, "left", "right").Bool("climbable", "")), 0, 64)
                     .OutObj("probe", "op probe: ground / ceiling under / over the point.", Schema.Obj().Open()).BuildOutput()).ReadOnly(), Handle);
         }
@@ -104,22 +110,48 @@ namespace InsideDev.Play
         {
             string op = PlayShared.Str(a, "op", "slice");
             float width = (float)PlayShared.Num(a, "width", 16), height = (float)PlayShared.Num(a, "height", 8), cell = (float)PlayShared.Num(a, "cell", 0.25);
-            var spot = ctx.Main(() => NavGame.Spot(a));
+            bool runs = PlayShared.Str(a, "format", "rows") == "runs", crop = PlayShared.Bool(a, "crop", false);
             var r = PlayShared.Env();
+            NavGame.SpotInfo spot = null;
+            SliceJob job = null;
+            Json.Obj probe = null;
+            double chunk = ChunkMs;
+            bool done = false;
+            ctx.MainDo(() =>
+            {
+                spot = NavGame.Spot(a);
+                if (op == "probe") { probe = Probe(spot); return; }
+                bool frozen = false;
+                try { frozen = World.Frozen() && !Recorder.On; } catch (Exception) { }
+                if (frozen) chunk = FrozenChunkMs;
+                job = new SliceJob(spot.x, spot.y, spot.z, width, height, cell, RayBudget);
+                done = job.Step(chunk);
+            });
             if (op == "probe")
             {
-                r["probe"] = ctx.Main(() => Probe(spot));
+                r["probe"] = probe;
                 return ToolResult.Ok(r);
             }
-            var job = ctx.Main(() => new SliceJob(spot.x, spot.y, spot.z, width, height, cell, RayBudget));
-            while (!ctx.Main(() => job.Step(ChunkMs))) ctx.ThrowIfCancelled();
-            var g = job.grid;
+            while (!done)
+            {
+                ctx.ThrowIfCancelled();
+                done = ctx.Main(() => job.Step(chunk));
+            }
+            var full = job.grid;
+            var g = crop && op == "slice" ? NavText.Crop(full) : full;
             var o = new Json.Obj(); o["x"] = PlayShared.R(g.originX); o["y"] = PlayShared.R(g.originY); o["z"] = PlayShared.R(g.z);
             r["origin"] = o;
             r["cell"] = PlayShared.R(g.cell, 3); r["cols"] = (double)g.cols; r["rows"] = (double)g.rows;
-            if (op == "slice") r["grid"] = PlayShared.L(g.ToRows());
+            if (op == "slice")
+            {
+                var rows = g.ToRows();
+                if (runs) for (int i = 0; i < rows.Count; i++) rows[i] = NavText.Runs(rows[i]);
+                r["grid"] = PlayShared.L(rows);
+                r["format"] = runs ? "runs" : "rows";
+                if (!ReferenceEquals(g, full)) r["cropped"] = true;
+            }
             var caps = NavGame.Caps(null);
-            var led = NavPlan.MergeLedges(job.GameLedges(g, caps), NavPlan.GridLedges(g, caps), spot.x, spot.y, Math.Max(width, height), 64);
+            var led = NavPlan.MergeLedges(job.GameLedges(full, caps), NavPlan.GridLedges(full, caps), spot.x, spot.y, Math.Max(width, height), 64);
             var ll = new List<object>();
             foreach (var e in led)
             {
@@ -188,7 +220,7 @@ namespace InsideDev.Play
             NavScene.Refresh();
             foreach (var w in NavScene.waters)
             {
-                if (w == null) continue;
+                if (w == null || !w.gameObject.activeInHierarchy) continue;
                 var col = w.GetComponent<Collider>();
                 if (col == null) continue;
                 var b = col.bounds;
@@ -301,7 +333,7 @@ namespace InsideDev.Play
                 s.z = hasPlane ? z : 0f; s.from = "point";
                 return s;
             }
-            if (!hasBody) throw new McpException(McpErr.NotReady, "no controlled body (loading or title)", "give x and y, or wait_until {ready:true}");
+            if (!hasBody) throw new McpException(McpErr.NotReady, "no controlled body (loading or title)", "give x and y, or wait_until {any:[{ready:true}]}");
             s.x = body.x; s.y = PlayShared.Has(a, "y") ? (float)PlayShared.Num(a, "y", 0) : body.y; s.z = body.z;
             return s;
         }
@@ -332,12 +364,13 @@ namespace InsideDev.Play
         }
     }
 
-    // FindObjectsOfType results for the overlays, one type per main-thread chunk, reused for 3 s (realtime) unless an
-    // entry was destroyed; streaming adds objects without a load, so the cache is short-lived instead of per load.
+    // The components the overlays draw. They come from Perception's component lists (one pass for every reader, kept
+    // current by its own rules: PpcXScan.cs) and are picked once per frame: the active ones of each kind. The cullers
+    // come from the game's culling manager. Nothing here scans the scene.
     internal static class NavScene
     {
-        internal const int Kinds = 7;
-        static float at = -100f;
+        internal const int Kinds = 1;
+        static int frame = -1, epoch = -1;
         internal static readonly List<Ladder> ladders = new List<Ladder>();
         internal static readonly List<Rope> ropes = new List<Rope>();
         internal static readonly List<BoyWater> waters = new List<BoyWater>();
@@ -346,39 +379,35 @@ namespace InsideDev.Play
         internal static readonly List<HeadlessKillTrigger> headless = new List<HeadlessKillTrigger>();
         internal static readonly List<SubsceneCuller> cullers = new List<SubsceneCuller>();
 
-        internal static bool Fresh()
-        {
-            if (Time.realtimeSinceStartup - at > 3f) return false;
-            foreach (var x in ladders) if (x == null) return false;
-            foreach (var x in ropes) if (x == null) return false;
-            foreach (var x in waters) if (x == null) return false;
-            return true;
-        }
+        internal static bool Fresh() { return frame == Time.frameCount && epoch == Observer.Epoch; }
 
-        static void Fill<T>(List<T> l) where T : UnityEngine.Object
+        static void Fill<T>(List<T> l) where T : Component
         {
             l.Clear();
-            foreach (var o in UnityEngine.Object.FindObjectsOfType(typeof(T))) { var t = o as T; if (t != null) l.Add(t); }
-        }
-
-        internal static void Scan(int k)
-        {
-            switch (k)
+            foreach (var o in Perception.Items(typeof(T)))
             {
-                case 0: Fill(ladders); break;
-                case 1: Fill(ropes); break;
-                case 2: Fill(waters); break;
-                case 3: Fill(killers); break;
-                case 4: Fill(delayed); break;
-                case 5: Fill(headless); break;
-                default: Fill(cullers); at = Time.realtimeSinceStartup; break;
+                var t = o as T;
+                if (t != null && t.gameObject.activeInHierarchy) l.Add(t);
             }
         }
+
+        internal static void Scan(int k) { Refresh(); }
 
         internal static void Refresh()
         {
             if (Fresh()) return;
-            for (int k = 0; k < Kinds; k++) Scan(k);
+            Perception.RefreshIfStale(Perception.RunSteps);
+            Fill(ladders);
+            Fill(ropes);
+            Fill(waters);
+            Fill(killers);
+            Fill(delayed);
+            Fill(headless);
+            cullers.Clear();
+            try { foreach (var c in SubsceneCullingManager.instance.GetAllSubsceneCullers()) if (c != null) cullers.Add(c); }
+            catch (Exception) { }
+            frame = Time.frameCount;
+            epoch = Observer.Epoch;
         }
     }
 
@@ -499,15 +528,9 @@ namespace InsideDev.Play
                     if (rays + 8 > budget) { notes.Add("ray budget reached: " + (rowOrder.Length - index) + " rows not scanned"); phase = 2; index = 0; continue; }
                     ScanRow(rowOrder[index++]);
                 }
-                else if (phase == 2)
-                {
-                    if (index == 0 && NavScene.Fresh()) { phase = 3; continue; }
-                    if (index >= NavScene.Kinds) { phase = 3; continue; }
-                    NavScene.Scan(index++);
-                    return false;
-                }
-                else if (phase == 3) { Compose(); phase = 4; return false; }
-                else if (phase == 4) { Overlay(); phase = 5; return false; }
+                else if (phase == 2) { NavScene.Refresh(); phase = 3; }
+                else if (phase == 3) { Compose(); phase = 4; }
+                else if (phase == 4) { Overlay(); phase = 5; }
                 else
                 {
                     Unloaded();
@@ -644,7 +667,8 @@ namespace InsideDev.Play
             foreach (var k in NavScene.headless) if (k != null && k.isActiveAndEnabled && k.isActive) KillBox(k.GetComponent<Collider>());
             try
             {
-                var hz = Perception.Hazards(new Vector3(g.originX + g.Width * 0.5f, g.originY + g.Height * 0.5f, z), Math.Max(g.Width, g.Height) * 0.75f, 8);
+                int hzTotal;
+                var hz = Perception.HazardsCounted(new Vector3(g.originX + g.Width * 0.5f, g.originY + g.Height * 0.5f, z), Math.Max(g.Width, g.Height) * 0.75f, 8, out hzTotal, Perception.Quiet);
                 if (hz != null)
                     foreach (var h in hz)
                         if (h != null && h.go != null && (h.kind == "kill_zone" || h.kind == "crusher"))

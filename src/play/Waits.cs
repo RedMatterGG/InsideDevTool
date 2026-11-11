@@ -11,7 +11,8 @@ namespace InsideDev.Play
     // the conditions holds. A timeout is not an error: ok true, satisfied false, timed_out true. Conditions are compiled
     // to main-thread checks (Compile) and evaluated after every step. The call never holds the main thread: it loops on
     // the worker through Stepper.Run / CallContext.WaitUntil. Condition job waits on another job (e.g. a detached load)
-    // without taking the control lane.
+    // without taking the control lane. Main-thread visits: one compiles every condition, checks them once and starts
+    // the run; one after the run reads the watched values, the observation and removes what the conditions installed.
     // Rules: every item of any has exactly one key (WaitPlan.KeyOf); ids and paths resolve strictly through
     // Observer.ResolveTarget before the game runs (stale_id / not_found / ambiguous come back as errors); a wait with
     // any non-job condition takes the control lane (busy otherwise, unless a job condition lets it watch without the
@@ -22,7 +23,8 @@ namespace InsideDev.Play
     // come from Perception.Body(false) (OBSERVE's definitions); while it is not built, a fallback reads the boy directly.
     // signal installs a tap connection at the front of that SignalOut's private connection list (the core EventMonitor
     // recipe, named "InsideDev.tap" so EventMonitor's listing skips it), removed when the wait ends or, failing that,
-    // 5 s after its last check (tick "waits").
+    // 5 s after its last check (tick "waits", which runs only while a tap exists); a wait that finds its tap removed
+    // (its checks stood still for 5 s) puts it back.
     // Game APIs checked against the decompiled code: SignalManager.signalOuts (FP/SignalManager.cs:29), SignalOut
     // isActive / gameObject / debugName / private connections (FP/SignalOut.cs:5-16, set FP/SignalManager.cs:135-139),
     // SignalConnection fields and RaiseEvent (FP/SignalConnection.cs:16-85), SignalIn (FP/SignalIn.cs:6-16), FastList
@@ -74,11 +76,21 @@ namespace InsideDev.Play
                     .OutObj("condition", "That condition.", Schema.Obj().Open()).Bool("timed_out", "timeout_s or max_steps ran out.")
                     .Int("waited_steps", "Logic steps run.", 0, 1000000).Num("elapsed_ms", "Wall-clock ms.", 0, 1e7)
                     .OutObj("observed", "The watched values at the end.", Schema.Obj().Open())
-                    .OutObj("job", "Job state (condition job).", McpExt.DevToolsProvider.JobSchema())
+                    .Enum("stop", "Why the wait ended.", null, RunStop.All).Str("detail", "What held, or what stopped the wait.")
+                    .OutObj("job", "Job state (condition job), with outcome, end and stop_reason of its result when it has them.", McpExt.DevToolsProvider.JobSchema())
                     .Arr("warnings", "", Schema.Str(), 0, 20)
                     .Prop("changes", null, ChangeLog.Ref())
                     .Prop("observe", null, Observer.ConciseRef()).BuildOutput()).AlwaysLoad(), Handle);
-            PlayRegistry.OnTick("waits", TickTaps);
+            tapTick = PlayRegistry.OnTick("waits", TickTaps, TickWhen.OnDemand);
+        }
+
+        static PlayTick tapTick;
+
+        // the wait / when block of act, move_to and interact results
+        public static SchemaObj WhenOut()
+        {
+            return Schema.Obj().Str("condition", "The key waited for.").Bool("satisfied", "It held.").Str("detail", "What held, or why it did not.")
+                .Int("waited_steps", "", 0, 1000000).Num("elapsed_ms", "", 0, 1e7);
         }
 
         static ToolResult Handle(Json.Obj a, CallContext ctx)
@@ -113,27 +125,34 @@ namespace InsideDev.Play
                 }
             }
             var set = new WaitSet();
+            bool cleaned = false;
             try
             {
-                for (int i = 0; i < any.Count; i++) set.conds.Add(CompileOne(any[i] as Json.Obj, keys[i], i, ctx));
+                // job conditions resolve here; the others compile on the main thread, in the visit that also checks them
+                // once and, when none holds yet, starts the run
+                var jobConds = new WaitCond[any.Count];
+                for (int i = 0; i < any.Count; i++)
+                    if (keys[i] == "job") jobConds[i] = JobCond(any[i] as Json.Obj, i, ctx);
                 long mark = Stepper.TryMark();
                 string stop, detail;
                 int steps;
                 double elapsed;
-                string already = ctx.Main(() => set.Check());
-                if (already != null)
+                string already = null;
+                bool aware = WaitPlan.LoadAwareAny(keys), watching = watch;
+                var rr = Stepper.Run(ctx, new RunRequest
                 {
-                    stop = RunStop.Condition; detail = already; steps = 0; elapsed = 0;
-                    if (leave) ctx.MainDo(() => { if (Stepper.Mode == StepMode.Step) Stepper.Unfreeze(); });
-                }
-                else if (!watch)
+                    maxSteps = maxSteps, timeoutMs = (int)Math.Round(timeoutS * 1000), stopCheck = set.Check, stopOnDeath = !aware, stopOnLoad = !aware,
+                    leaveRunning = leave, label = "wait_until"
+                }, () =>
                 {
-                    bool aware = WaitPlan.LoadAwareAny(keys);
-                    var rr = Stepper.Run(ctx, new RunRequest
-                    {
-                        maxSteps = maxSteps, timeoutMs = (int)Math.Round(timeoutS * 1000), stopCheck = set.Check, stopOnDeath = !aware, stopOnLoad = !aware,
-                        leaveRunning = leave, label = "wait_until"
-                    });
+                    for (int i = 0; i < any.Count; i++) set.conds.Add(jobConds[i] ?? CompileMain(any[i] as Json.Obj, keys[i], i));
+                    already = set.Check();
+                    if (already != null && leave && Stepper.Mode == StepMode.Step) Stepper.Unfreeze();
+                    return already == null && !watching;
+                });
+                if (already != null) { stop = RunStop.Condition; detail = already; steps = 0; elapsed = 0; }
+                else if (rr != null)
+                {
                     stop = rr.stop; detail = rr.detail; steps = rr.steps; elapsed = rr.elapsedMs;
                     warnings.AddRange(rr.warnings);
                 }
@@ -145,7 +164,9 @@ namespace InsideDev.Play
                     observed = ctx.Main(() =>
                     {
                         var ob = set.Observed();
-                        if (wantObserve) obs = Stepper.TryConcise("wait_until");
+                        if (wantObserve) obs = Stepper.TryConcise("wait_until", ctx.Info.sessionId);
+                        set.Cleanup();
+                        cleaned = true;
                         return ob;
                     });
                 }
@@ -156,7 +177,7 @@ namespace InsideDev.Play
                 {
                     if (keys[i] != "job") continue;
                     var j = ctx.FindJob(PlayShared.Str(any[i] as Json.Obj, "job", ""));
-                    if (j != null) o["job"] = j.Describe();
+                    if (j != null) o["job"] = JobBrief(j);
                     break;
                 }
                 var ch = Stepper.TrySince(mark);
@@ -166,11 +187,27 @@ namespace InsideDev.Play
             }
             finally
             {
-                if (set.conds.Count > 0)
+                if (!cleaned && set.NeedsCleanup)
                 {
                     try { ctx.MainDo(set.Cleanup, 2000); } catch { }
                 }
             }
+        }
+
+        // the job's state plus, from its result, how it really ended (a playback that died, was cancelled or hit a load
+        // still ends as a job in state done)
+        static Json.Obj JobBrief(McpJob j)
+        {
+            var d = j.Describe();
+            try
+            {
+                var res = j.Result;
+                if (res != null)
+                    foreach (var k in new[] { "outcome", "end", "stop_reason" })
+                        if (res[k] is string) d[k] = res[k];
+            }
+            catch (Exception) { }
+            return d;
         }
 
         static void Watch(CallContext ctx, WaitSet set, int timeoutMs, int maxSteps, out string stop, out string detail, out int steps, out double elapsed)
@@ -513,12 +550,7 @@ namespace InsideDev.Play
 
         static string ShortState(object state)
         {
-            if (state == null) return "";
-            string n = state.GetType().Name;
-            if (n.StartsWith("Boy") && n.Length > 3) n = n.Substring(3);
-            else if (n.StartsWith("Huddle") && n.Length > 6) n = n.Substring(6);
-            if (n.EndsWith("State") && n.Length > 5) n = n.Substring(0, n.Length - 5);
-            return n;
+            return state == null ? "" : ActStateNames.Short(state.GetType());
         }
 
         static bool SameState(BodyNow b, string want)
@@ -720,29 +752,30 @@ namespace InsideDev.Play
             o["condition"] = key;
             try
             {
-                set.conds.Add(CompileOne(condition, key, 0, ctx));
-                string already = ctx.Main(() => set.Check());
                 int steps = 0;
                 double elapsed = 0;
-                string detail;
+                string detail, already = null;
                 var warnings = new List<string>();
+                int budget = WaitPlan.WhenBudgetMs(timeoutS, ctx.RemainingMs, reserveMs);
+                int maxSteps = 36000;
+                if (key == "steps") maxSteps = Math.Max(maxSteps, PlayShared.Int(condition, "steps", 1));
+                bool aware = WaitPlan.LoadAwareAny(new List<string> { key });
+                // compile, check once and start the run in one visit of the main thread
+                var rr = Stepper.Run(ctx, new RunRequest { maxSteps = maxSteps, timeoutMs = Math.Max(1, budget), stopCheck = set.Check, stopOnDeath = !aware, stopOnLoad = !aware, label = label + " when" }, () =>
+                {
+                    set.conds.Add(CompileMain(condition, key, 0));
+                    already = set.Check();
+                    return already == null && budget >= 100;
+                });
                 if (already != null) { stop = RunStop.Condition; detail = set.What ?? already; }
+                else if (rr == null) { stop = RunStop.Timeout; detail = "no time left in this call for the wait (lower the action's length or when_timeout_s)"; }
                 else
                 {
-                    int budget = WaitPlan.WhenBudgetMs(timeoutS, ctx.RemainingMs, reserveMs);
-                    if (budget < 100) { stop = RunStop.Timeout; detail = "no time left in this call for the wait (lower the action's length or when_timeout_s)"; }
-                    else
-                    {
-                        int maxSteps = 36000;
-                        if (key == "steps") maxSteps = Math.Max(maxSteps, PlayShared.Int(condition, "steps", 1));
-                        bool aware = WaitPlan.LoadAwareAny(new List<string> { key });
-                        var rr = Stepper.Run(ctx, new RunRequest { maxSteps = maxSteps, timeoutMs = budget, stopCheck = set.Check, stopOnDeath = !aware, stopOnLoad = !aware, label = label + " when" });
-                        stop = rr.stop;
-                        detail = rr.stop == RunStop.Condition ? (set.What ?? rr.detail) : rr.detail;
-                        steps = rr.steps;
-                        elapsed = rr.elapsedMs;
-                        warnings.AddRange(rr.warnings);
-                    }
+                    stop = rr.stop;
+                    detail = rr.stop == RunStop.Condition ? (set.What ?? rr.detail) : rr.detail;
+                    steps = rr.steps;
+                    elapsed = rr.elapsedMs;
+                    warnings.AddRange(rr.warnings);
                 }
                 o["satisfied"] = stop == RunStop.Condition;
                 o["detail"] = detail ?? "";
@@ -753,7 +786,10 @@ namespace InsideDev.Play
             }
             finally
             {
-                try { ctx.MainDo(set.Cleanup, 2000); } catch { }
+                if (set.NeedsCleanup)
+                {
+                    try { ctx.MainDo(set.Cleanup, 2000); } catch { }
+                }
             }
         }
 
@@ -825,6 +861,8 @@ namespace InsideDev.Play
             public SignalConnection con;
             public int fired;
             public double lastUsedMs;
+            // removed from its SignalOut (the wait ended, or its checks stood still past TapExpireMs)
+            public bool dead;
         }
 
         static readonly List<Tap> taps = new List<Tap>();
@@ -842,6 +880,7 @@ namespace InsideDev.Play
             int start = t.fired;
             c.check = () =>
             {
+                if (t.dead) ReviveTap(t);
                 t.lastUsedMs = Now;
                 return t.fired > start ? output + " fired on " + spec + (t.fired - start > 1 ? " (" + (t.fired - start) + " times)" : "") : null;
             };
@@ -873,12 +912,30 @@ namespace InsideDev.Play
             t.con = new SignalConnection { isActive = true, signalIn = sin, signalOut = found, signalOutGameObject = go, signalOutName = found.debugName, signalInName = TapName };
             list.Insert(0, t.con);
             taps.Add(t);
+            if (tapTick != null) tapTick.Active = true;
             return t;
+        }
+
+        // the expiry took the tap of a wait that still runs (its checks stood still for TapExpireMs, e.g. a long hitch
+        // in the frame that starts the run): put it back; signals that fired in between are lost
+        static void ReviveTap(Tap t)
+        {
+            try
+            {
+                var list = fConns != null && t.so != null ? fConns.GetValue(t.so) as FastList<SignalConnection> : null;
+                if (list == null) return;
+                list.Insert(0, t.con);
+                taps.Add(t);
+                t.dead = false;
+                if (tapTick != null) tapTick.Active = true;
+            }
+            catch { }
         }
 
         static void RemoveTap(Tap t)
         {
             if (!taps.Remove(t)) return;
+            t.dead = true;
             try
             {
                 var list = fConns != null && t.so != null ? fConns.GetValue(t.so) as FastList<SignalConnection> : null;
@@ -887,10 +944,14 @@ namespace InsideDev.Play
             catch { }
         }
 
-        // main thread, every frame: drop taps whose wait ended without clean-up
+        // main thread, every frame while a tap exists: drop taps whose wait ended without clean-up
         static void TickTaps()
         {
-            if (taps.Count == 0) return;
+            if (taps.Count == 0)
+            {
+                if (tapTick != null) tapTick.Active = false;
+                return;
+            }
             double now = Now;
             for (int i = taps.Count - 1; i >= 0; i--)
                 if (now - taps[i].lastUsedMs > TapExpireMs) RemoveTap(taps[i]);

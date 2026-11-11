@@ -17,6 +17,9 @@ namespace InsideDev.Play
     // thread (CtlRun.cs): the reply says "started: ... job=jN", ctl job jN shows it, ctl stop, MCP restore and jobs cancel
     // stop it. Every reply is one result line plus the body line (CtlCore.Body); the first word of the result line is
     // what the MCP command tool reads as the outcome (busy:, usage:, refused:, failed: are errors).
+    // ctl status also names the last ctl job and how it ended; ctl wait [jN] [<seconds>] blocks until a job ends, which
+    // only a caller off the game's main thread may do (every route to the console today runs commands on the main
+    // thread, where it is refused with the polling form: a blocked main thread would stop the game and the job).
     // A second extension class of InsideDev.Play.dll next to PlayExtension: it owns only the ctl word.
     public sealed class CtlExtension : IInsideDevExtension, IDisposable
     {
@@ -32,6 +35,7 @@ namespace InsideDev.Play
         public string Command(List<string> a, DevCore core)
         {
             if (a == null || a.Count == 0 || !string.Equals(a[0], CtlCommands.Word, StringComparison.OrdinalIgnoreCase)) return null;
+            if (PlayRegistry.OnMainThread) PlayRegistry.UsedHere(false); else PlayRegistry.Used(false);
             return CtlCommands.Run(a);
         }
 
@@ -51,7 +55,9 @@ namespace InsideDev.Play
             try { line = p.error ?? Exec(p); }
             catch (McpException e) { line = CtlCore.ErrorLine(e.code, e.Message, e.hint); }
             catch (Exception e) { line = "failed: " + e.GetType().Name + ": " + e.Message; }
-            if (p.error == null && (p.kind == CtlKind.Help || p.kind == CtlKind.StatusJson)) return line;
+            if (p.error == null && (p.kind == CtlKind.Help || p.kind == CtlKind.StatusJson || (p.kind == CtlKind.Job && p.json))) return line;
+            // the body line reads the game: main thread only (ctl wait may come from another thread)
+            if (!PlayRegistry.OnMainThread) return line;
             return line + "\n" + SafeBody();
         }
 
@@ -62,7 +68,8 @@ namespace InsideDev.Play
                 case CtlKind.Help: return CtlCore.Help;
                 case CtlKind.Status: return Status();
                 case CtlKind.StatusJson: return CtlGame.StatusJson();
-                case CtlKind.Job: return JobLine(p.jobId);
+                case CtlKind.Job: return p.json ? JobJson(p.jobId) : JobLine(p.jobId);
+                case CtlKind.Wait: return Wait(p.jobId, p.target);
                 case CtlKind.Stop: return Stop();
                 case CtlKind.Hold:
                 case CtlKind.Release:
@@ -146,7 +153,16 @@ namespace InsideDev.Play
                 job.Fail(McpErr.Internal, "could not start the ctl thread: " + e.Message);
                 return "failed: could not start the job thread: " + e.Message;
             }
-            return "started: " + p.what + " job=" + job.Id + "; ctl job " + job.Id + " shows it, ctl stop cancels it";
+            string eta = "";
+            // input commands and time step have a known length (stopat, goto and a playback end when they get there)
+            try
+            {
+                bool step = Stepper.Mode == StepMode.Step && Stepper.Clock.ModeChosen;
+                if (p.kind == CtlKind.Input) eta = CtlCore.Eta(p.steps, step, Stepper.Speed);
+                else if (p.kind == CtlKind.Tool && p.tool == "time") eta = CtlCore.Eta((int)p.args.Num("steps", 0), true, Stepper.Speed);
+            }
+            catch (Exception) { }
+            return "started: " + p.what + " job=" + job.Id + "; ctl job " + job.Id + " shows it, ctl stop cancels it" + eta;
         }
 
         // main thread: a Play tool that answers at once (track ops, time freeze / run / speed / state)
@@ -204,7 +220,89 @@ namespace InsideDev.Play
             return "held by " + j.Tool + " job " + j.Id + (what != null ? " (" + what + ")" : "");
         }
 
-        static string Status() { return "ok: control lane " + LaneText(); }
+        static string Status()
+        {
+            string last = CtlJobs.LastId;
+            var j = string.IsNullOrEmpty(last) ? null : HostJobs.Find(last);
+            string tail = j == null || j.State == McpJobState.Running ? "" : "; last job " + j.Id + ": " + CtlCore.JobText(j.State, CtlJobs.WhatOf(j.Id) ?? j.Tool, j.Result);
+            return "ok: control lane " + LaneText() + tail;
+        }
+
+        // main thread: {lane, job?, last_job?} for ctl status json
+        internal static Json.Obj StatusBlock()
+        {
+            var o = new Json.Obj();
+            var run = HostJobs.Running(McpLanes.Control);
+            o["lane"] = run == null ? "free" : "held";
+            if (run != null) o["job"] = JobObj(run);
+            string last = CtlJobs.LastId;
+            var j = string.IsNullOrEmpty(last) ? null : HostJobs.Find(last);
+            if (j != null && j.State != McpJobState.Running) o["last_job"] = JobObj(j);
+            return o;
+        }
+
+        static Json.Obj JobObj(McpJob j)
+        {
+            var o = new Json.Obj();
+            o["id"] = j.Id;
+            o["tool"] = j.Tool;
+            o["state"] = j.State;
+            string what = CtlJobs.WhatOf(j.Id);
+            if (what != null) o["what"] = what;
+            o["elapsed_s"] = Math.Round(j.ElapsedMs / 1000.0, 1);
+            if (j.State != McpJobState.Running)
+            {
+                o["line"] = CtlCore.JobText(j.State, what ?? j.Tool, j.Result);
+                var res = j.Result;
+                if (res != null)
+                    foreach (var k in new[] { "outcome", "end", "stop_reason", "steps", "requested" })
+                        if (res[k] != null && !(res[k] is Json.Obj)) o[k] = res[k];
+            }
+            else
+            {
+                var d = j.Describe();
+                if (d.ContainsKey("progress")) { o["progress"] = d["progress"]; o["total"] = d["total"]; }
+                if (j.Cancelled) o["cancelling"] = true;
+            }
+            return o;
+        }
+
+        static string JobJson(string id)
+        {
+            if (string.IsNullOrEmpty(id)) id = CtlJobs.LastId;
+            var j = string.IsNullOrEmpty(id) ? null : HostJobs.Find(id);
+            if (j == null) return InsideDev.JsonLine.Obj("ok", false, "error", string.IsNullOrEmpty(id) ? "no ctl job yet" : "no job " + id);
+            var o = JobObj(j);
+            o["ok"] = true;
+            o.order.Remove("ok");
+            o.order.Insert(0, "ok");
+            return InsideDev.JsonLine.Write(o);
+        }
+
+        // ctl wait: the job's line once it ended, or its running line after seconds. Blocks the caller, so it is refused
+        // on the game's main thread (the job could never end there)
+        static string Wait(string id, double seconds)
+        {
+            if (string.IsNullOrEmpty(id)) id = CtlJobs.LastId;
+            if (string.IsNullOrEmpty(id)) return "not found: no ctl job yet (timed ctl commands start one)";
+            var j = HostJobs.Find(id);
+            if (j == null) return "not found: no job " + id + " (finished jobs are kept 10 minutes)";
+            if (j.State != McpJobState.Running) return JobLine(id);
+            if (PlayRegistry.OnMainThread || PlayRegistry.MainThread < 0)
+                return "refused: ctl wait would stop the game here (the console, the bridge and the command tool run commands on the game's main thread); poll ctl job " + id +
+                       ", or use the MCP tool wait_until {any:[{job:\"" + id + "\"}]}";
+            return WaitJob(id, (int)Math.Round(seconds * 1000));
+        }
+
+        // any thread but the game's main thread: block until the job ends or timeoutMs passed; the reply of ctl job
+        public static string WaitJob(string id, int timeoutMs)
+        {
+            var j = HostJobs.Find(id);
+            if (j == null) return "not found: no job " + id + " (finished jobs are kept 10 minutes)";
+            if (PlayRegistry.OnMainThread) return "refused: a wait on the game's main thread would stop the game";
+            bool ended = j.Await(Math.Max(0, Math.Min(timeoutMs, (int)(CtlCore.WaitMaxS * 1000))));
+            return ended ? JobLine(id) : JobLine(id) + " (not finished after " + CtlCore.F(Math.Round(timeoutMs / 1000.0, 1)) + " s)";
+        }
 
         static string JobLine(string id)
         {

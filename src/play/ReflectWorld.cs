@@ -139,6 +139,13 @@ namespace InsideDev.Play
             catch (Exception) { return null; }
         }
 
+        // the same for the caller's MCP session (its own events cursor, no-progress counter and delta base)
+        public static object Concise(string tool, CallContext ctx)
+        {
+            try { return Observer.Concise(tool, ctx != null && ctx.Info != null ? ctx.Info.sessionId : null); }
+            catch (Exception) { return null; }
+        }
+
         public static bool SaveLocked()
         {
             try { return Saves.Locked; }
@@ -176,6 +183,13 @@ namespace InsideDev.Play
             if (frames <= 0) return false;
             bool frozen = false;
             try { frozen = ctx.Main(() => Frozen(), 3000); } catch (McpException) { }
+            return WaitVerify(ctx, frames, warnings, frozen);
+        }
+
+        // the same when the caller read Frozen() in the main-thread item that made the change (one item less)
+        public static bool WaitVerify(CallContext ctx, int frames, List<string> warnings, bool frozen)
+        {
+            if (frames <= 0) return false;
             if (frozen) warnings.Add("frozen: re-read after " + frames + " rendered frames; the game's logic steps did not run (time step or act to see the game react)");
             if (!ctx.WaitFrames(frames, 3000 + frames * 200))
             {
@@ -277,18 +291,36 @@ namespace InsideDev.Play
             public List<SignalIn> In(GameObject go) { List<SignalIn> l; return go != null && ins.TryGetValue(go.GetInstanceID(), out l) ? l : new List<SignalIn>(); }
             public List<SignalOut> Out(GameObject go) { List<SignalOut> l; return go != null && outs.TryGetValue(go.GetInstanceID(), out l) ? l : new List<SignalOut>(); }
 
+            // connections by the instance id of their sender / receiver object (filled by ScanPorts)
+            public readonly Dictionary<int, List<SignalConnection>> from = new Dictionary<int, List<SignalConnection>>();
+            public readonly Dictionary<int, List<SignalConnection>> to = new Dictionary<int, List<SignalConnection>>();
+
             public List<SignalConnection> From(GameObject go)
             {
-                var r = new List<SignalConnection>();
-                foreach (var c in conns) if (c.signalOutGameObject == go) r.Add(c);
-                return r;
+                List<SignalConnection> l;
+                return go != null && from.TryGetValue(go.GetInstanceID(), out l) ? new List<SignalConnection>(l) : new List<SignalConnection>();
             }
 
             public List<SignalConnection> To(GameObject go)
             {
-                var r = new List<SignalConnection>();
-                foreach (var c in conns) if (c.signalInGameObject == go) r.Add(c);
-                return r;
+                List<SignalConnection> l;
+                return go != null && to.TryGetValue(go.GetInstanceID(), out l) ? new List<SignalConnection>(l) : new List<SignalConnection>();
+            }
+
+            internal void Index(SignalConnection c)
+            {
+                conns.Add(c);
+                var o = c.signalOutGameObject;
+                if (o != null) Bucket(from, o.GetInstanceID()).Add(c);
+                var i = c.signalInGameObject;
+                if (i != null) Bucket(to, i.GetInstanceID()).Add(c);
+            }
+
+            static List<SignalConnection> Bucket(Dictionary<int, List<SignalConnection>> d, int id)
+            {
+                List<SignalConnection> l;
+                if (!d.TryGetValue(id, out l)) d[id] = l = new List<SignalConnection>();
+                return l;
             }
         }
 
@@ -321,7 +353,7 @@ namespace InsideDev.Play
                 }
             if (sm.connections != null)
                 foreach (var c in sm.connections)
-                    if (c != null && c.isActive && !c.IsDead) p.conns.Add(c);
+                    if (c != null && c.isActive && !c.IsDead) p.Index(c);
             return p;
         }
 

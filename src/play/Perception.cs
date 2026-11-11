@@ -23,7 +23,26 @@ namespace InsideDev.Play
 
         public static void Register()
         {
-            PlayRegistry.OnTick("perception", Tick);
+            tick = PlayRegistry.OnTick("perception", Tick, TickWhen.OnDemand);
+            try
+            {
+                EditorState.Describe("play", "play.perception_scan", "all", "observe: which objects the component pass keeps. all = switched-off objects too (objects that the game switches on later are seen at once, a pass is needed only after a load or a streamed-in subscene); active = active objects only, rescanned for every observation");
+                EditorState.Describe("play", "play.perception_bg_s", "0", "observe: seconds between background passes of the component lists while an agent is active (0 = none; passes run when an observation needs them)");
+                Doctor.Register("play.perception", DoctorRows);
+            }
+            catch (Exception) { }
+        }
+
+        static List<Doctor.Row> DoctorRows()
+        {
+            var l = new List<Doctor.Row>();
+            bool bad = MissingTypes.Count > 0 || MissingMembers.Count > 0 || Failures.Count > 0;
+            string detail = ScanStatus();
+            if (MissingTypes.Count > 0) detail += "; game classes not found: " + string.Join(", ", MissingTypes.ToArray());
+            if (MissingMembers.Count > 0) detail += "; private members not found: " + string.Join(", ", MissingMembers.ToArray());
+            if (Failures.Count > 0) detail += "; first failure: " + Failures[0];
+            l.Add(new Doctor.Row("play.perception", "observe scan", bad ? Doctor.Warn : Doctor.Ok, detail, bad ? "the game build differs from the one the tool was written for: observe lists fewer objects or states" : null));
+            return l;
         }
 
         // the controlled character now (ScriptGlobals.mainCharacter: huddle when huddleActive, else boy); null while loading
@@ -40,6 +59,25 @@ namespace InsideDev.Play
             var c = Controlled();
             pos = c != null ? c.pos : Vector3.zero;
             return c != null;
+        }
+
+        // the same position without building the body record (per-frame readers); allocates nothing
+        internal static bool BodyPosFast(out Vector3 pos)
+        {
+            if (Time.frameCount == ctlFrame && ctlEpoch == Observer.Epoch && ctlCache != null && ctlCache.go != null) { pos = ctlCache.pos; return true; }
+            pos = Vector3.zero;
+            var ch = ActiveCharacter();
+            if (ch == null) return false;
+            var boy = ch as Boy;
+            if (boy != null)
+            {
+                Submarine sub = boy.specialBoyMode == Boy.SpecialBoyMode.InsideSub ? BoySubmarine() : null;
+                if (sub != null) { pos = sub.pos3; return true; }
+                Boy dude = boy.isMindControlling ? ControlledDude() : null;
+                if (dude != null) { pos = dude.pos3; return true; }
+            }
+            pos = ch.pos3;
+            return true;
         }
 
         // the body section of observe (Observer.BodySchema); full adds anim, obstructed, edges
@@ -99,7 +137,7 @@ namespace InsideDev.Play
             foreach (var x in Items(typeof(MindHatReceiver)))
             {
                 var rcv = x as MindHatReceiver;
-                if (rcv == null) continue;
+                if (!Live(rcv)) continue;
                 var d = rcv.GetComponent<Boy>();
                 if (d == null || d == boy) continue;
                 bool ctl = c != null && c.kind == "dude" && c.boy == d;
@@ -109,7 +147,7 @@ namespace InsideDev.Play
             foreach (var x in Items(typeof(Submarine)))
             {
                 var s = x as Submarine;
-                if (s == null) continue;
+                if (!Live(s)) continue;
                 l.Add(BodyOf("submarine", s.gameObject, s.pos3, c != null && c.kind == "submarine" && c.sub == s, s.isActiveAndEnabled));
                 if (l.Count >= 16) break;
             }
@@ -127,7 +165,7 @@ namespace InsideDev.Play
         public static List<HazardInfo> Hazards(Vector3 center, float radius, int limit)
         {
             int total;
-            return HazardsCounted(center, radius, limit, out total);
+            return HazardsCounted(center, radius, limit, out total, ForQuery);
         }
 
         // interact verbs the controlled body can try on go (Interact.Verbs); kind = one of Observer.ObjectKinds
@@ -320,13 +358,13 @@ namespace InsideDev.Play
             foreach (var x in Items(typeof(SubmarineBoyInteraction)))
             {
                 var sbi = x as SubmarineBoyInteraction;
-                if (sbi == null || sbi.submarine == null) continue;
+                if (!Live(sbi) || sbi.submarine == null) continue;
                 if (sbi.GetBoyIsInsideSubmarine()) return sbi.submarine;
             }
             foreach (var x in Items(typeof(Submarine)))
             {
                 var s = x as Submarine;
-                if (s != null && s.isActiveAndEnabled) return s;
+                if (Live(s) && s.isActiveAndEnabled) return s;
             }
             return null;
         }
@@ -336,7 +374,7 @@ namespace InsideDev.Play
             foreach (var x in Items(typeof(MindHatReceiver)))
             {
                 var rcv = x as MindHatReceiver;
-                if (rcv == null || !rcv.ControlIsActive()) continue;
+                if (!Live(rcv) || !rcv.ControlIsActive()) continue;
                 var d = rcv.GetBoyControlledByHat();
                 if (d != null && d != ScriptGlobals.boy && d.isCharacterActive) return d;
             }
@@ -366,12 +404,21 @@ namespace InsideDev.Play
             return "state " + (an ?? s);
         }
 
+        // per frame while an agent is active: reads the falling body directly (no body record, no allocation)
         static void TrackFall()
         {
-            var c = Controlled();
-            if (c == null || c.boy == null || c.grounded || c.dead) return;
-            float lim = c.boy.properties != null && c.boy.properties.death != null ? c.boy.properties.death.fallSpeedLimit : 12.4f;
-            if (-c.vel.y > lim * 0.85f) fallThreatStep = LogicManager.stepCount;
+            var boy = ActiveCharacter() as Boy;
+            if (boy == null || boy.isDead) return;
+            if (boy.specialBoyMode == Boy.SpecialBoyMode.InsideSub && BoySubmarine() != null) return;
+            if (boy.isMindControlling)
+            {
+                var dude = ControlledDude();
+                if (dude != null) { boy = dude; if (boy.isDead) return; }
+            }
+            float vy = boy.velocity.y;
+            if (vy > -1f || boy.status.groundPlateau != null) return;
+            float lim = boy.properties != null && boy.properties.death != null ? boy.properties.death.fallSpeedLimit : 12.4f;
+            if (-vy > lim * 0.85f) fallThreatStep = LogicManager.stepCount;
         }
 
         static string ComputeMusicTimed()
@@ -382,13 +429,12 @@ namespace InsideDev.Play
             bool hb = BodyPos(out p);
             var wft = LevelGlobals.waterFlushTunnel;
             if (wft != null && wft.isActiveAndEnabled && (!hb || (wft.transform.position - p).magnitude < 120f)) return "lab water lock (WaterFlushTunnel)";
-            EnsureFresh(typeof(ElevatorFall));
+            RefreshIfStale(RunSteps);
             foreach (var x in Items(typeof(ElevatorFall)))
             {
                 var ef = x as ElevatorFall;
                 if (ef != null && ef.isActiveAndEnabled && (!hb || (ef.transform.position - p).magnitude < 80f)) return "lab elevator fall (ElevatorFall)";
             }
-            EnsureFresh(typeof(ZombieMonitorDetection));
             foreach (var x in Items(typeof(ZombieMonitorDetection)))
             {
                 var z = x as ZombieMonitorDetection;
@@ -397,9 +443,23 @@ namespace InsideDev.Play
             return null;
         }
 
+        static PlayTick tick;
+
+        // any thread (ChangeLog.Touch): an agent is active, the tick runs until ChangeLog.Active ends
+        internal static void TickOn()
+        {
+            var t = tick;
+            if (t != null) t.Active = true;
+        }
+
         static void Tick()
         {
-            if (!ChangeLog.Active) return;
+            if (!ChangeLog.Active)
+            {
+                tick.Active = false;
+                if (ChangeLog.Active) tick.Active = true;
+                return;
+            }
             try
             {
                 if (GameManager.IsLoading()) return;

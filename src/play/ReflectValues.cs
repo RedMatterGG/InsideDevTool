@@ -389,8 +389,8 @@ namespace InsideDev.Play
         {
             if (v == null) return null;
             if (v is bool || v is string) return Cut(v);
-            if (v is double) return v;
-            if (v is float) return FloatToDouble((float)v);
+            if (v is double) return FiniteOrName((double)v);
+            if (v is float) return FiniteOrName((float)v);
             if (IsNumber(v)) return System.Convert.ToDouble(v, IC);
             if (v is char) return v.ToString();
             if (v is Enum) return v.ToString();
@@ -398,7 +398,7 @@ namespace InsideDev.Play
             if (fl != null)
             {
                 var l = new List<object>();
-                foreach (var x in fl) l.Add(FloatToDouble(x));
+                foreach (var x in fl) l.Add(FiniteOrName(x));
                 return l;
             }
             if (v is UnityEngine.Object) return objRender != null ? objRender((UnityEngine.Object)v) : SafeName((UnityEngine.Object)v);
@@ -422,15 +422,17 @@ namespace InsideDev.Play
             if (en != null)
             {
                 var l = new List<object>();
-                int n = 0, total = 0;
+                var col = v as ICollection;
+                int n = 0;
+                bool more = false;
                 foreach (var x in en)
                 {
-                    total++;
-                    if (n >= MaxItems) continue;
+                    if (n >= MaxItems) { more = true; break; }
                     l.Add(depth > 0 ? RenderInner(x, depth - 1, objRender) : Shallow(x));
                     n++;
                 }
-                if (total > n) l.Add("+" + (total - n) + " more");
+                if (col != null && col.Count > n) l.Add("+" + (col.Count - n) + " more");
+                else if (more) l.Add("+ more");
                 return l;
             }
             if (depth <= 0) return Shallow(v);
@@ -471,6 +473,21 @@ namespace InsideDev.Play
         {
             if (float.IsNaN(f) || float.IsInfinity(f)) return 0;
             return double.Parse(f.ToString("R", IC), IC);
+        }
+
+        // a number for JSON; NaN and the infinities have no JSON form and are shown by name
+        public static object FiniteOrName(double d)
+        {
+            if (double.IsNaN(d)) return "NaN";
+            if (double.IsInfinity(d)) return d > 0 ? "Infinity" : "-Infinity";
+            return d;
+        }
+
+        public static object FiniteOrName(float f)
+        {
+            if (float.IsNaN(f)) return "NaN";
+            if (float.IsInfinity(f)) return f > 0 ? "Infinity" : "-Infinity";
+            return FloatToDouble(f);
         }
 
         public static string CleanName(string n)
@@ -929,6 +946,105 @@ namespace InsideDev.Play
             return null;
         }
 
+        // Calls and writes are decided by where the type comes from (the read rules above them stay a deny list):
+        //   game code (Assembly-CSharp, firstpass, PlayMaker, ConditionalExpression, Log): allowed, minus the named rules;
+        //   UnityEngine: allowed, minus what writes a file (Application.CaptureScreenshot, Profiler log), the registry
+        //     (PlayerPrefs Set* / Save / Delete*), the saved display mode (Screen.SetResolution, fullScreen), opens the
+        //     network (WWW, Network, MasterServer, Ping ...), loads code (Security, Types) or quits; of Application only
+        //     AppWritable and read-only names; namespaces outside UnityNamespaces not at all;
+        //   the tool itself (InsideDev*): read-only names only: its classes write files and start processes
+        //     (SafeFile, Ffmpeg, the recorders) and are driven through tools and commands;
+        //   everything else (mscorlib, System.*, Mono.*, any other library): only SystemTypes, System.Collections*,
+        //     System.Text and System.Globalization. System.Xml, System.CodeDom, Microsoft.CSharp, System.Data,
+        //     System.Timers and the rest can write files, compile or load code, or start threads.
+        const int FromGame = 0, FromUnity = 1, FromTool = 2, FromLibrary = 3;
+        static readonly Dictionary<Assembly, int> origins = new Dictionary<Assembly, int>();
+        static readonly string[] GameAssemblies = { "Assembly-CSharp", "Assembly-CSharp-firstpass", "PlayMaker", "ConditionalExpression", "Log" };
+        static readonly string[] SystemTypes = { "Object", "ValueType", "Enum", "String", "Char", "Boolean", "Byte", "SByte", "Int16", "UInt16", "Int32", "UInt32", "Int64", "UInt64",
+            "Single", "Double", "Decimal", "Math", "Convert", "BitConverter", "DateTime", "TimeSpan", "Guid", "Array", "Random", "Nullable", "Nullable`1", "StringComparer", "Version", "Buffer" };
+        static readonly string[] UnityNamespaces = { "UnityEngine", "UnityEngine.UI", "UnityEngine.EventSystems", "UnityEngine.Events", "UnityEngine.Rendering", "UnityEngine.Audio", "UnityEngine.Sprites" };
+        static readonly string[] UnityBlockedTypes = { "WWW", "WWWForm", "Network", "NetworkView", "NetworkPlayer", "NetworkMessageInfo", "MasterServer", "Ping", "Security", "Types",
+            "Caching", "Microphone", "WebCamTexture", "Handheld", "Profiler", "Social", "CrashReport" };
+        static readonly string[] AppWritable = { "targetFrameRate", "runInBackground", "backgroundLoadingPriority" };
+
+        static int Origin(Type t)
+        {
+            while (t.HasElementType && t.GetElementType() != null) t = t.GetElementType();
+            var asm = t.Assembly;
+            lock (origins)
+            {
+                int o;
+                if (origins.TryGetValue(asm, out o)) return o;
+                string n;
+                try { n = asm.GetName().Name ?? ""; } catch { n = ""; }
+                if (Array.IndexOf(GameAssemblies, n) >= 0 || n.StartsWith("Assembly-", StringComparison.Ordinal)) o = FromGame;
+                else if (n == "UnityEngine" || n.StartsWith("UnityEngine.", StringComparison.Ordinal)) o = FromUnity;
+                else if (n == "InsideDev" || n.StartsWith("InsideDev.", StringComparison.Ordinal) || n == "InsideMuter") o = FromTool;
+                else o = FromLibrary;
+                origins[asm] = o;
+                return o;
+            }
+        }
+
+        // a call or a write on a member that type declares (or on type as the target): null when its origin allows it
+        static string OutsideAllowList(Type type, string m, bool isCall, bool isWrite, out string hint)
+        {
+            hint = null;
+            Type t = type;
+            while (t.HasElementType && t.GetElementType() != null) t = t.GetElementType();
+            string ns = t.Namespace ?? "", tn = t.Name, full = t.FullName ?? tn;
+            if (type.IsArray) { ns = "System"; tn = "Array"; }
+            switch (type.IsArray ? FromLibrary : Origin(t))
+            {
+                case FromLibrary:
+                    if (ns == "System" ? Array.IndexOf(SystemTypes, tn) >= 0 : ns == "System.Collections" || ns.StartsWith("System.Collections.", StringComparison.Ordinal) || ns == "System.Text" || ns == "System.Globalization") return null;
+                    hint = "outside the game and UnityEngine only the basic System types (numbers, strings, Math, Convert, DateTime, arrays), System.Collections and System.Text can be called or written";
+                    return full + " is outside the reflect allow-list (it could reach files, processes, code loading or the network)";
+                case FromTool:
+                    if (isCall && !isWrite && ReadOnlyName(m)) return null;
+                    hint = "the tool's own classes write files and start processes: drive them through the MCP tools and the command tool";
+                    return full + "." + m + " is InsideDev code and is not callable through reflect";
+                case FromUnity:
+                    if (Array.IndexOf(UnityNamespaces, ns) < 0)
+                    {
+                        hint = "the network, analytics, platform and file namespaces of UnityEngine are not reachable through MCP";
+                        return full + " is outside the reflect allow-list";
+                    }
+                    if (ns != "UnityEngine") return null;
+                    if (Array.IndexOf(UnityBlockedTypes, tn) >= 0)
+                    {
+                        hint = "network, code-loading, capture-device and profiler-log APIs are not reachable through MCP";
+                        return "UnityEngine." + tn + " is not allowed";
+                    }
+                    if (tn == "Application")
+                    {
+                        string bare = m.StartsWith("set_", StringComparison.Ordinal) ? m.Substring(4) : m;
+                        if (isCall && !isWrite && ReadOnlyName(m)) return null;
+                        if (Array.IndexOf(AppWritable, bare) >= 0) return null;
+                        hint = bare == "CaptureScreenshot" ? "use the screenshot tool (Application.CaptureScreenshot writes a file at any path)" : "of Application only targetFrameRate, runInBackground, backgroundLoadingPriority and read-only members are reachable";
+                        return "Application." + m + " is not allowed";
+                    }
+                    if (tn == "PlayerPrefs" && (isWrite || !ReadOnlyName(m)))
+                    {
+                        hint = "PlayerPrefs is the registry: settings stay as they are (reads are fine)";
+                        return "PlayerPrefs." + m + " writes the registry";
+                    }
+                    if (tn == "Screen" && (m == "SetResolution" || m == "set_fullScreen" || m == "fullScreen" || m == "set_fullScreenMode"))
+                    {
+                        hint = "the display mode is saved by the game and has no undo: change it in the game's own settings";
+                        return "Screen." + m + " changes the saved display mode";
+                    }
+                    return null;
+            }
+            return null;
+        }
+
+        // the type of a field or property that is being written (not the type that declares it): only the deny rules
+        public static string RefusalOfValueType(Type type, string member, object value, out string hint)
+        {
+            return Refusal(type, member, false, true, value, null, Saves.Guard, false, out hint);
+        }
+
         // null when allowed, else the refusal reason; hint gets the alternative
         public static string Refusal(Type type, string member, bool isCall, bool isWrite, object value, IList<object> args, out string hint)
         {
@@ -938,6 +1054,12 @@ namespace InsideDev.Play
         // saveGuard = Saves.Guard (play.save_guard): the save writes (GameManager loads, Savepoint Activate / Save, the
         // save classes) are refused only when it is on
         public static string Refusal(Type type, string member, bool isCall, bool isWrite, object value, IList<object> args, bool saveGuard, out string hint)
+        {
+            return Refusal(type, member, isCall, isWrite, value, args, saveGuard, true, out hint);
+        }
+
+        // owner = type declares the member (or is the target); false = type is only the value type of a written member
+        static string Refusal(Type type, string member, bool isCall, bool isWrite, object value, IList<object> args, bool saveGuard, bool owner, out string hint)
         {
             hint = null;
             if (type == null) return null;
@@ -955,6 +1077,16 @@ namespace InsideDev.Play
             {
                 hint = "runtime, process and type-loading APIs are not reachable through MCP";
                 return "System." + tn + " is blocked";
+            }
+            if ((ns == "InsideDev" || ns.StartsWith("InsideDev.", StringComparison.Ordinal)) && (tn == "HostSettings" || tn == "EditorState" || SecretName(m)))
+            {
+                hint = "the MCP token and the user settings are read in the in-game console (cfg masks the secrets)";
+                return full + "." + m + " holds the MCP server's settings or token and is not readable through reflect";
+            }
+            if (tn.StartsWith("AkSoundEngine", StringComparison.Ordinal) && (isCall || isWrite) && AkFileMember(m))
+            {
+                hint = "Wwise captures and dumps write files at any path; record sound with the tool's own recorders (they write into the tool's folders)";
+                return tn + "." + m + " makes the sound engine write a file";
             }
             if ((ns == "InsideDev.McpExt" || ns.StartsWith("InsideDev.McpExt.", StringComparison.Ordinal) || ns == "InsideDev.Play") && (isCall || isWrite))
             {
@@ -1025,6 +1157,12 @@ namespace InsideDev.Play
                 hint = "settings stay as they are";
                 return "PlayerPrefs." + m + " deletes settings";
             }
+            if (owner && (isCall || isWrite))
+            {
+                string outside = OutsideAllowList(type, m, isCall, isWrite, out hint);
+                if (outside != null) return outside;
+                hint = null;
+            }
             if (RaisesVolume(m, isWrite ? value : null, isCall ? args : null))
             {
                 hint = "sound policy: master volume only goes to 0 (audio {op:\"rtpc\", name:\"rtpc_master_volume\", value:0})";
@@ -1033,10 +1171,67 @@ namespace InsideDev.Play
             return null;
         }
 
+        static bool SecretName(string m)
+        {
+            return m.IndexOf("token", StringComparison.OrdinalIgnoreCase) >= 0 || m.IndexOf("password", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // AkSoundEngine.StartOutputCapture and every member named *Capture*, *Dump*, *Write*, *Save*
+        static bool AkFileMember(string m)
+        {
+            return m.IndexOf("Capture", StringComparison.OrdinalIgnoreCase) >= 0 || m.IndexOf("Dump", StringComparison.OrdinalIgnoreCase) >= 0
+                || m.IndexOf("Write", StringComparison.OrdinalIgnoreCase) >= 0 || m.IndexOf("Save", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // a string member whose name says it holds a path (path, file, dir, folder): writing it can redirect a file the game writes
+        public static bool PathName(string m)
+        {
+            string l = (m ?? "").ToLowerInvariant();
+            return l.IndexOf("path", StringComparison.Ordinal) >= 0 || l.IndexOf("file", StringComparison.Ordinal) >= 0 || l.IndexOf("dir", StringComparison.Ordinal) >= 0 || l.IndexOf("folder", StringComparison.Ordinal) >= 0;
+        }
+
+        // a write to one member: static readonly fields (the game never changes them; a path there redirects a file) and
+        // string members named like a path are refused
+        public static string WriteRefusal(MemberInfo m, out string hint)
+        {
+            hint = null;
+            if (m == null) return null;
+            var f = m as FieldInfo;
+            if (f != null && f.IsStatic && f.IsInitOnly)
+            {
+                hint = "static readonly fields are fixed by the game (a path there would redirect a file it writes)";
+                return m.Name + " is static readonly";
+            }
+            if (MemberType(m) == typeof(string) && PathName(m.Name))
+            {
+                hint = "string members named path, file, dir or folder can redirect a file the game writes";
+                return m.Name + " holds a path";
+            }
+            return null;
+        }
+
+        // every member WritePath writes: the leaf and the value-type owners it writes back
+        public static string WriteRefusal(PathInfo pi, out string hint)
+        {
+            hint = null;
+            int n = pi.members.Count;
+            for (int i = n - 1; i >= 0; i--)
+            {
+                if (i < n - 1)
+                {
+                    var mt = MemberType(pi.members[i]);
+                    if (mt == null || !mt.IsValueType) break;
+                }
+                string why = WriteRefusal(pi.members[i], out hint);
+                if (why != null) return why;
+            }
+            return null;
+        }
+
         static bool ReadOnlyName(string m)
         {
             return m.StartsWith("Get", StringComparison.Ordinal) || m.StartsWith("Is", StringComparison.Ordinal) || m.StartsWith("Has", StringComparison.Ordinal)
-                || m.StartsWith("get_", StringComparison.Ordinal) || m.StartsWith("Can", StringComparison.Ordinal) || m == "ToString";
+                || m.StartsWith("get_", StringComparison.Ordinal) || (m.StartsWith("Can", StringComparison.Ordinal) && !m.StartsWith("Cancel", StringComparison.Ordinal)) || m == "ToString";
         }
 
         public static string Norm(string s)

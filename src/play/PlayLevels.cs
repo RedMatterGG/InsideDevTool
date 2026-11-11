@@ -55,10 +55,12 @@ namespace InsideDev.Play
 
         public static void Register()
         {
+            try { EditorState.Describe("play", "play.cheats", "0", "checkpoint next / prev / goto (jumps to another checkpoint; they write the new spawn into INSIDE.sav) are refused unless this is 1"); } catch (Exception) { }
             PlayRegistry.Add(PlayShared.Def("checkpoint", "Checkpoints", PlayShared.Play, Owner,
                 "Checkpoints (savepoints). current / list are read-only. reload = respawn at the last checkpoint (like dying, no save write; also skips the death wait). next / prev / goto jump to another checkpoint: a cheat, only when the user enabled play.cheats (EditorState play.cheats = 1); it writes the new spawn into INSIDE.sav. Waits until playable unless wait is false; a load still running after timeout_s comes back as job.",
                 Schema.Obj().Enum("op", "current, list, reload, next, prev or goto.", "current", "current", "list", "reload", "next", "prev", "goto")
                     .Int("subscene", "op goto: savepoint subscene index (0..82, see list).", 0, 999).Int("savepoint", "op goto: savepoint index.", 0, 999)
+                    .Str("name", "op goto: subscene by name instead of subscene (scene or puzzle name, or a part of it that matches one subscene; savepoint defaults to 0).")
                     .Str("filter", "op list: name filter.").Int("limit", "op list: rows.", 40, 1, 200).Int("offset", "op list: first row.", 0, 0, 1000)
                     .Bool("wait", "Wait until playable after a load.", true).Num("timeout_s", "Wait limit; when it runs out the result has job.", 45, 1, 50).Build(),
                 Schema.Obj().Enum("op", "", null, "current", "list", "reload", "next", "prev", "goto").Enum("outcome", "", null, "done", "loading", "refused")
@@ -73,6 +75,8 @@ namespace InsideDev.Play
                 Schema.Obj().Enum("op", "status, list, wait_ready, load_checkpoint, load_chapter, reload or step.", "status",
                         "status", "list", "wait_ready", "load_checkpoint", "load_chapter", "reload", "step")
                     .Int("subscene", "Savepoint subscene index.", 0, 999).Int("savepoint", "Savepoint index.", 0, 999).Int("chapter", "Chapter index.", 0, 65)
+                    .Str("name", "op load_checkpoint: subscene by name instead of subscene (scene or puzzle name, or a part of it that matches one subscene).")
+                    .Enum("what", "op list: which rows (all = subscenes and chapters).", "all", "all", "subscenes", "chapters")
                     .Enum("mode", "op load_checkpoint.", "respawn", "respawn", "quiet", "chapter")
                     .Enum("kind", "op reload.", "respawn", "respawn", "chapter", "newgame").Enum("dir", "op step.", "next", "next", "prev")
                     .Str("filter", "op list: name filter.").Int("limit", "op list: rows.", 100, 1, 300).Int("offset", "op list: first row.", 0, 0, 1000)
@@ -98,7 +102,24 @@ namespace InsideDev.Play
                         .Bool("pinned", "").Bool("visible", "")), 0, 300)
                     .Arr("pinned", "Pinned subscenes.", Schema.IntAny(), 0, 300).Arr("warnings", "", Schema.Str(), 0, 20).BuildOutput()), HandleStream);
 
-            PlayRegistry.OnTick("levels", Tick);
+            tick = PlayRegistry.OnTick("levels", Tick, TickWhen.OnDemand);
+            tick.Active = true;
+            PlayRegistry.OnWake(TickOn);
+        }
+
+        static PlayTick tick;
+
+        // any thread: the tick has work (Play used again, a load, a watch, a stream op or freeze, a queued cleanup); it
+        // switches itself off again when Play is not in use and none of that is left
+        internal static void TickOn()
+        {
+            var t = tick;
+            if (t != null) t.Active = true;
+        }
+
+        static bool HasWork()
+        {
+            return PlayRegistry.InUse || requested || loadingFlag || MainCleanup.Pending || watches.Count > 0 || PlayLevelsStream.Busy || PlayLevelsStream.Frozen;
         }
 
         public static SchemaObj StatusSchema()
@@ -131,8 +152,10 @@ namespace InsideDev.Play
                 req.cheat = true;
                 if (op == "goto")
                 {
-                    if (!PlayShared.Has(a, "subscene")) throw new McpException(McpErr.BadArgs, "op goto needs subscene (and savepoint)", "checkpoint {op:\"list\"} lists them");
-                    req.subscene = PlayShared.Int(a, "subscene", 0);
+                    string byName = PlayShared.Str(a, "name", null);
+                    if (!string.IsNullOrEmpty(byName)) req.subscene = ctx.Main(() => ResolveName(byName, "checkpoint {op:\"list\", filter} lists the names"));
+                    else if (!PlayShared.Has(a, "subscene")) throw new McpException(McpErr.BadArgs, "op goto needs subscene (and savepoint) or name", "checkpoint {op:\"list\"} lists them");
+                    else req.subscene = PlayShared.Int(a, "subscene", 0);
                     req.savepoint = PlayShared.Int(a, "savepoint", 0);
                 }
             }
@@ -152,7 +175,7 @@ namespace InsideDev.Play
             Warn(res, pre, r.Arr("warnings"));
             if (r.Str("outcome", "") == "done")
             {
-                object obs = ctx.Main(() => Concise("checkpoint"));
+                object obs = ctx.Main(() => World.Concise("checkpoint", ctx));
                 if (obs != null) res["observe"] = obs;
             }
             return ToolResult.Ok(res);
@@ -166,7 +189,8 @@ namespace InsideDev.Play
             {
                 string filter = PlayShared.Str(a, "filter", null);
                 int limit = PlayShared.Int(a, "limit", 100), offset = PlayShared.Int(a, "offset", 0);
-                return ToolResult.Ok(ctx.Main(() => LevelList(op, filter, limit, offset)));
+                string what = PlayShared.Str(a, "what", "all");
+                return ToolResult.Ok(ctx.Main(() => LevelList(op, filter, limit, offset, what)));
             }
             int settle = PlayShared.Int(a, "settle_frames", 20);
             if (op == "wait_ready")
@@ -184,9 +208,11 @@ namespace InsideDev.Play
             switch (op)
             {
                 case "load_checkpoint":
-                    if (!PlayShared.Has(a, "subscene")) throw new McpException(McpErr.BadArgs, "op load_checkpoint needs subscene (and savepoint)", "level {op:\"list\"} lists them");
+                    string byName = PlayShared.Str(a, "name", null);
+                    if (!string.IsNullOrEmpty(byName)) req.subscene = ctx.Main(() => ResolveName(byName, "level {op:\"list\", filter} lists the names"));
+                    else if (!PlayShared.Has(a, "subscene")) throw new McpException(McpErr.BadArgs, "op load_checkpoint needs subscene (and savepoint) or name", "level {op:\"list\"} lists them");
+                    else req.subscene = PlayShared.Int(a, "subscene", 0);
                     req.mode = PlayShared.Str(a, "mode", "respawn");
-                    req.subscene = PlayShared.Int(a, "subscene", 0);
                     req.savepoint = PlayShared.Int(a, "savepoint", 0);
                     break;
                 case "load_chapter":
@@ -342,7 +368,7 @@ namespace InsideDev.Play
             if (backup != null) res["backup"] = backup;
             int waitMs = Math.Min(Math.Max(0, req.timeoutMs), ctx.RemainingMs - 2500);
             bool done = req.wait && waitMs > 0 && ctx.WaitUntil(() => LoadDone(issued), waitMs);
-            if (ctx.Cancelled) throw new McpException(McpErr.Cancelled, "cancelled: " + ctx.Info.CancelReason, "the load itself keeps running in the game; wait_until {ready:true}");
+            if (ctx.Cancelled) throw new McpException(McpErr.Cancelled, "cancelled: " + ctx.Info.CancelReason, "the load itself keeps running in the game; wait_until {any:[{ready:true}]}");
             if (done && req.settleFrames > 0) ctx.WaitFrames(req.settleFrames, Math.Max(500, ctx.RemainingMs - 1500));
             if (done)
             {
@@ -353,12 +379,13 @@ namespace InsideDev.Play
                 return res;
             }
             res["outcome"] = "loading";
-            warnings.Add("loading: the load is still running; wait_until {job:\"" + (job != null ? job.Id : "") + "\"} or {ready:true}, then observe");
+            warnings.Add("loading: the load is still running; wait_until {any:[{job:\"" + (job != null ? job.Id : "") + "\"}, {ready:true}]}, then observe");
             if (job != null)
             {
                 job.Detach();
                 var w = new LoadWatch { job = job, issued = issued, settle = req.settleFrames, backup = backup, startedUtc = started, warnings = new List<string>(warnings) };
                 lock (watches) watches.Add(w);
+                TickOn();
                 res["job"] = job.Describe();
             }
             AddWarnings(res, warnings);
@@ -456,6 +483,7 @@ namespace InsideDev.Play
 
         static void Tick()
         {
+            MainCleanup.Pump();
             if (!hooked) Hook();
             var gm = GM();
             bool loading = false;
@@ -468,6 +496,11 @@ namespace InsideDev.Play
             if (requested && (loading || Time.frameCount - requestedFrame > 600)) requested = false;
             PlayLevelsStream.Tick(loading);
             if (watches.Count > 0) TickWatches();
+            if (!HasWork())
+            {
+                tick.Active = false;
+                if (HasWork()) tick.Active = true;
+            }
         }
 
         static void Hook()
@@ -584,13 +617,14 @@ namespace InsideDev.Play
                 p.notReadyHint = "wait until the game shows the world, then retry";
                 return p;
             }
-            if (!GameManager.GameIsStarted()) { p.notReady = "the game is still booting"; p.notReadyHint = "wait_until {ready:true}"; return p; }
+            if (!GameManager.GameIsStarted()) { p.notReady = "the game is still booting"; p.notReadyHint = "wait_until {any:[{ready:true}]}"; return p; }
             if (GameManager.IsLoading() || PendingLoad(gm) || requested) p.busy = "a load is in progress (" + gm.debugState + ")";
             else
             {
                 try { if (Discovery.Busy) p.busy = "the InsideDev discovery queue is loading a subscene (" + (Discovery.status ?? "") + ")"; } catch { }
             }
             if (p.busy == null && PlayLevelsStream.Busy) p.busy = "a stream load is running";
+            if (p.busy == null && SearchRunning()) p.busy = "a savepoint search is still running (it loads and unloads subscenes)";
             p.subsceneCount = SavepointManager.SubsceneCount;
             p.savepointCount = sub >= 0 && sub < p.subsceneCount ? SavepointManager.GetSubsceneSavepointCount(sub) : -1;
             p.unlocked = Unlocked();
@@ -601,7 +635,7 @@ namespace InsideDev.Play
         static void ThrowProbe(LoadProbe p)
         {
             if (p.notReady != null) throw new McpException(McpErr.NotReady, p.notReady, p.notReadyHint);
-            if (p.busy != null) throw new McpException(McpErr.Busy, "busy: " + p.busy, "one load at a time: wait_until {ready:true}, then retry");
+            if (p.busy != null) throw new McpException(McpErr.Busy, "busy: " + p.busy, "one load at a time: wait_until {any:[{ready:true}]}, then retry");
         }
 
         static void Discover(CallContext ctx, int sub, List<string> warnings)
@@ -619,7 +653,7 @@ namespace InsideDev.Play
         {
             var gm = GM();
             if (gm == null) throw new McpException(McpErr.NotReady, "no GameManager");
-            if (GameManager.IsLoading() || PendingLoad(gm)) throw new McpException(McpErr.Busy, "busy: a load started meanwhile", "wait_until {ready:true}, then retry");
+            if (GameManager.IsLoading() || PendingLoad(gm)) throw new McpException(McpErr.Busy, "busy: a load started meanwhile", "wait_until {any:[{ready:true}]}, then retry");
             int before = GameManager.LoadCount;
             bool lockedBefore = Saves.Locked;
             string listHint = play ? "checkpoint {op:\"list\"}" : "level {op:\"list\"}";
@@ -661,6 +695,7 @@ namespace InsideDev.Play
             }
             if (!loadRoutineMissing && !GameManager.IsLoading() && !PendingLoad(gm)) throw new McpException(McpErr.GameError, "the game dropped the load request", "retry once the game is playing");
             requested = true;
+            TickOn();
             requestedFrame = Time.frameCount;
             loadingFlag = true;
             if (d.writes)
@@ -703,6 +738,22 @@ namespace InsideDev.Play
             return savegameItemField != null ? savegameItemField.GetValue(sg) as Savegame.SavegameDataMapItem : null;
         }
 
+        // the running savepoint search: the game keeps it going after our call timed out or was cancelled, and it
+        // switches culling off and on while it loads subscenes, so no load and no stream op may start before it ends
+        static SavepointManager.SavepointTask searchTask;
+        static DateTime searchStarted;
+
+        // main thread
+        static bool SearchRunning()
+        {
+            var t = searchTask;
+            if (t == null) return false;
+            bool done = true;
+            try { done = t.IsCompleted(); } catch { }
+            if (done || (DateTime.UtcNow - searchStarted).TotalSeconds > 180) { searchTask = null; return false; }
+            return true;
+        }
+
         // worker: SavepointManager.SavepointTask(cur).FindNext / FindPrevious (loads and unloads subscenes while it searches)
         static SpIndex FindStep(CallContext ctx, bool next, List<string> warnings)
         {
@@ -713,11 +764,13 @@ namespace InsideDev.Play
                 var cur = Savegame.GetCurrentSavepoint();
                 var tk = new SavepointManager.SavepointTask(cur);
                 if (next) tk.FindNext(); else tk.FindPrevious();
+                searchTask = tk;
+                searchStarted = DateTime.UtcNow;
                 return tk;
             });
             int ms = Math.Min(30000, ctx.RemainingMs - 8000);
             bool ok = ms > 0 && ctx.WaitUntil(() => task.IsCompleted(), ms);
-            if (!ok) throw new McpException(McpErr.Timeout, "the savepoint search did not finish in time", "retry; it keeps running and the next try is faster (subscenes are discovered)");
+            if (!ok) throw new McpException(McpErr.Timeout, "the savepoint search did not finish in time", "it keeps running in the game: loads answer busy until it ends (level {op:\"status\"}), then retry; the next try is faster (subscenes are discovered)");
             var r = ctx.Main(() => task.Failed() ? SpIndex.Unknown : new SpIndex(task.savepointIndex.subscene, task.savepointIndex.savepoint));
             if (r.IsUnknown) throw new McpException(McpErr.NotFound, "there is no " + (next ? "next" : "previous") + " savepoint", "checkpoint {op:\"list\"}");
             warnings.Add("target: " + (next ? "next" : "previous") + " savepoint is " + r);
@@ -840,14 +893,15 @@ namespace InsideDev.Play
             return o;
         }
 
-        static Json.Obj LevelList(string op, string filter, int limit, int offset)
+        static Json.Obj LevelList(string op, string filter, int limit, int offset, string what)
         {
+            bool wantSubs = what != "chapters", wantChapters = what != "subscenes";
             if (!G.SavepointsReady) throw new McpException(McpErr.NotReady, "the savepoint manager is not ready (the game is still booting)");
             var o = Head(op, "done");
             var subs = new List<object>();
             int total = 0;
             var infos = SavepointManager.GetSubsceneInfos();
-            for (int s = 0; s < infos.Count; s++)
+            for (int s = 0; wantSubs && s < infos.Count; s++)
             {
                 var info = infos[s];
                 if (!TextFilter.Match(filter, info.name, info.puzzleName, info.areaName)) continue;
@@ -865,12 +919,11 @@ namespace InsideDev.Play
                 if (pins.IsPinned(s)) r["pinned"] = true;
                 subs.Add(r);
             }
-            o["subscenes"] = subs;
-            o["total"] = (double)total;
+            if (wantSubs) { o["subscenes"] = subs; o["total"] = (double)total; }
             var chapters = ChapterIndexes();
             var unlocked = Unlocked();
             var chl = new List<object>();
-            for (int i = 0; i < chapters.Count; i++)
+            for (int i = 0; wantChapters && i < chapters.Count; i++)
             {
                 string name = ChapterName(i);
                 if (!TextFilter.Match(filter, name, Label(chapters[i].sub))) continue;
@@ -882,7 +935,8 @@ namespace InsideDev.Play
                 r["unlocked"] = ChapterMap.Unlocked(chapters, i, unlocked);
                 chl.Add(r);
             }
-            o["chapters"] = chl;
+            if (wantChapters) o["chapters"] = chl;
+            if (!wantSubs) o["total"] = (double)chl.Count;
             o["current"] = Current();
             return o;
         }
@@ -892,25 +946,7 @@ namespace InsideDev.Play
         {
             if (!G.SavepointsReady) throw new McpException(McpErr.NotReady, "the savepoint manager is not ready (the game is still booting)");
             int n = SavepointManager.SubsceneCount;
-            if (!string.IsNullOrEmpty(name))
-            {
-                var scenes = new List<string>();
-                var puzzles = new List<string>();
-                foreach (var i in SavepointManager.GetSubsceneInfos()) { scenes.Add(i.name); puzzles.Add(i.puzzleName); }
-                string err;
-                List<int> cands;
-                int r = SubsceneNames.Resolve(scenes, puzzles, name, out err, out cands);
-                if (r >= 0) return r;
-                var e = new McpException(cands.Count > 1 ? McpErr.Ambiguous : McpErr.NotFound, err, "level {op:\"list\", filter} lists the names");
-                if (cands.Count > 1)
-                {
-                    e.data = new Json.Obj();
-                    var l = new List<object>();
-                    for (int i = 0; i < cands.Count && i < 5; i++) { var c = new Json.Obj(); c["id"] = (double)cands[i]; c["path"] = scenes[cands[i]]; l.Add(c); }
-                    e.data["candidates"] = l;
-                }
-                throw e;
-            }
+            if (!string.IsNullOrEmpty(name)) return ResolveName(name, "level {op:\"list\", filter} lists the names");
             if (sub == -1)
             {
                 int b = BodySubscene();
@@ -921,12 +957,35 @@ namespace InsideDev.Play
             return sub;
         }
 
+        // main thread: the savepoint subscene index of a scene or puzzle name (exact, else a part that matches one
+        // subscene); throws not_found, or ambiguous with data.candidates [{id, path}]
+        static int ResolveName(string name, string listHint)
+        {
+            if (!G.SavepointsReady) throw new McpException(McpErr.NotReady, "the savepoint manager is not ready (the game is still booting)");
+            var scenes = new List<string>();
+            var puzzles = new List<string>();
+            foreach (var i in SavepointManager.GetSubsceneInfos()) { scenes.Add(i.name); puzzles.Add(i.puzzleName); }
+            string err;
+            List<int> cands;
+            int r = SubsceneNames.Resolve(scenes, puzzles, name, out err, out cands);
+            if (r >= 0) return r;
+            var e = new McpException(cands.Count > 1 ? McpErr.Ambiguous : McpErr.NotFound, err, listHint);
+            if (cands.Count > 1)
+            {
+                e.data = new Json.Obj();
+                var l = new List<object>();
+                for (int i = 0; i < cands.Count && i < 5; i++) { var c = new Json.Obj(); c["id"] = (double)cands[i]; c["path"] = scenes[cands[i]]; l.Add(c); }
+                e.data["candidates"] = l;
+            }
+            throw e;
+        }
+
         static void SetFreeze(bool on, List<string> w)
         {
             var mgr = SubsceneCullingManager.instance;
             if (on)
             {
-                bool was = mgr.CullingActive;
+                bool was = PlayLevelsStream.Original(mgr.CullingActive);
                 if (!PlayLevelsStream.Frozen) freezeWas = was;
                 PlayLevelsStream.Frozen = true;
                 mgr.CullingActive = false;
@@ -947,6 +1006,7 @@ namespace InsideDev.Play
             if (LoadingNow()) return "CullingActive left to the running load (it switches culling back on itself)";
             var m = SubsceneCullingManager.instance;
             if (m == null) return "no culling manager";
+            if (!PlayLevelsStream.ThawNow(freezeWas)) return "CullingActive goes back " + (freezeWas ? "on" : "off") + " when the running stream load ends";
             m.CullingActive = freezeWas;
             return "CullingActive back " + (freezeWas ? "on" : "off");
         }

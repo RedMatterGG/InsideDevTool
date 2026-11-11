@@ -11,8 +11,11 @@ namespace InsideDev.Play
     // every logic step of input is recorded, trim it, save it, then play the same input back as one realtime take.
     //   Recording: AgentCore.CommandReceived calls Record once per logic step with the command that reached the game
     //   (agent queue, latch, neutral, or the pad in mix / human mode), the controlled body's pos3 / velocity3 before that
-    //   step's logic, the game time and flags (gated, dead, Perception.ForcedInput, huddle grabbing). A load or 72000
-    //   frames end the recording; the frames so far stay in memory.
+    //   step's logic, the game time and flags (gated, dead, Perception.ForcedInput, huddle grabbing). The installed
+    //   AgentCore is the tap: giving control back (act input_mode human, ctl mode human, restore of the input alone)
+    //   keeps it in place in human mode until the recording ends, so the pad is recorded too; when something else
+    //   replaces the game's input core the recording ends and says so (InputLost). A load or 72000 frames end the
+    //   recording; the frames so far stay in memory.
     //   Playback: while a track plays AgentCore.UpdateCommand takes the step's input from Next instead of its queue
     //   (TrackCursor: one frame per logic step, gaps hold the previous frame, no 600-step cap). On every recorded step
     //   Next first corrects the body toward the recorded one (TrackCorrect, the Playback.InputRecorder.AdjustPosition
@@ -21,7 +24,10 @@ namespace InsideDev.Play
     //   Boy.AddVelocity, only in run, jump or swim without a special mode (Boy.Teleport would reset his state). Nothing
     //   is corrected while dead, gated or without a body. The playback is a detached control-lane job that the tick
     //   "input_track" ends: done, cancelled (job cancel, op stop, restore), died, loading, stalled (600 frames without a
-    //   step) or desynced (stop_drift).
+    //   step) or desynced (stop_drift). The result (and status, as last_play, until the next play) says how it ended in
+    //   end: finished, cancelled, restore, level_load, died, stalled, desynced or error; the job itself ends in state
+    //   done for every one of them except a cancel, so end is the field to branch on. The tick runs only while a
+    //   playback is armed.
     //   Clock: play puts the Stepper in realtime at speed and holds the rehearsal's lockstep (Stepper.HoldLockstep:
     //   captureFramerate 60, one logic step per frame, frames paced to real time) so the game replays the rehearsal by
     //   itself; afterwards the game keeps running (then run) or goes back to step mode (then freeze). A scene recorder
@@ -36,6 +42,8 @@ namespace InsideDev.Play
         public const int StallFrames = 600, MaxSamples = 60, ProgressEvery = 30;
         public static readonly string[] Ops = { "status", "start", "stop", "save", "load", "list", "info", "trim", "play" };
         public static readonly string[] Outcomes = { "done", "recording", "stopped", "saved", "loaded", "trimmed", "playing", "cancelled", "died", "loading", "stalled", "desynced" };
+        // how a playback ended (result field end)
+        public static readonly string[] Ends = { "finished", "cancelled", "restore", "level_load", "died", "stalled", "desynced", "error" };
 
         sealed class Player
         {
@@ -60,17 +68,19 @@ namespace InsideDev.Play
         static volatile InputTrack rec;
         static volatile Player player;
         static volatile string lastStop = "";
+        static volatile Json.Obj lastPlay;
+        static PlayTick tick;
 
         public static void Register()
         {
             PlayRegistry.Add(Def(), Handle);
-            PlayRegistry.OnTick("input_track", Tick);
+            tick = PlayRegistry.OnTick("input_track", Tick, TickWhen.OnDemand);
         }
 
         internal static ToolDef Def()
         {
             return PlayShared.Def("input_track", "Input track (rehearse, then take)", PlayShared.Both, Owner,
-                "Record and replay input. start records every logic step of input that reaches the game (with body position and velocity) while you act / move_to in step mode; stop, info, trim {from, to}, save {name} (_mod/input_tracks), load, list. play feeds the track back one frame per logic step in realtime at the rehearsal's 60 Hz lockstep (input only; drift measured; correct:true opts in to nudges), as a job: wait_until {job}; cancel with op stop or restore. A manual srec recording may run during play (it owns frame pacing).",
+                "Record and replay input. start records every logic step of input that reaches the game (with body position and velocity) while you act / move_to in step mode; stop, info, trim {from, to}, save {name} (_mod/input_tracks), load, list. play feeds the track back one frame per logic step in realtime at the rehearsal's 60 Hz lockstep (input only; drift measured; correct:true opts in to nudges), as a job: wait_until {any:[{job:\"j3\"}]}; cancel with op stop or restore. The result's end says how a playback ended (finished, cancelled, restore, level_load, died, stalled, desynced, error); status keeps it as last_play. A manual srec recording may run during play (it owns frame pacing).",
                 Schema.Obj().Enum("op", "status, start, stop, save, load, list, info, trim or play.", "status", Ops)
                     .StrMax("name", "Track name (letters, digits, _ - .); info and play default to the track in memory.", TrackFile.MaxName)
                     .Int("from", "trim: first step kept.", 0, 0, 1000000)
@@ -88,6 +98,9 @@ namespace InsideDev.Play
                     .Num("timeout_s", "play / stop: wait limit.", 45, 0, 50)
                     .Enum("observe", "play: observation in the result.", "concise", "concise", "none").Build(),
                 Schema.Obj().Enum("op", "", null, Ops).Enum("outcome", "", null, Outcomes).Str("stop_reason", "Why play or recording ended.")
+                    .Enum("end", "play: how the playback ended.", null, Ends)
+                    .OutObj("last_play", "status: the last playback that ended.", Schema.Obj().Str("name", "").Enum("outcome", "", null, Outcomes).Enum("end", "", null, Ends)
+                        .Str("stop_reason", "").Int("step", "", 0, 1000000).Int("of", "", 0, 1000000).Str("job", "").Str("ended", "UTC."))
                     .Bool("recording", "").Bool("playing", "")
                     .OutObj("track", "Track in memory (info with name: the saved one); see docs for all fields.", TrackSchema())
                     .Arr("tracks", "op list.", Schema.OutOf(Schema.Obj().Str("name", "").Int("steps", "", 0, 1000000).Str("body", "").Int("subscene", "", -1, 999)), 0, 500)
@@ -141,6 +154,12 @@ namespace InsideDev.Play
             bool full;
             lock (gate) full = !r.Append(step, Time.fixedTime, f);
             if (full) EndRecording("the track is full (" + InputTrack.MaxFrames + " steps)");
+        }
+
+        // main thread (AgentCore): the installed input core, the recorder's tap, is gone
+        internal static void InputLost(string why)
+        {
+            if (rec != null) EndRecording(why + ": no input reaches the recording any more");
         }
 
         // AgentCore.UpdateCommand while a track plays: this step's input, after the correction of the body
@@ -252,28 +271,60 @@ namespace InsideDev.Play
         static void Tick()
         {
             var p = player;
-            if (p == null || p.ended) return;
-            string end = null, detail = "";
-            int step = p.cursor.Step;
-            if (p.job.Cancelled) { end = "cancelled"; detail = p.job.CancelReason; }
-            else if (p.cursor.Done) { end = "done"; detail = step + " steps"; }
-            else if (p.desynced) { end = "desynced"; detail = "the body drifted more than stop_drift " + F(p.cp.stopDrift) + " m from the path"; }
-            else if (LoadingNow()) { end = "loading"; detail = "a load started"; }
-            else if (DeadNow()) { end = "died"; detail = "the body died"; }
-            else if (step != p.lastStep) { p.lastStep = step; p.idleFrames = 0; }
-            else if (CamPath.Pausing) p.idleFrames = 0;
-            else if (++p.idleFrames >= StallFrames) { end = "stalled"; detail = "no logic step for " + StallFrames + " frames (paused, menu or window focus)"; }
-            if (end != null) { Finish(p, end, detail); return; }
-            if (step < p.nextProgress) return;
-            p.nextProgress = step + ProgressEvery;
-            try { p.job.Progress(step, p.cursor.Length, "input_track: step " + step + "/" + p.cursor.Length); } catch (Exception) { }
+            if (p == null || p.ended)
+            {
+                if (tick != null) tick.Active = false;
+                return;
+            }
+            string outcome = null, end = null, detail = "";
+            try
+            {
+                int step = p.cursor.Step;
+                if (p.job.Cancelled)
+                {
+                    outcome = "cancelled";
+                    detail = p.job.CancelReason;
+                    end = (detail ?? "").StartsWith("restore", StringComparison.Ordinal) ? "restore" : "cancelled";
+                    if (end == "restore") detail = RestoreDetail();
+                }
+                else if (p.cursor.Done) { outcome = "done"; end = "finished"; detail = step + " steps"; }
+                else if (p.desynced) { outcome = end = "desynced"; detail = "the body drifted more than stop_drift " + F(p.cp.stopDrift) + " m from the path"; }
+                else if (LoadingNow()) { outcome = "loading"; end = "level_load"; detail = "a load started"; }
+                else if (DeadNow()) { outcome = end = "died"; detail = "the body died"; }
+                else if (step != p.lastStep) { p.lastStep = step; p.idleFrames = 0; }
+                else if (CamPath.Pausing) p.idleFrames = 0;
+                else if (++p.idleFrames >= StallFrames) { outcome = end = "stalled"; detail = "no logic step for " + StallFrames + " frames (paused, menu or window focus)"; }
+                if (outcome == null)
+                {
+                    if (step < p.nextProgress) return;
+                    p.nextProgress = step + ProgressEvery;
+                    try { p.job.Progress(step, p.cursor.Length, "input_track: step " + step + "/" + p.cursor.Length); } catch (Exception) { }
+                    return;
+                }
+            }
+            catch (Exception e)
+            {
+                outcome = "cancelled";
+                end = "error";
+                detail = "error: " + e.GetType().Name + ": " + e.Message;
+                DevLog.Error("[play] input_track playback", e);
+            }
+            Finish(p, outcome, end, detail);
         }
 
-        static void Finish(Player p, string outcome, string detail)
+        // which restore ended it (the restore tool, or the host's own: idle, session end, mcp off, play restore, quit)
+        static string RestoreDetail()
+        {
+            string why = Restorer.Why;
+            return string.IsNullOrEmpty(why) ? "restore" : "restore (" + why + ")";
+        }
+
+        static void Finish(Player p, string outcome, string end, string detail)
         {
             if (p.ended) return;
             p.ended = true;
             if (player == p) player = null;
+            if (tick != null) tick.Active = false;
             try { Stepper.HoldLockstep(false); } catch (Exception) { }
             var w = p.warnings;
             int nudged;
@@ -286,9 +337,20 @@ namespace InsideDev.Play
             }
             else if (!p.freezeAfter) w.Add("clock: the game keeps running in realtime (then run); time {op:\"step_mode\"} freezes it again");
             var r = Result("play", outcome);
+            r["end"] = end;
             r["stop_reason"] = detail ?? "";
             r["playback"] = Progress(p);
             r["track"] = Brief(p.header, p.cursor.Length);
+            var lp = new Json.Obj();
+            lp["name"] = p.header.name;
+            lp["outcome"] = outcome;
+            lp["end"] = end;
+            lp["stop_reason"] = detail ?? "";
+            lp["step"] = (double)p.cursor.Step;
+            lp["of"] = (double)p.cursor.Length;
+            lp["job"] = p.job.Id;
+            lp["ended"] = DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", IC);
+            lastPlay = lp;
             if (p.wantObserve)
             {
                 try { r["observe"] = Observer.Concise("input_track"); }
@@ -296,7 +358,7 @@ namespace InsideDev.Play
             }
             r["warnings"] = PlayShared.L(Cap(w));
             p.result = r;
-            Note("playback " + outcome + ": " + detail);
+            Note("playback " + end + ": " + detail);
             try { p.job.Finish(r); } catch (Exception e) { DevLog.Error("[play] input_track finish", e); }
         }
 
@@ -323,8 +385,14 @@ namespace InsideDev.Play
         {
             var parts = new List<string>();
             var p = player;
-            if (p != null) { Finish(p, "cancelled", "restore"); parts.Add("playback cancelled"); }
-            if (rec != null) { EndRecording("restore"); parts.Add("recording stopped (the track stays in memory)"); }
+            if (p != null)
+            {
+                // restore means realtime: the playback must not freeze the clock again after the clock's own undo ran
+                p.freezeAfter = false;
+                Finish(p, "cancelled", "restore", RestoreDetail());
+                parts.Add("playback cancelled");
+            }
+            if (rec != null) { EndRecording(RestoreDetail()); parts.Add("recording stopped (the track stays in memory)"); }
             return parts.Count == 0 ? "nothing running" : string.Join(", ", parts.ToArray());
         }
 
@@ -383,6 +451,8 @@ namespace InsideDev.Play
                 r["job"] = p.job.Describe();
             }
             if (lastStop.Length > 0 && rec == null) r["stop_reason"] = "recording: " + lastStop;
+            var lp = lastPlay;
+            if (lp != null) r["last_play"] = lp;
             r["warnings"] = new List<object>();
             return ToolResult.Ok(r);
         }
@@ -448,6 +518,7 @@ namespace InsideDev.Play
                 var res = p.result;
                 var r = Result("stop", res != null ? res.Str("outcome", "cancelled") : p.ended ? "cancelled" : "playing");
                 r["stop_reason"] = res != null ? res.Str("stop_reason", "input_track stop") : "input_track stop";
+                if (res != null && res["end"] is string) r["end"] = res["end"];
                 r["playback"] = res != null ? res["playback"] : Progress(p);
                 r["job"] = p.job.Describe();
                 r["warnings"] = new List<object>();
@@ -489,10 +560,7 @@ namespace InsideDev.Play
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(path));
-                string tmp = path + ".tmp";
-                File.WriteAllText(tmp, text);
-                if (File.Exists(path)) File.Delete(path);
-                File.Move(tmp, path);
+                SafeFile.WriteAllText(path, text);
             }
             catch (Exception e) { return ToolResult.Fail(McpErr.GameError, "cannot write " + path + ": " + e.Message, "check the _mod folder"); }
             lock (gate) if (current == t) dirty = false;
@@ -535,11 +603,19 @@ namespace InsideDev.Play
                 {
                     var files = Directory.GetFiles(dir, "*" + TrackFile.Extension);
                     Array.Sort(files, StringComparer.OrdinalIgnoreCase);
+                    int unreadable = 0;
                     foreach (var f in files)
                     {
                         if (rows.Count >= 500) { warnings.Add("list: more than 500 tracks, the rest left out"); break; }
-                        Json.Obj h;
-                        using (var rd = new StreamReader(f)) h = TrackFile.HeaderOfLine(rd.ReadLine());
+                        Json.Obj h = null;
+                        long bytes = 0;
+                        try
+                        {
+                            bool tooLong;
+                            using (var rd = new StreamReader(f)) h = TrackFile.HeaderOfLine(TrackFile.ReadLineCapped(rd, TrackFile.MaxLineChars, out tooLong));
+                            bytes = new FileInfo(f).Length;
+                        }
+                        catch (Exception) { unreadable++; continue; }
                         if (h == null) continue;
                         var o = new Json.Obj();
                         o["name"] = Path.GetFileNameWithoutExtension(f);
@@ -551,9 +627,10 @@ namespace InsideDev.Play
                         o["checkpoint"] = h.Str("checkpoint", "");
                         o["created"] = h.Str("created", "");
                         o["source"] = h.Str("source", "");
-                        o["bytes"] = (double)new FileInfo(f).Length;
+                        o["bytes"] = (double)bytes;
                         rows.Add(o);
                     }
+                    if (unreadable > 0) warnings.Add("list: " + unreadable + " file(s) could not be read and were left out");
                 }
             }
             catch (Exception e) { return ToolResult.Fail(McpErr.GameError, "cannot list " + dir + ": " + e.Message); }
@@ -656,9 +733,9 @@ namespace InsideDev.Play
             if (Playing) throw new McpException(McpErr.Busy, "a track is already playing", "wait_until {any:[{job:\"<id>\"}]} or input_track {op:\"stop\"}");
             if (rec != null) throw new McpException(McpErr.Refused, "a track is being recorded", "input_track {op:\"stop\"} first");
             string reason;
-            if (!ActProbe.Ready(out reason)) throw new McpException(McpErr.NotReady, "the game is not ready to play (" + reason + ")", PlayShared.NextFor(reason, null) ?? "wait_until {ready:true}");
+            if (!ActProbe.Ready(out reason)) throw new McpException(McpErr.NotReady, "the game is not ready to play (" + reason + ")", PlayShared.NextFor(reason, null) ?? PlayShared.WaitReadyCall);
             var ch = ScriptGlobals.mainCharacter;
-            if (ch == null) throw new McpException(McpErr.NotReady, "no controlled body", "wait_until {ready:true}");
+            if (ch == null) throw new McpException(McpErr.NotReady, "no controlled body", PlayShared.WaitReadyCall);
             Vector3 pos = ch.pos3;
             double off = TrackPlan.StartOffset(p.cursor.First, pos.x, pos.y);
             string why = TrackPlan.StartRefusal(p.header, p.cursor.Length, KindOf(ch), off, maxStart);
@@ -676,6 +753,7 @@ namespace InsideDev.Play
             if (Math.Abs(p.speed - 1) > 1e-6) p.warnings.Add("speed: " + F(p.speed) + " is a preview; a take with sound runs at speed 1");
             p.lastStep = 0;
             player = p;
+            if (tick != null) tick.Active = true;
             RegisterRestore();
             Note("playback started: " + p.header.name + " (" + p.cursor.Length + " steps)");
         }
@@ -757,11 +835,20 @@ namespace InsideDev.Play
             if (bad != null) throw new McpException(McpErr.BadArgs, bad, "input_track {op:\"list\"} shows the saved tracks");
             path = PathFor(name);
             if (!File.Exists(path)) throw new McpException(McpErr.NotFound, "no saved track " + name, "input_track {op:\"list\"} shows the saved tracks");
-            string text;
-            try { text = File.ReadAllText(path); }
-            catch (Exception e) { throw new McpException(McpErr.GameError, "cannot read " + path + ": " + e.Message); }
             string err;
-            var t = TrackFile.Read(text, out err);
+            InputTrack t = null;
+            try
+            {
+                long bytes = new FileInfo(path).Length;
+                if (bytes > TrackFile.MaxFileBytes)
+                    throw new McpException(McpErr.BadArgs, path + ": " + (bytes >> 20) + " MB, an input track is at most " + (TrackFile.MaxFileBytes >> 20) + " MB", "the file is not an input track");
+                bool layout;
+                using (var rd = new StreamReader(path)) t = TrackFile.ReadLines(rd, out err, out layout);
+                // a file that was reformatted by hand: the whole text as JSON
+                if (t == null && !layout) t = TrackFile.Read(File.ReadAllText(path), out err);
+            }
+            catch (McpException) { throw; }
+            catch (Exception e) { throw new McpException(McpErr.GameError, "cannot read " + path + ": " + e.Message); }
             if (t == null) throw new McpException(McpErr.BadArgs, path + ": " + err, "the file is not an input track");
             t.header.name = name;
             return t;

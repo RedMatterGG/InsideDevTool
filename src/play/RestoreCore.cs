@@ -9,10 +9,15 @@ namespace InsideDev.Play
     // state); RunAll runs the matching undos newest first, each in try/catch. An entry leaves the registry before its
     // undo runs (so an undo may Forget or re-register its key); a failed undo goes back in its place for the next
     // restore unless the key was registered again meanwhile. "save_lock" runs only with includeSaveLock. only = exact
-    // keys or key prefixes ("hazard:", "stream_pin"); empty = all.
+    // keys or key prefixes ("hazard:", "stream_pin"); empty = all. The clock's undo (LateKeys: "time") runs after every
+    // other one, whenever it was registered: an undo that touches the clock (a playback that ends, a camera that
+    // unfreezes) can then never leave it in a state the clock's own undo did not see, and what that undo reports is the
+    // final state. Plan lists what RunAll would do. Keep holds notes about things no undo puts back; they are listed in
+    // kept by RunAll and Plan for as long as their text function returns one.
     internal sealed class RestoreBook
     {
         public const string SaveLock = "save_lock";
+        public static readonly string[] LateKeys = { "time" };
 
         sealed class Entry
         {
@@ -20,8 +25,82 @@ namespace InsideDev.Play
             public Func<string> undo;
         }
 
+        sealed class Note
+        {
+            public string key;
+            public Func<string> text;
+        }
+
         readonly object gate = new object();
         readonly List<Entry> entries = new List<Entry>();
+        readonly List<Note> notes = new List<Note>();
+
+        public void Keep(string key, Func<string> text)
+        {
+            if (string.IsNullOrEmpty(key) || text == null) return;
+            lock (gate)
+            {
+                notes.RemoveAll(n => n.key == key);
+                notes.Add(new Note { key = key, text = text });
+            }
+        }
+
+        public void Unkeep(string key)
+        {
+            lock (gate) { notes.RemoveAll(n => n.key == key); }
+        }
+
+        // main thread in the game: "key (text)" of every note that still holds; the others are dropped
+        public List<string> Notes()
+        {
+            List<Note> snap;
+            lock (gate) { snap = new List<Note>(notes); }
+            var l = new List<string>();
+            foreach (var n in snap)
+            {
+                string t = null;
+                try { t = n.text(); } catch (Exception) { }
+                if (string.IsNullOrEmpty(t)) { lock (gate) { notes.Remove(n); } continue; }
+                l.Add(n.key + " (" + t + ")");
+            }
+            return l;
+        }
+
+        // the entries in the order RunAll takes them: newest first, the late keys after all others
+        List<Entry> Ordered()
+        {
+            List<Entry> snap;
+            lock (gate) { snap = new List<Entry>(entries); }
+            var l = new List<Entry>(snap.Count);
+            for (int i = snap.Count - 1; i >= 0; i--) if (Array.IndexOf(LateKeys, snap[i].key) < 0) l.Add(snap[i]);
+            for (int i = snap.Count - 1; i >= 0; i--) if (Array.IndexOf(LateKeys, snap[i].key) >= 0) l.Add(snap[i]);
+            return l;
+        }
+
+        static bool Skipped(Entry e, List<string> only, bool includeSaveLock, ICollection<string> exclude)
+        {
+            return !Matches(e.key, only) || (exclude != null && exclude.Contains(e.key)) || (e.key == SaveLock && !includeSaveLock);
+        }
+
+        // what RunAll with the same arguments would do: {would_reset[{key, what}], kept[]}; nothing runs
+        public Json.Obj Plan(List<string> only, bool includeSaveLock, ICollection<string> exclude)
+        {
+            var would = new List<object>();
+            var kept = new List<object>();
+            foreach (var e in Ordered())
+            {
+                if (Skipped(e, only, includeSaveLock, exclude)) { kept.Add(e.key); continue; }
+                var o = new Json.Obj();
+                o["key"] = e.key;
+                o["what"] = e.what;
+                would.Add(o);
+            }
+            foreach (var n in Notes()) kept.Add(n);
+            var r = new Json.Obj();
+            r["would_reset"] = would;
+            r["kept"] = kept;
+            return r;
+        }
 
         public void Register(string key, string what, Func<string> undo)
         {
@@ -63,15 +142,14 @@ namespace InsideDev.Play
         // main thread in the game; {reset[{key, what, result}], kept[], errors[]}
         public Json.Obj RunAll(List<string> only, bool includeSaveLock, ICollection<string> exclude)
         {
-            List<Entry> snap;
-            lock (gate) { snap = new List<Entry>(entries); }
+            var snap = Ordered();
             var reset = new List<object>();
             var kept = new List<string>();
             var errors = new List<object>();
-            for (int i = snap.Count - 1; i >= 0; i--)
+            for (int i = 0; i < snap.Count; i++)
             {
                 var e = snap[i];
-                if (!Matches(e.key, only) || (exclude != null && exclude.Contains(e.key)) || (e.key == SaveLock && !includeSaveLock)) { kept.Insert(0, e.key); continue; }
+                if (Skipped(e, only, includeSaveLock, exclude)) { kept.Insert(0, e.key); continue; }
                 int at;
                 lock (gate) { at = entries.IndexOf(e); if (at >= 0) entries.RemoveAt(at); }
                 if (at < 0) continue;
@@ -98,6 +176,7 @@ namespace InsideDev.Play
             r["reset"] = reset;
             var k = new List<object>();
             foreach (var s in kept) k.Add(s);
+            foreach (var n in Notes()) k.Add(n);
             r["kept"] = k;
             r["errors"] = errors;
             return r;

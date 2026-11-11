@@ -9,7 +9,7 @@ namespace InsideDev.Play
     // duration and seq script grammar, the word parser that turns "ctl ..." into a CtlPlan, the held-input arithmetic and
     // the reply texts. Compiled into InsideDev.Play.dll and, as is, into the offline tests (qa/mcp/CTL/CtlTest.cs).
     // Durations: a plain number is seconds (1.2), a whole number followed by s is logic steps (72s = 72 steps = 1.2 s).
-    public enum CtlKind { Help, Status, StatusJson, Input, Hold, Release, StopAt, Tool, Mode, Job, Stop }
+    public enum CtlKind { Help, Status, StatusJson, Input, Hold, Release, StopAt, Tool, Mode, Job, Stop, Wait }
 
     // one stretch of timed input; stick false keeps the held stick (ctl hold) for these steps
     public struct CtlFrame
@@ -27,7 +27,7 @@ namespace InsideDev.Play
         public readonly List<string> warnings = new List<string>();
         public int steps;
         public CtlFrame set;
-        public bool releaseAll, relStick, relJump, relAction, async;
+        public bool releaseAll, relStick, relJump, relAction, async, json;
         public double target;
         public Json.Obj args;
     }
@@ -41,7 +41,7 @@ namespace InsideDev.Play
 
         public const string Help =
             "ctl: drive the boy / huddle through AgentCore (no OS input, no window focus). <t> = seconds (1.2) or logic steps (72s; 60 steps = 1 s).\n" +
-            "  ctl status [json] | ctl job [jN] | ctl stop | ctl help\n" +
+            "  ctl status [json] | ctl job [jN] [json] | ctl wait [jN] [<seconds>] | ctl stop | ctl help\n" +
             "  ctl stick <x> <y> [for <t>]   ctl press <jump|action|grab ...> [for <t>]   ctl tap <jump|action|grab ...> [<t>]\n" +
             "  ctl hold <left|right|up|down|stick <x> <y>|jump|action|grab ...>   ctl release [all | stick|jump|action|grab ...]\n" +
             "  ctl run left|right [<t>]   ctl walk left|right [<t>]   ctl jump [left|right] [<t>]   ctl grab on|off   ctl swim <dir> [<t>]\n" +
@@ -77,9 +77,9 @@ namespace InsideDev.Play
                 error = "'" + s + "' is not a duration (seconds like 1.2, or logic steps like 72s)";
                 return false;
             }
-            int n = (int)Math.Round(sec * StepsPerSecond);
-            if (sec <= 0 || n > MaxSteps) { error = "'" + s + "': more than 0 and at most " + MaxSteps / StepsPerSecond + " s"; return false; }
-            steps = Math.Max(1, n);
+            // the range first: a huge number must not wrap in the cast
+            if (!(sec > 0) || sec * StepsPerSecond > MaxSteps) { error = "'" + s + "': more than 0 and at most " + MaxSteps / StepsPerSecond + " s"; return false; }
+            steps = Math.Max(1, (int)Math.Round(sec * StepsPerSecond));
             return true;
         }
 
@@ -113,6 +113,15 @@ namespace InsideDev.Play
             double s = steps / (double)StepsPerSecond;
             double ms = stepMode ? s * 6000 : s * 1500 / Math.Max(0.05, speed);
             return (int)Math.Min(600000, ms + 10000);
+        }
+
+        // how long a timed command of steps takes on the wall clock, for the started: reply
+        public static string Eta(int steps, bool stepMode, double speed)
+        {
+            if (steps <= 0) return "";
+            double s = steps / (double)StepsPerSecond;
+            if (stepMode) return "; it takes at most about " + F(Math.Round(s, 1)) + " s (step mode runs as fast as the game renders)";
+            return "; it takes about " + F(Math.Round(s / Math.Max(0.05, speed), 1)) + " s";
         }
 
         // ---------------------------------------------------------------- seq scripts
@@ -366,6 +375,7 @@ namespace InsideDev.Play
                 case "time": return Time(a, p);
                 case "mode": return Mode(a, p);
                 case "job": return Job(a, p);
+                case "wait": return Wait(a, p);
                 case "stop":
                     p.kind = CtlKind.Stop;
                     return Extra(a, p, 2, "ctl stop");
@@ -880,8 +890,30 @@ namespace InsideDev.Play
         static CtlPlan Job(List<string> a, CtlPlan p)
         {
             p.kind = CtlKind.Job;
-            if (a.Count > 2) p.jobId = a[2];
-            return Extra(a, p, 3, "ctl job [jN]");
+            int i = 2;
+            if (i < a.Count && a[i].ToLowerInvariant() != "json") p.jobId = a[i++];
+            if (i < a.Count && a[i].ToLowerInvariant() == "json") { p.json = true; i++; }
+            return Extra(a, p, i, "ctl job [jN] [json]");
+        }
+
+        public const double WaitDefaultS = 30, WaitMaxS = 600;
+        const string UWait = "ctl wait [jN] [<seconds>]";
+
+        // ctl wait [jN] [<seconds>]: target = the seconds to wait for the job (default 30, at most 600)
+        static CtlPlan Wait(List<string> a, CtlPlan p)
+        {
+            p.kind = CtlKind.Wait;
+            p.target = WaitDefaultS;
+            int i = 2;
+            double s;
+            if (i < a.Count && !Num(a[i], out s)) p.jobId = a[i++];
+            if (i < a.Count)
+            {
+                if (!Num(a[i], out s) || s <= 0 || s > WaitMaxS) return Usage(p, UWait, "seconds are more than 0 and at most " + F(WaitMaxS));
+                p.target = s;
+                i++;
+            }
+            return Extra(a, p, i, UWait);
         }
 
         // ---------------------------------------------------------------- reply texts
@@ -1046,7 +1078,10 @@ namespace InsideDev.Play
                         if (s.Bool("recording")) return "ok: recording " + TrackBrief(t);
                         var pb = s["playback"] as Json.Obj;
                         if (s.Bool("playing") && pb != null) return "ok: playing " + pb.Str("name", "?") + " step " + F(pb.Num("step")) + "/" + F(pb.Num("of")) + (s["job"] is Json.Obj ? " job=" + ((Json.Obj)s["job"]).Str("id", "?") : "");
-                        return "ok: no recording or playback" + (t != null ? "; in memory " + TrackBrief(t) : "");
+                        var lp = s["last_play"] as Json.Obj;
+                        return "ok: no recording or playback" + (t != null ? "; in memory " + TrackBrief(t) : "") +
+                               (lp != null ? "; last play " + lp.Str("name", "?") + " ended " + lp.Str("end", "?") + " at step " + F(lp.Num("step")) + "/" + F(lp.Num("of")) +
+                                   (lp.Str("stop_reason", "").Length > 0 ? " (" + Clip(OneLine(lp.Str("stop_reason", "")), 80) + ")" : "") : "");
                     }
             }
             return "ok: track " + op + ": " + s.Str("outcome", "done");

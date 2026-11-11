@@ -13,6 +13,11 @@ namespace InsideDev.Play
     // loading or not controllable never count as stalled. The worker side (StepperCore.RunOn) only starts the run
     // through ctx.Main, waits and sends progress; Tick owns all clean-up, so a cancelled or abandoned call never leaves
     // the game stepping. IClockHost is the game (GameClockHost in Stepper.cs) or a fake clock in the tests.
+    // Who writes the time scale: while the clock is frozen, Tick holds scale 0 in every frame. While it runs (realtime,
+    // or step mode left running) the scale is written only when something changes it here (mode, speed, unfreeze, the
+    // end of a run) and once after every load or title, which reset the game's scale; between those events the editor's
+    // time keys, the timescale command and the game's own scripts keep what they set. A MultiCam capture or a scene
+    // replay owns the clock outright (IClockHost.External).
     public enum StepMode { Step, Realtime }
 
     public sealed class RunRequest
@@ -32,6 +37,8 @@ namespace InsideDev.Play
     {
         public const string Steps = "steps", Condition = "condition", Died = "died", Loading = "loading", Cancelled = "cancelled",
             Timeout = "timeout", Stalled = "stalled";
+        // every value, for the output schemas of the tools that pass it through
+        public static readonly string[] All = { Steps, Condition, Died, Loading, Cancelled, Timeout, Stalled };
     }
 
     public sealed class RunResult
@@ -74,7 +81,7 @@ namespace InsideDev.Play
         bool Paused { get; }
         // the controlled character is dead
         bool Dead { get; }
-        // a MultiCam capture owns the clock: hands off
+        // a MultiCam capture or a scene replay owns the clock: hands off
         bool External { get; }
         // safe to freeze and to step deterministically: not loading, the load's fade-in done and input back, no title
         bool CanControl(out string reason);
@@ -99,7 +106,7 @@ namespace InsideDev.Play
         public double startMs, deadlineMs, elapsedMs;
         public volatile int steps;
         public int frames, lastProgressFrame, pausedFrames;
-        public bool wasLoading, wasDead, stepping, refreeze;
+        public bool wasLoading, wasDead, stepping, refreeze, couldControl;
         public volatile bool finished, abandoned;
         public string stop = RunStop.Steps, detail = "";
         public readonly List<string> warnings = new List<string>();
@@ -130,7 +137,7 @@ namespace InsideDev.Play
 
         readonly IClockHost h;
         StepMode mode = StepMode.Realtime;
-        bool modeChosen, wantFrozen, touched;
+        bool modeChosen, wantFrozen, touched, reapply, couldControl = true;
         volatile bool frozenApplied;
         double speed = 1;
         volatile StepRun run;
@@ -155,6 +162,8 @@ namespace InsideDev.Play
             if (double.IsNaN(s)) return 1;
             return Math.Max(MinSpeed, Math.Min(MaxSpeed, s));
         }
+
+        public const string ExternalNote = "external: a MultiCam capture or a scene replay owns the clock";
 
         public static string MusicWarning(string what)
         {
@@ -221,17 +230,21 @@ namespace InsideDev.Play
 
         void ApplyNow(List<string> w)
         {
-            if (h.External) { frozenApplied = false; if (w != null) w.Add("external: a MultiCam capture owns the clock"); return; }
+            if (h.External) { frozenApplied = false; if (w != null) w.Add(ExternalNote); return; }
             string reason;
             bool can = h.CanControl(out reason);
+            couldControl = can;
             if (wantFrozen)
             {
+                reapply = false;
                 if (can) { h.ApplyScale(0f); frozenApplied = true; }
                 else { frozenApplied = false; if (w != null) w.Add("freeze_deferred: " + reason + ": the game freezes once it is ready"); }
             }
             else
             {
                 frozenApplied = false;
+                // a load in progress resets the scale when it ends: Tick writes it once more then
+                reapply = !can;
                 h.ApplyScale(TargetScale());
             }
         }
@@ -247,6 +260,8 @@ namespace InsideDev.Play
             if (h.External) { frozenApplied = false; return; }
             string reason;
             bool can = h.CanControl(out reason);
+            if (can && !couldControl) reapply = true;
+            couldControl = can;
             if (wantFrozen)
             {
                 if (can) { h.ApplyScale(0f); frozenApplied = true; }
@@ -254,14 +269,24 @@ namespace InsideDev.Play
                 return;
             }
             frozenApplied = false;
-            if (!can) return;
-            if (mode == StepMode.Realtime) { if (Math.Abs(h.GameScale - speed) > 1e-4) h.ApplyScale((float)speed); }
-            else if (h.GameScale == 0f) h.ApplyScale(1f);
+            if (!can || !reapply) return;
+            reapply = false;
+            h.ApplyScale(TargetScale());
+        }
+
+        // main thread: Step / Frame as of now (a caller that reads them while Tick did not run)
+        public void Sync()
+        {
+            Interlocked.Exchange(ref step, h.StepCount);
+            Interlocked.Exchange(ref frame, h.FrameCount);
         }
 
         // main thread: start a run (the caller holds the control lane)
         public StepRun Begin(RunRequest req, Func<bool> cancelled, double budgetMs)
         {
+            // a run whose caller gave up ends at the next Tick; a new call that comes first ends it here
+            var old = run;
+            if (old != null && old.abandoned) End(old, RunStop.Cancelled, "abandoned: the caller stopped waiting");
             if (run != null) throw new McpException(McpErr.Busy, "a run is already active (" + run.req.label + ")", "wait for it, or call restore");
             TouchOnce();
             if (!modeChosen) { modeChosen = true; mode = StepMode.Step; wantFrozen = true; }
@@ -272,13 +297,15 @@ namespace InsideDev.Play
             r.wasLoading = h.Loading;
             r.wasDead = h.Dead;
             frozenApplied = false;
-            if (h.External) r.Warn("external: a MultiCam capture owns the clock");
+            reapply = false;
+            string reason;
+            r.couldControl = h.CanControl(out reason);
+            if (h.External) r.Warn(ExternalNote);
             else if (mode == StepMode.Step)
             {
                 h.BeginStepping();
                 r.stepping = true;
-                string reason;
-                if (h.CanControl(out reason)) { if (!h.Paused) h.ApplyScale(1f); }
+                if (r.couldControl) { if (!h.Paused) h.ApplyScale(1f); }
                 else r.Warn((h.Loading ? "loading" : "not_ready") + ": " + reason + ": the game runs in realtime until it is ready, then steps");
             }
             else
@@ -340,9 +367,11 @@ namespace InsideDev.Play
             r.wasLoading = loading;
             r.wasDead = dead;
             if (stop != null) { End(r, stop, detail); return; }
+            bool back = can && !r.couldControl;
+            r.couldControl = can;
             if (h.External) return;
             if (mode == StepMode.Step) { if (can && !paused) h.ApplyScale(1f); }
-            else if (can && Math.Abs(h.GameScale - speed) > 1e-4) h.ApplyScale((float)speed);
+            else if (back) h.ApplyScale((float)speed);
         }
 
         // main thread: end r now with stop / detail and freeze or keep running as asked
@@ -365,7 +394,11 @@ namespace InsideDev.Play
             ApplyNow(w);
             foreach (var x in w) if (!x.StartsWith("external")) r.Warn(x);
             MusicRun(r);
-            lock (r.gate) { r.finished = true; }
+            lock (r.gate)
+            {
+                r.finished = true;
+                Monitor.PulseAll(r.gate);
+            }
         }
 
         public void AbortRun(string why)
@@ -419,7 +452,13 @@ namespace InsideDev.Play
         public const int SliceMs = 250, ReplyReserveMs = 1500, StallGraceMs = 3000, CancelGraceMs = 2000;
 
         // worker thread: run req on clock and wait for its end (see Stepper.Run)
-        public static RunResult RunOn(CallContext ctx, StepClock clock, RunRequest req)
+        public static RunResult RunOn(CallContext ctx, StepClock clock, RunRequest req) { return RunOn(ctx, clock, req, null); }
+
+        // prepare (may be null) runs on the main thread in the same visit that starts the run, right before it (every
+        // visit of the main thread costs the caller about one rendered frame); it may still change req. When it returns
+        // false nothing starts and RunOn returns null. The worker then sleeps on the run's gate, which End pulses, so it
+        // goes on in the frame the run ended in.
+        public static RunResult RunOn(CallContext ctx, StepClock clock, RunRequest req, Func<bool> prepare)
         {
             if (req == null) req = new RunRequest();
             ctx.ThrowIfCancelled();
@@ -427,19 +466,23 @@ namespace InsideDev.Play
             try { job = ctx.RunningJob(McpLanes.Control); } catch (NotImplementedException) { }
             var j = job;
             Func<bool> cancelled = () => ctx.Cancelled || (j != null && j.Cancelled);
-            int want = req.timeoutMs > 0 ? req.timeoutMs : 50000;
-            int budget = Math.Max(50, Math.Min(want, ctx.RemainingMs - ReplyReserveMs));
-            var r = ctx.Main(() => clock.Begin(req, cancelled, budget));
+            var r = ctx.Main(() =>
+            {
+                if (prepare != null && !prepare()) return null;
+                int want = req.timeoutMs > 0 ? req.timeoutMs : 50000;
+                int budget = Math.Max(50, Math.Min(want, ctx.RemainingMs - ReplyReserveMs));
+                return clock.Begin(req, cancelled, budget);
+            });
+            if (r == null) return null;
             int lastSteps = -1;
             string prefix = string.IsNullOrEmpty(req.label) ? "" : req.label + ": ";
-            var spin = System.Diagnostics.Stopwatch.StartNew();
             while (!r.finished)
             {
-                spin.Reset();
-                spin.Start();
-                bool done = ctx.WaitUntil(() => r.finished, SliceMs, 1);
+                lock (r.gate)
+                {
+                    if (!r.finished) Monitor.Wait(r.gate, SliceMs);
+                }
                 if (r.finished) break;
-                if (!done && spin.ElapsedMilliseconds < 5 && !cancelled()) Thread.Sleep(5);
                 int s = r.steps;
                 if (s != lastSteps)
                 {

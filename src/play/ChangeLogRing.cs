@@ -8,7 +8,9 @@ namespace InsideDev.Play
     // tests. Entries get a sequence number that only grows; Since(mark) groups the entries after mark into the changes
     // lists, capped per list (first half and last half kept, the middle counted in truncated), Events(mark) merges them
     // into one step-ordered list for observe.events (deaths, loads, checkpoints, errors and notes are kept first).
-    // Repeated identical errors collapse into one entry with a count unless a Mark was handed out in between.
+    // Repeated identical errors collapse into one entry with a count until a reader has seen that entry (a Mark, or
+    // an Events read up to a sequence number): the next repeat is then a new entry, so a client that polls learns
+    // that the error keeps firing.
     // Compact(mark) is the default "changes" of action results: signal / fsm entries flagged far (more than 15 m from
     // the body when they fired) are only counted in far{}, every list is capped and the whole object is kept under a
     // character budget by cutting signals, fsm, toggled and other first (deaths, checkpoints, loads, errors stay).
@@ -72,7 +74,7 @@ namespace InsideDev.Play
         {
             lock (gate)
             {
-                if (lastError != null && lastError.seq > lastMarked && lastError.item != null && lastError.item.Str("message", "") == message && lastError.item.Str("type", "") == kind)
+                if (lastError != null && lastError.seq > lastMarked && seq - lastError.seq < ring.Length && lastError.item != null && lastError.item.Str("message", "") == message && lastError.item.Str("type", "") == kind)
                 {
                     lastError.repeat++;
                     return lastError.seq;
@@ -295,6 +297,7 @@ namespace InsideDev.Play
         {
             long lost;
             var es = After(mark, out lost);
+            if (upTo < long.MaxValue) lock (gate) { if (upTo > lastMarked) lastMarked = Math.Min(upTo, seq); }
             if (upTo < long.MaxValue || priorityOnly) es.RemoveAll(e => e.seq > upTo || (priorityOnly && !IsPriority(e.type)));
             cut = 0;
             cap = Math.Max(0, cap);

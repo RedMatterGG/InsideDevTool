@@ -13,10 +13,14 @@ namespace InsideDev.Play
     // loads (GameManager.loadStarted / loadFinished). Actions call Mark() before they run and put Since(mark, 20) into
     // their result as "changes". Every list is capped (cap per list) and truncated{} counts what was cut.
     // Polling runs in the "changelog" tick and again inside Since / Events when they are called on the main thread, so
-    // a result built in the frame the action stopped already holds that frame. Game hooks are added in the first tick
-    // (never in Register: the offline contract test registers every module without a game). Toggle polling and the
-    // core ObjectDatabase demand (which the EventMonitor FSM watch depends on) run only while an agent was active in
-    // the last 90 s. Extra output: "other" [{step, type, detail}] for note / input_hijacked / stalled, truncated.lost
+    // a result built in the frame the action stopped already holds that frame. Game hooks are added when Play is first used
+    // (CatchUp, never in Register: the offline contract test registers every module without a game). The tick runs only
+    // while an agent is active: from a tool call (Touch) until 90 s without one, or until Idle() (restore); then it
+    // switches itself off (no per-frame work at all) and the next Touch switches it on; deaths and loads are
+    // still recorded by their game events. The first poll after such a pause brings the log up to date: a checkpoint
+    // reached meanwhile is added, signal / fsm events fired meanwhile are counted in one note, the on / off baseline
+    // starts fresh. While active the tick also asks the core for its object index and event monitor
+    // (ObjectDatabase.Demand, Background.Want), which sleep otherwise. Extra output: "other" [{step, type, detail}] for note / input_hijacked / stalled, truncated.lost
     // when the ring (4000) overflowed, "warnings" when the event monitor is off. Since is compact (ChangeRing.Compact):
     // signals and fsm changes of objects more than NearRadius from the body are only counted in far{}, lists are capped at
     // CompactCap and the object stays under CompactChars; SinceFull lists everything (act changes:"full", dev tools).
@@ -36,6 +40,7 @@ namespace InsideDev.Play
         static long activeUntilTicks;
         static bool hasCheckpoint;
         static int cpSub = -1, cpSp = -1;
+        static volatile bool asleep = true;
 
         static readonly int[] frameOf = new int[128];
         static readonly long[] stepOf = new long[128];
@@ -48,7 +53,18 @@ namespace InsideDev.Play
 
         public static void Register()
         {
-            PlayRegistry.OnTick("changelog", Tick);
+            tick = PlayRegistry.OnTick("changelog", Tick, TickWhen.OnDemand);
+            PlayRegistry.OnWake(CatchUp);
+        }
+
+        static PlayTick tick;
+
+        // main thread, when Play is used after a quiet stretch: the game hooks and the main thread are known before the
+        // waking call marks or reads the log
+        static void CatchUp()
+        {
+            if (mainThread < 0) mainThread = Thread.CurrentThread.ManagedThreadId;
+            if (!hooked) Hook();
         }
 
         // any thread: the current sequence number
@@ -156,6 +172,17 @@ namespace InsideDev.Play
         internal static void Touch()
         {
             Interlocked.Exchange(ref activeUntilTicks, DateTime.UtcNow.Ticks + TimeSpan.TicksPerSecond * 90);
+            Background.Touch();
+            var t = tick;
+            if (t != null) t.Active = true;
+            Perception.TickOn();
+        }
+
+        // any thread: the agent is done (restore): the tick stops working at once instead of after 90 s; the next tool
+        // call wakes it again
+        public static void Idle()
+        {
+            Interlocked.Exchange(ref activeUntilTicks, 0);
         }
 
         static Json.Obj Item(long step)
@@ -169,6 +196,13 @@ namespace InsideDev.Play
         {
             if (mainThread < 0) mainThread = Thread.CurrentThread.ManagedThreadId;
             if (!hooked) Hook();
+            if (!Active)
+            {
+                asleep = true;
+                tick.Active = false;
+                if (Active) tick.Active = true;
+                return;
+            }
             SafePoll(false);
         }
 
@@ -232,7 +266,7 @@ namespace InsideDev.Play
             try
             {
                 string kind = type == LogType.Exception ? "exception" : type == LogType.Assert ? "assert" : type == LogType.Error ? "error" : null;
-                if (kind == null) return;
+                if (kind == null || !Active) return;
                 string m = msg ?? "";
                 int nl = m.IndexOf('\n');
                 if (nl >= 0) m = m.Substring(0, nl);
@@ -269,34 +303,57 @@ namespace InsideDev.Play
             int f = Time.frameCount;
             long st = LogicManager.stepCount;
             Interlocked.Exchange(ref lastStep, st);
+            if (asleep) Wake(st);
             int slot = f & 127;
             frameOf[slot] = f;
             stepOf[slot] = st;
             if (f == lastPollFrame && !force) return;
             bool firstThisFrame = f != lastPollFrame;
             lastPollFrame = f;
-            Vector3 bp;
-            bool hasBody = false;
-            try { hasBody = Perception.BodyPos(out bp); } catch { bp = Vector3.zero; }
-            drainBody = bp;
-            drainHasBody = hasBody;
+            drainFrame = -1;
             DrainMonitor(st);
             if (firstThisFrame) PollCheckpoint(st);
-            bool active = Active;
-            if (active)
+            if (Active)
             {
-                try { ObjectDatabase.Demand(2f); } catch { }
+                try
+                {
+                    ObjectDatabase.Demand(2f);
+                    if (firstThisFrame && (f & 63) == 0) { Background.Want(Background.Objects, 5f); Background.Want(Background.Events, 5f); }
+                }
+                catch { }
                 PollToggles(force, st);
             }
         }
 
+        // main thread, the first poll after a time without an agent
+        static void Wake(long st)
+        {
+            asleep = false;
+            long total = 0;
+            try { total = EventMonitor.total; } catch { }
+            if (lastMonitorTotal >= 0 && total > lastMonitorTotal)
+                ring.Add("note", ChangeRing.OtherList, st, "idle: " + (total - lastMonitorTotal).ToString(System.Globalization.CultureInfo.InvariantCulture) + " signal / fsm events fired while no agent was active (not listed)", null);
+            lastMonitorTotal = total;
+            lock (gate) { nearActive.Clear(); nearSet.Clear(); }
+            nearBuilt = -100000;
+            try { Background.Want(Background.Objects, 5f); Background.Want(Background.Events, 5f); } catch { }
+        }
+
         static Vector3 drainBody;
         static bool drainHasBody;
+        static int drainFrame = -1;
 
-        // main thread: the event's object was more than NearRadius from the body (no body or no object = near)
+        // main thread: the event's object was more than NearRadius from the body (no body or no object = near). The
+        // body position is read once per poll, and only when an event arrived.
         static bool Far(ObjRecord rec)
         {
-            if (!drainHasBody || rec == null || rec.go == null) return false;
+            if (rec == null || rec.go == null) return false;
+            if (drainFrame != lastPollFrame)
+            {
+                drainFrame = lastPollFrame;
+                try { drainHasBody = Perception.BodyPosFast(out drainBody); } catch { drainHasBody = false; }
+            }
+            if (!drainHasBody) return false;
             Vector3 p;
             try { p = rec.go.transform.position; } catch { return false; }
             return (p - drainBody).sqrMagnitude > NearRadius * NearRadius;
@@ -420,7 +477,7 @@ namespace InsideDev.Play
             if (!force && f - lastToggleFrame < 6) return;
             lastToggleFrame = f;
             Vector3 c;
-            if (!Perception.BodyPos(out c)) return;
+            if (!Perception.BodyPosFast(out c)) return;
             lock (gate)
             {
                 if (nearEpoch != Observer.Epoch || nearSet.Count == 0 && f - nearBuilt > 30 || (c - nearCenter).sqrMagnitude > 9f || f - nearBuilt > 120) RebuildNear(c, f);
@@ -464,8 +521,7 @@ namespace InsideDev.Play
             for (int i = 0; i < all.Count && nearSet.Count < 3000; i++)
             {
                 var r = all[i];
-                if (r == null || r.go == null) continue;
-                if ((r.pos - c).sqrMagnitude > r2) continue;
+                if (r == null || (r.pos - c).sqrMagnitude > r2 || r.go == null) continue;
                 if (bodyRootPath != null && r.path != null && r.path.StartsWith(bodyRootPath, StringComparison.Ordinal)) continue;
                 if (IsCuller(r)) continue;
                 nearSet.Add(r);

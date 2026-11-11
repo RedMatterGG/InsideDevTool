@@ -11,6 +11,11 @@ namespace InsideDev.Play
     // component resolves to its GameObject); the key is (instance id, prefix, sub) so one object can be o12 as a box,
     // o13 as the ledge on its left edge and h4 as a hazard. Liveness is Unity's null check. Name and path lookups use
     // the core ObjectDatabase index (built synchronously once if it never ran; exact paths also try GameObject.Find).
+    // An id outlives a load, a respawn and a subscene that streamed out and in again: the table keeps the hierarchy
+    // path of every id, a new object at the path of a retired id gets that id back when the core index (a pass begun
+    // after the load) shows exactly that object there, and an id used before then is resolved through the same path
+    // (one synchronous index pass at most twice). Same-named siblings make a path ambiguous: such ids are not carried
+    // over. An id whose object is gone answers stale_id with a "gone" message.
     public static partial class Observer
     {
         static readonly IdTable ids = new IdTable(o => { var u = o as UObj; return u != null; });
@@ -27,6 +32,8 @@ namespace InsideDev.Play
 
         static volatile Latest latest;
 
+        static int passAtLoad;
+
         internal static string IdFor(UObj o, string prefix, int sub)
         {
             if (o == null) return null;
@@ -34,7 +41,16 @@ namespace InsideDev.Play
             GameObject go = comp != null ? comp.gameObject : o as GameObject;
             UObj key = go != null ? (UObj)go : o;
             if (prefix != "h" && prefix != "b") prefix = "o";
-            return ids.Assign(IdTable.Key(key.GetInstanceID(), IdTable.PrefixCode(prefix), sub), key, prefix);
+            long k = IdTable.Key(key.GetInstanceID(), IdTable.PrefixCode(prefix), sub);
+            string have = ids.Existing(k, key);
+            if (have != null) return have;
+            return go != null ? AssignNew(k, go, prefix) : ids.Assign(k, key, prefix);
+        }
+
+        // a new entry (its own method: the two delegates are only allocated here, not on every IdFor)
+        static string AssignNew(long k, GameObject go, string prefix)
+        {
+            return ids.Assign(k, go, prefix, () => PlayShared.PathOf(go.transform), path => SoleAtPath(path, false) == go);
         }
 
         // the id an object already has (o, then h, then b; sub 0), or null
@@ -50,18 +66,73 @@ namespace InsideDev.Play
             return null;
         }
 
+        // the id an object already has under one prefix (sub 0), or null
+        internal static string ExistingId(GameObject go, string prefix)
+        {
+            if (go == null) return null;
+            return ids.Existing(IdTable.Key(go.GetInstanceID(), IdTable.PrefixCode(prefix), 0), go);
+        }
+
+        // the one loaded object at a hierarchy path by the core object index; null when there is none or several, and
+        // when the index has no finished pass that began after the last load. refresh = run that pass now (a long
+        // frame; only for an id the caller is about to act on).
+        static GameObject SoleAtPath(string path, bool refresh)
+        {
+            if (string.IsNullOrEmpty(path)) return null;
+            int synced = 0;
+            for (int n = 0; n < 4; n++)
+            {
+                bool current = ObjectDatabase.Ready && !ObjectDatabase.Scanning && ObjectDatabase.pass > passAtLoad;
+                if (current)
+                {
+                    var l = ObjectDatabase.ByPath(path);
+                    if (l.Count == 1) return l[0].go;
+                    if (l.Count > 1 || !refresh || synced > 0 || ObjectDatabase.Age < 0.25f) return null;
+                }
+                else if (!refresh || synced >= 2) return null;
+                if (current) ObjectDatabase.MarkDirty("play: id lookup");
+                ObjectDatabase.EnsureFresh(0f);
+                synced++;
+            }
+            return null;
+        }
+
         static UObj ResolveId(string id)
         {
             object obj;
-            switch (ids.Lookup(id, out obj))
+            string path;
+            long key;
+            int entryEpoch;
+            switch (ids.Lookup(id, out obj, out path, out key, out entryEpoch))
             {
                 case IdLookup.Ok: return (UObj)obj;
+                case IdLookup.Gone:
+                {
+                    var kept = obj as UObj;
+                    if (kept != null && ids.Rebind(id, key, kept)) return kept;
+                    bool beforeLoad = entryEpoch < ids.Epoch;
+                    bool loading = false;
+                    try { loading = GameManager.IsLoading(); } catch { }
+                    if (loading) throw new McpException(McpErr.StaleId, id + " is from before the load that is running now", "wait_until {any:[{ready:true}]}; the id works again when its object is back, else call observe");
+                    GameObject found = null;
+                    try { found = SoleAtPath(path, true); } catch (Exception) { found = null; }
+                    if (found != null)
+                    {
+                        long nk = IdTable.Key(found.GetInstanceID(), (int)((key >> 4) & 0xF), (int)(key & 0xF));
+                        if (ids.Rebind(id, nk, found)) return found;
+                    }
+                    string where = string.IsNullOrEmpty(path) ? "" : " (" + StateNames.PathTail(path, 70) + " is not loaded now, or several objects share that path)";
+                    throw new McpException(McpErr.StaleId, (beforeLoad ? id + " is from before the last load and its object is gone" : id + " was destroyed and is gone") + where, "call observe again for current ids");
+                }
                 case IdLookup.Stale: throw new McpException(McpErr.StaleId, id + " is from before the last load", "call observe again for current ids");
                 case IdLookup.Destroyed: throw new McpException(McpErr.StaleId, id + " was destroyed", "call observe again for current ids");
                 case IdLookup.NotFound: throw new McpException(McpErr.NotFound, "no object has id " + id, "use an id from the latest observe");
                 default: throw new McpException(McpErr.BadArgs, "'" + id + "' is not an id (o12, h3, b1)");
             }
         }
+
+        // ids carried over a load so far: given back to the same path by observe, and resolved again on use
+        internal static long IdsCarried { get { return ids.Revived; } }
 
         static GameObject ToGo(UObj o)
         {
@@ -114,8 +185,8 @@ namespace InsideDev.Play
                 var hits = new List<ObjRecord>();
                 foreach (var r in ObjectDatabase.all)
                 {
-                    if (r == null || r.go == null || r.path == null) continue;
-                    if (r.path == path || r.path.EndsWith(suffix, StringComparison.Ordinal)) { hits.Add(r); if (hits.Count > 50) break; }
+                    if (r == null || r.path == null) continue;
+                    if ((r.path == path || r.path.EndsWith(suffix, StringComparison.Ordinal)) && r.go != null) { hits.Add(r); if (hits.Count > 50) break; }
                 }
                 if (hits.Count == 1) return hits[0].go;
                 if (hits.Count > 1) throw Ambiguous(s, hits);
@@ -162,6 +233,12 @@ namespace InsideDev.Play
         {
             Perception.ForgetBody();
             Perception.InvalidateAll();
+            try
+            {
+                passAtLoad = ObjectDatabase.pass;
+                ObjectDatabase.MarkDirty("play: load finished");
+            }
+            catch (Exception) { }
         }
 
         internal static ObjInfo LatestObject(GameObject go)

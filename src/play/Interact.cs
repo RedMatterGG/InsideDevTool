@@ -17,8 +17,11 @@ namespace InsideDev.Play
     // take; refused when the hat has disableDetach), and the result then lists it in direct_calls. The result adds
     // phases[] {name, steps, result} and, for lever / valve / button / lift / push / pull, what the target did in detail.
     // Grip: a successful grab sets AgentCore.Grip instead of a latch (act and move_to keep it); grab, push and pull keep
-    // it, every other verb lets go first and warns grip_released. when waits for one wait_until condition before the
-    // verb runs (Act.RunWhen).
+    // it, every other verb lets go and warns grip_released, but only once it is sure that it will run: a verb that
+    // answers out_of_reach (approach:false) or not_available leaves the grab alone, and so does an error before anything
+    // ran (a stale target id, a main thread that did not answer). when waits for one wait_until condition before the
+    // verb runs (Act.RunWhen); wait_ready_s lets a game that does not take input yet run until it does (Act.WaitReady).
+    // Each phase reads the body, queues its frames and starts its run in one visit of the main thread.
     public static class Interact
     {
         public const string Owner = "INPUT";
@@ -38,10 +41,14 @@ namespace InsideDev.Play
                     .Bool("allow_direct", "hat_detach: if the gesture fails, take the hat off with MindHat.ForceDetach (a direct game call; off keeps takes input-only).", false)
                     .Obj("when", Waits.WhenText, Waits.WhenSchema())
                     .Num("when_timeout_s", "Longest wait for when (wall clock s).", Waits.WhenDefaultS, 0.1, Waits.WhenMaxS)
+                    .Num("wait_ready_s", Act.WaitReadyText, 0, 0, Act.WaitReadyMaxS)
                     .Enum("observe", "Observation in the result.", "concise", "concise", "none").Required("verb").Build(),
                 Schema.Obj().Enum("outcome", "How it ended.", null, Outcomes).Str("verb", "Verb run.").Str("target", "Target id.")
                     .Str("state_before", "Body state before.").Str("state_after", "Body state after.").Int("steps", "Logic steps run.", 0, 100000)
                     .Str("detail", "Why it failed, or what happened.").Arr("direct_calls", "Direct game calls used instead of input (allow_direct).", Schema.Str(), 0, 4)
+                    .Arr("phases", "The steps of the verb in order: approach, then the macro's phases.", Schema.OutOf(Schema.Obj().Str("name", "").Int("steps", "", 0, 100000)
+                        .Str("result", "done, time, already, skipped, fail, or an outcome.")), 0, 40)
+                    .OutObj("when", "The when wait.", Waits.WhenOut()).OutObj("wait_ready", "The wait_ready_s wait.", Act.WaitReadyOut())
                     .Arr("warnings", "", Schema.Str(), 0, 20)
                     .Prop("changes", null, ChangeLog.Ref())
                     .Prop("observe", null, Observer.ConciseRef()).BuildOutput()).AlwaysLoad(), Handle);
@@ -70,6 +77,7 @@ namespace InsideDev.Play
             bool wantObs = PlayShared.Str(a, "observe", "concise") != "none";
             var when = PlayShared.Obj(a, "when");
             double whenTimeout = PlayShared.Num(a, "when_timeout_s", Waits.WhenDefaultS);
+            double waitReadyS = PlayShared.Num(a, "wait_ready_s", 0);
 
             ToolResult busy;
             var job = ctx.BeginJob(McpLanes.Control, out busy);
@@ -83,7 +91,8 @@ namespace InsideDev.Play
             var scope = new ActScope();
             int steps = 0;
             string outcome = null, detail = null;
-            bool latched = false;
+            // started: something was queued or run (from then on an error releases the input)
+            bool latched = false, started = false;
             Prep p = null;
             ActBody start = null, end = null;
             InteractMacro macro = null;
@@ -91,6 +100,17 @@ namespace InsideDev.Play
             {
                 p = ctx.Main(() => Prepare(scope, verb, spec, warnings));
                 start = p.snap;
+                if (p.notReady != null && waitReadyS > 0 && Act.ReadyWaitable(p.reason, null))
+                {
+                    started = true;
+                    bool ready;
+                    r["wait_ready"] = Act.WaitReady(ctx, waitReadyS, ActInputs.ReserveMs(600), "interact", warnings, out ready);
+                    var scopeR = new ActScope();
+                    var pr = ctx.Main(() => Prepare(scopeR, verb, spec, warnings));
+                    scope = scopeR;
+                    p = pr;
+                    start = p.snap;
+                }
                 if (p.notReady != null)
                 {
                     outcome = p.notReady == "loading" ? "loading" : "not_available";
@@ -98,6 +118,7 @@ namespace InsideDev.Play
                 }
                 if (outcome == null && when != null)
                 {
+                    started = true;
                     string ws;
                     if (!Act.RunWhen(ctx, r, when, whenTimeout, 600, "interact", out ws))
                     {
@@ -115,14 +136,14 @@ namespace InsideDev.Play
                         if (p.notReady != null) { outcome = p.notReady == "loading" ? "loading" : "not_available"; detail = "not ready after when: " + p.reason; }
                     }
                 }
-                if (outcome == null && AgentCore.Grip && Array.IndexOf(InteractMacros.GripVerbs, verb) < 0)
+                // the verb needs the action button: the grab ends, but not before it is sure that the verb runs
+                bool letGo = outcome == null && AgentCore.Grip && Array.IndexOf(InteractMacros.GripVerbs, verb) < 0;
+                // release and drop are the verbs that let go: they do it whatever the body's state says
+                if (letGo && (verb == "release" || verb == "drop"))
                 {
-                    if (verb == "throw") scope.dropGrip = true;
-                    else
-                    {
-                        ctx.MainDo(() => AgentCore.SetGrip(false));
-                        if (verb != "release" && verb != "drop") warnings.Add("grip_released: " + verb + " needs the action button free, so the grab from interact grab was let go");
-                    }
+                    started = true;
+                    LetGo(ctx, scope, verb, warnings);
+                    letGo = false;
                 }
                 if (outcome == null && p.needApproach)
                 {
@@ -133,6 +154,8 @@ namespace InsideDev.Play
                     }
                     else
                     {
+                        started = true;
+                        if (letGo) { LetGo(ctx, scope, verb, warnings); letGo = false; }
                         Json.Obj mv = null;
                         try { mv = Navigator.MoveTo(ctx, new MoveRequest { target = p.navTarget, stop = "adjacent", gait = Math.Abs(p.dx) < 2.5f ? "walk" : "run", maxSteps = 900 }); }
                         catch (NotImplementedException) { warnings.Add("approach_unavailable: move_to is not built yet"); }
@@ -159,6 +182,8 @@ namespace InsideDev.Play
                 }
                 if (outcome == null)
                 {
+                    started = true;
+                    if (letGo) LetGo(ctx, scope, verb, warnings);
                     MacroPhase failed = null;
                     foreach (var ph in macro.phases)
                     {
@@ -197,7 +222,9 @@ namespace InsideDev.Play
             }
             finally
             {
-                if (outcome == null || outcome == "cancelled" || outcome == "died" || outcome == "loading") AgentCore.Release();
+                // outcome null = an error: it releases only what this call started
+                if (outcome == null) { if (started) AgentCore.Release(); }
+                else if (outcome == "cancelled" || outcome == "died" || outcome == "loading") AgentCore.Release();
                 else AgentCore.ReleaseKeepGrip();
             }
 
@@ -219,6 +246,14 @@ namespace InsideDev.Play
             if (AgentCore.Hijacked && !warnings.Contains("input_hijacked")) warnings.Add("input_hijacked");
             Act.Tail(r, ctx, mark, wantObs, "interact", warnings);
             return ToolResult.Ok(r);
+        }
+
+        // throw drops the grip in the queue operation of its first phase; the others let go now
+        static void LetGo(CallContext ctx, ActScope scope, string verb, List<string> warnings)
+        {
+            if (verb == "throw") { scope.dropGrip = true; return; }
+            ctx.MainDo(() => AgentCore.SetGrip(false));
+            if (verb != "release" && verb != "drop") warnings.Add("grip_released: " + verb + " needs the action button free, so the grab from interact grab was let go");
         }
 
         static ActBody SafeTake(CallContext ctx, ActScope scope)
@@ -350,19 +385,16 @@ namespace InsideDev.Play
             return e;
         }
 
-        // worker thread: "ok", "fail" or an outcome (died, loading, cancelled, timeout, failed)
+        // worker thread: "ok", "fail" or an outcome (died, loading, cancelled, timeout, failed). The body before the
+        // phase, the phase's frames and the start of its run share one visit of the main thread.
         static string RunPhase(CallContext ctx, ActScope scope, MacroPhase ph, ActBody start, ref int steps, List<string> warnings, List<object> phasesOut, string verb)
         {
             if (ctx.Cancelled) return "cancelled";
             int left = InteractMacros.MaxTotalSteps - steps;
             if (left <= 0) return "timeout";
-            var pre = ctx.Main(() => ActProbe.Take(scope));
-            if (ph.skipUnless != null && !ph.skipUnless.Eval(pre, start)) { phasesOut.Add(PhaseJson(ph.name, 0, "skipped")); return "ok"; }
-            if (ph.minSteps == 0 && ph.done != null && ph.done.Eval(pre, start)) { phasesOut.Add(PhaseJson(ph.name, 0, "already")); return "ok"; }
-            if (ph.fail != null && ph.fail.Eval(pre, start)) { phasesOut.Add(PhaseJson(ph.name, 0, "fail")); return "fail"; }
-            if (scope.dropGrip) { AgentCore.ReplaceDropGrip(ph.frames, true); scope.dropGrip = false; }
-            else AgentCore.Replace(ph.frames, true);
-            long s0 = pre.step;
+            string early = null;
+            long s0 = 0;
+            var now = new ActBody();
             var req = new RunRequest
             {
                 maxSteps = Math.Min(ph.maxSteps, left),
@@ -372,13 +404,28 @@ namespace InsideDev.Play
                 label = "interact " + verb + ": " + ph.name,
                 stopCheck = () =>
                 {
-                    var now = ActProbe.Take(scope);
+                    ActProbe.Take(scope, now);
                     if (ph.fail != null && now.step > s0 && ph.fail.Eval(now, start)) return "fail";
                     if (ph.done != null && now.step - s0 >= Math.Max(1, ph.minSteps) && ph.done.Eval(now, start)) return "done";
                     return null;
                 }
             };
-            var rr = Stepper.Run(ctx, req);
+            var rr = Stepper.Run(ctx, req, () =>
+            {
+                var pre = ActProbe.Take(scope);
+                if (ph.skipUnless != null && !ph.skipUnless.Eval(pre, start)) { early = "skipped"; return false; }
+                if (ph.minSteps == 0 && ph.done != null && ph.done.Eval(pre, start)) { early = "already"; return false; }
+                if (ph.fail != null && ph.fail.Eval(pre, start)) { early = "fail"; return false; }
+                if (scope.dropGrip) { AgentCore.ReplaceDropGrip(ph.frames, true); scope.dropGrip = false; }
+                else AgentCore.Replace(ph.frames, true);
+                s0 = pre.step;
+                return true;
+            });
+            if (rr == null)
+            {
+                phasesOut.Add(PhaseJson(ph.name, 0, early ?? "skipped"));
+                return early == "fail" ? "fail" : "ok";
+            }
             steps += rr.steps;
             foreach (var w in rr.warnings) if (!warnings.Contains(w)) warnings.Add(w);
             string result;
@@ -426,7 +473,8 @@ namespace InsideDev.Play
         // worker thread: what the target did ("failed:..." turns a done lever into failed)
         static string TargetDetail(CallContext ctx, ActScope scope, string verb, Prep p, ActBody start, ActBody end, string outcome)
         {
-            if (p == null || p.target == null) return null;
+            // a worker thread: only the reference is tested here, the object itself on the main thread below
+            if (p == null || (object)p.target == null) return null;
             if (verb == "push" || verb == "pull")
             {
                 float moved;

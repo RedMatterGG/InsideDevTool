@@ -570,4 +570,64 @@ namespace InsideDev.Play
             return (float)Math.Round(c, 3);
         }
     }
+
+    // compact text forms of a slice (pure)
+    internal static class NavText
+    {
+        // "####....~~" -> "4# 4. 2~"
+        public static string Runs(string row)
+        {
+            if (string.IsNullOrEmpty(row)) return "";
+            var sb = new System.Text.StringBuilder(row.Length);
+            int i = 0;
+            while (i < row.Length)
+            {
+                int j = i;
+                while (j < row.Length && row[j] == row[i]) j++;
+                if (sb.Length > 0) sb.Append(' ');
+                sb.Append((j - i).ToString(System.Globalization.CultureInfo.InvariantCulture)).Append(row[i]);
+                i = j;
+            }
+            return sb.ToString();
+        }
+
+        // "4# 4. 2~" -> "####....~~" (the inverse of Runs; null when the text is not run-length coded)
+        public static string Expand(string runs)
+        {
+            if (runs == null) return null;
+            var sb = new System.Text.StringBuilder();
+            foreach (var part in runs.Split(' '))
+            {
+                if (part.Length == 0) continue;
+                int n;
+                if (part.Length < 2 || !int.TryParse(part.Substring(0, part.Length - 1), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out n) || n <= 0) return null;
+                sb.Append(part[part.Length - 1], n);
+            }
+            return sb.ToString();
+        }
+
+        static bool Empty(char c) { return c == '.' || c == '?'; }
+
+        // the slice without its border rows and columns that hold only '.' or '?'; g itself when nothing can go (or
+        // everything would)
+        public static GridSlice Crop(GridSlice g)
+        {
+            if (g == null || g.cols == 0 || g.rows == 0) return g;
+            int c0 = g.cols, c1 = -1, r0 = g.rows, r1 = -1;
+            for (int r = 0; r < g.rows; r++)
+                for (int c = 0; c < g.cols; c++)
+                {
+                    if (Empty(g.cells[r * g.cols + c])) continue;
+                    if (c < c0) c0 = c;
+                    if (c > c1) c1 = c;
+                    if (r < r0) r0 = r;
+                    if (r > r1) r1 = r;
+                }
+            if (c1 < 0 || (c0 == 0 && r0 == 0 && c1 == g.cols - 1 && r1 == g.rows - 1)) return g;
+            var o = new GridSlice(g.originX + c0 * g.cell, g.originY + r0 * g.cell, g.z, g.cell, c1 - c0 + 1, r1 - r0 + 1);
+            for (int r = r0; r <= r1; r++)
+                for (int c = c0; c <= c1; c++) o.cells[(r - r0) * o.cols + (c - c0)] = g.cells[r * g.cols + c];
+            return o;
+        }
+    }
 }
