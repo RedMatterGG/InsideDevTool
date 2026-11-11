@@ -8,7 +8,7 @@
   "created": "2026-10-03T12:45:00Z",
   "game": "INSIDE",
   "editor": "InsideDev 0.5.0",
-  "enabled": true,
+  "enabled": false,
   "operations": [
     {
       "id": 2,

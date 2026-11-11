@@ -35,7 +35,7 @@
   ],
   "timing": {"fps": 30, "segments": [{"from": 0, "speed": 1, "label": "real"}]},
   "output": {"format": "jpg", "jpeg": 90},
-  "session": {"res": [2560, 1440]},
+  "session": {"res": [0, 0]},
   "post": {"brightness": 0.55, "blacklift": 0.006, "postGamma": 0.03, "inWhiteScale": 0.95},
   "tracks": ["HayBaleHolder/HayBale"],
   "replay": {
