@@ -294,6 +294,28 @@ namespace InsideDev.McpExt
             return l.Count;
         }
 
+        // true while any job runs (no allocation)
+        internal static bool AnyRunning
+        {
+            get { lock (gate) { foreach (var j in lanes.Values) if (!j.Ended) return true; return false; } }
+        }
+
+        // The job on the lane that an automatic restore has to wait for, or null. A job that outlived its call
+        // (detached) and whose MCP session is no longer live has no owner left: the restore does not wait for it and
+        // cancels it. Jobs started without a session (console, POST /cmd, ctl) always count.
+        internal static McpJob Blocking(string lane, Func<string, bool> sessionLive)
+        {
+            if (string.IsNullOrEmpty(lane)) lane = McpLanes.Control;
+            HostJob j;
+            lock (gate) { if (!lanes.TryGetValue(lane, out j) || j.Ended) return null; }
+            if (sessionLive == null || !(j.Detached || j.autoDetached)) return j;
+            string sid = j.call != null ? j.call.sessionId : null;
+            if (string.IsNullOrEmpty(sid)) return j;
+            bool live;
+            try { live = sessionLive(sid); } catch (Exception) { live = true; }
+            return live ? j : null;
+        }
+
         // called when a tool call returns: finishes the call's job unless it was detached
         public static void EndOfCall(CallInfo call, ToolResult result)
         {
@@ -337,8 +359,13 @@ namespace InsideDev.McpExt
         internal static void Sweep()
         {
             var now = DateTime.UtcNow;
-            var l = new List<HostJob>();
-            lock (gate) foreach (var j in lanes.Values) if (!j.Ended && (j.Detached || j.autoDetached)) l.Add(j);
+            List<HostJob> l = null;
+            lock (gate)
+            {
+                if (lanes.Count == 0) return;
+                foreach (var j in lanes.Values) if (!j.Ended && (j.Detached || j.autoDetached)) { if (l == null) l = new List<HostJob>(); l.Add(j); }
+            }
+            if (l == null) return;
             foreach (var j in l)
             {
                 if (!j.Cancelled && now - j.StartedUtc > MaxDetached) j.Cancel("job ran longer than " + (int)MaxDetached.TotalSeconds + " s");

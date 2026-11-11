@@ -5,8 +5,8 @@ using System.IO;
 namespace InsideDev.McpExt
 {
     // ShotDraw.cs (owner HOST): the Unity-free half of McpShot (Shot.cs has the capture). Types of the screenshot
-    // service, Describe / Attach, the worker-side processing (decode, black check, scale, set-of-mark labels, encode)
-    // with a built-in 5x7 font, the shots folder (_mod/shots, newest 200 kept) and the inside://shots/<file> resource.
+    // service, Describe / Attach, the set-of-mark labels with a built-in 5x7 font, the shots folder (_mod/shots, newest
+    // 200 kept) and the inside://shots/<file> resource.
     public sealed class ShotMark
     {
         public string id, label;
@@ -20,16 +20,21 @@ namespace InsideDev.McpExt
         public int maxWidth = 960;
         // hide InsideDev panels, HUD and overlays for this capture
         public bool clean = true;
-        // full / path: return once the file is written, without the decode and the black check (2560x1440: the managed
-        // inflate of the black check was most of the call)
+        // full / path: return once the file is written, without reading the frame back for the black check
         public bool fast;
         // marks to draw (mode marked); null = ask McpShot.MarkSource
         public List<ShotMark> marks;
+        // preview / marked: "png" (default) or "jpeg" (several times smaller; quality 1..100)
+        public string format = "png";
+        public int quality = 80;
     }
 
     public sealed class ShotResult
     {
+        // the encoded image of preview / marked (PNG, or JPEG when format says so); null for full / path
         public byte[] png;
+        public string format = "png";
+        public string Mime { get { return format == "jpeg" ? "image/jpeg" : "image/png"; } }
         public string path, mode, error;
         public int width, height, srcWidth, srcHeight;
         public bool black;
@@ -39,7 +44,8 @@ namespace InsideDev.McpExt
         internal Json.Obj camera;
         internal bool hasBoy, boyOn;
         internal float boyX, boyY;
-        internal double luma = -1;
+        internal double luma = -1, mainMs = -1;
+        internal long ms = -1, bytes = -1;
     }
 
     public static partial class McpShot
@@ -53,17 +59,20 @@ namespace InsideDev.McpExt
         internal static int Keep = 200;
         internal const int MaxMarks = 64;
 
-        // structured fields {mode, width, height, src_width, src_height, path, black, frame, marks[{id, label, x, y}]}
-        // with x / y scaled to the returned image
+        // structured fields {mode, format, width, height, src_width, src_height, path, uri, bytes, black, frame,
+        // marks[{id, label, x, y}], camera, boy, ms, main_ms} with x / y scaled to the returned image; ms = the whole
+        // capture, main_ms = its part on the game's main thread
         public static Json.Obj Describe(ShotResult r)
         {
             var o = new Json.Obj();
             if (r == null) return o;
             o["mode"] = r.mode ?? "preview";
+            o["format"] = r.format ?? "png";
             o["width"] = (double)r.width; o["height"] = (double)r.height;
             o["src_width"] = (double)r.srcWidth; o["src_height"] = (double)r.srcHeight;
             if (r.path != null) o["path"] = r.path;
             if (r.file != null) o["uri"] = UriPrefix + r.file;
+            if (r.bytes >= 0) o["bytes"] = (double)r.bytes;
             o["black"] = r.black;
             o["frame"] = (double)r.frame;
             double sx = r.srcWidth > 0 && r.width > 0 ? r.width / (double)r.srcWidth : 1.0;
@@ -89,6 +98,8 @@ namespace InsideDev.McpExt
                 b["x"] = Math.Round(r.boyX * sx, 1); b["y"] = Math.Round(r.boyY * sy, 1); b["on_screen"] = r.boyOn;
                 o["boy"] = b;
             }
+            if (r.ms >= 0) o["ms"] = (double)r.ms;
+            if (r.mainMs >= 0) o["main_ms"] = r.mainMs;
             if (r.note != null) o["note"] = r.note;
             if (r.error != null) o["problem"] = r.error;
             return o;
@@ -98,7 +109,7 @@ namespace InsideDev.McpExt
         public static void Attach(ToolResult result, ShotResult r)
         {
             if (result == null || r == null) return;
-            if (r.png != null) result.AddImage(r.png, "image/png");
+            if (r.png != null) result.AddImage(r.png, r.Mime);
             if (result.structured == null)
             {
                 result.structured = new Json.Obj();
@@ -118,53 +129,13 @@ namespace InsideDev.McpExt
             }
         }
 
-        // worker thread: decode, black check, scale and label the captured PNG into r (mode decides what comes back inline)
-        internal static void Process(ShotResult r, byte[] png, ShotRequest req)
+        internal static string NormalizeFormat(string format)
         {
-            string mode = NormalizeMode(r.mode ?? (req != null ? req.mode : null));
-            r.mode = mode;
-            byte[] px = null;
-            int w = 0, h = 0;
-            if (req != null && req.fast && (mode == "full" || mode == "path"))
+            switch ((format ?? "").Trim().ToLowerInvariant())
             {
-                r.width = r.srcWidth; r.height = r.srcHeight; r.png = null;
-                r.note = "fast: not decoded, black not checked";
-                return;
+                case "jpeg": case "jpg": return "jpeg";
+                default: return "png";
             }
-            try
-            {
-                px = Png.DecodeRgb(png, out w, out h);
-                r.srcWidth = w; r.srcHeight = h;
-                double mean;
-                r.black = ShotDraw.IsBlack(px, w, h, out mean);
-                r.luma = mean;
-            }
-            catch (Exception e) { r.note = "not decoded: " + e.Message; px = null; }
-            if (mode == "full" || mode == "path")
-            {
-                r.width = r.srcWidth; r.height = r.srcHeight; r.png = null;
-                return;
-            }
-            if (px == null) { r.png = png; r.width = r.srcWidth; r.height = r.srcHeight; return; }
-            int maxW = req != null ? req.maxWidth : 960;
-            int nw = w, nh = h;
-            byte[] outPx = px;
-            if (maxW > 0 && w > maxW)
-            {
-                nw = maxW; nh = Math.Max(1, (int)Math.Round(h * (maxW / (double)w)));
-                outPx = Png.Scale(px, w, h, nw, nh);
-            }
-            r.width = nw; r.height = nh;
-            bool drew = false;
-            if (mode == "marked" && r.marks != null && r.marks.Count > 0)
-            {
-                double sx = nw / (double)w, sy = nh / (double)h;
-                var scaled = new List<ShotMark>();
-                foreach (var m in r.marks) if (m != null && scaled.Count < MaxMarks) scaled.Add(new ShotMark { id = m.id, label = m.label ?? m.id, x = (float)(m.x * sx), y = (float)(m.y * sy) });
-                ShotDraw.Marks(outPx, nw, nh, scaled);
-                drew = true;
-            }
-            r.png = ReferenceEquals(outPx, px) && !drew ? png : Png.EncodeRgb(outPx, nw, nh);
         }
 
         // newest keep files stay
@@ -172,8 +143,12 @@ namespace InsideDev.McpExt
         {
             try
             {
-                var files = Directory.GetFiles(dir, "*.png");
-                if (files.Length <= keep) return;
+                var png = Directory.GetFiles(dir, "*.png");
+                var jpg = Directory.GetFiles(dir, "*.jpg");
+                if (png.Length + jpg.Length <= keep) return;
+                var files = new string[png.Length + jpg.Length];
+                png.CopyTo(files, 0);
+                jpg.CopyTo(files, png.Length);
                 var times = new DateTime[files.Length];
                 for (int i = 0; i < files.Length; i++) { try { times[i] = File.GetLastWriteTimeUtc(files[i]); } catch { times[i] = DateTime.MinValue; } }
                 Array.Sort(times, files);
@@ -182,7 +157,7 @@ namespace InsideDev.McpExt
             catch { }
         }
 
-        // inside://shots/<file>: the full-size PNG of a capture (blob), null when the uri is not a shot or the file is gone
+        // inside://shots/<file>: the image file of a capture (blob), null when the uri is not a shot or the file is gone
         internal static ResourceContents ReadShot(string uri)
         {
             if (uri == null || !uri.StartsWith(UriPrefix, StringComparison.Ordinal) || ShotsDir == null) return null;
@@ -190,12 +165,14 @@ namespace InsideDev.McpExt
             if (!SafeName(name)) throw new McpException(McpErr.BadArgs, "bad screenshot name " + name, "use the uri from a screenshot result");
             string p = Path.Combine(ShotsDir, name);
             if (!File.Exists(p)) return null;
-            return new ResourceContents { uri = uri, mimeType = "image/png", blob = File.ReadAllBytes(p) };
+            return new ResourceContents { uri = uri, mimeType = name.EndsWith(".jpg", StringComparison.Ordinal) ? "image/jpeg" : "image/png", blob = File.ReadAllBytes(p) };
         }
 
+        // digits and "_" followed by .png or .jpg: nothing that could leave the shots folder
         internal static bool SafeName(string name)
         {
-            if (string.IsNullOrEmpty(name) || name.Length > 64 || !name.EndsWith(".png", StringComparison.Ordinal)) return false;
+            if (string.IsNullOrEmpty(name) || name.Length > 64 || name.Length < 5) return false;
+            if (!name.EndsWith(".png", StringComparison.Ordinal) && !name.EndsWith(".jpg", StringComparison.Ordinal)) return false;
             for (int i = 0; i < name.Length - 4; i++) { char c = name[i]; if (!(c >= '0' && c <= '9') && c != '_') return false; }
             return true;
         }

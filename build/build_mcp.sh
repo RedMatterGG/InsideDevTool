@@ -25,4 +25,4 @@ mkdir -p "$ROOT/tools/mcp"
 dotnet "$CSC" -nologo -noconfig -nostdlib -t:exe -langversion:7.3 -optimize+ -main:InsideDev.McpExt.StdioProxy \
   -out:"$ROOT/tools/mcp/InsideDev.McpStdio.exe" -nowarn:0618,0414,0649,0169,0219,0162,0168,0067 \
   -r:"$NETFX/mscorlib.dll" -r:"$NETFX/System.dll" -r:"$NETFX/System.Core.dll" \
-  McpStdio.cs McpServer.cs $(ls Server*.cs Sse*.cs | sort) stdio/Json.cs
+  McpStdio.cs McpServer.cs $(ls Server*.cs Sse*.cs | sort) ../InsideDev/Runtime/Json.cs

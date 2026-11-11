@@ -10,25 +10,54 @@ namespace InsideDev.McpExt
     // most the tool budget (CallInfo.budgetMs, 55 s) plus a 2.5 s grace. On time: HostJobs.EndOfCall, progress flush,
     // audit. Over time: the reply is error timeout; a call that holds a job keeps running as that job (the client awaits
     // it with jobs / wait_until {job}) and its late result lands in the job; a call without a job is cancelled, so its
-    // pending main-thread items are dropped and never run. Results are normalized: structured has ok first and
-    // isError == !ok.
+    // pending main-thread items are dropped and never run. A call whose client closed the connection while it ran
+    // (CallInfo.clientGone, asked twice a second) is cancelled the same way. Results are normalized: structured has ok
+    // first and isError == !ok.
     internal static class HostDispatch
     {
         internal static int GraceMs = 2500;
         internal const int AuditArgsChars = 2000;
-        static long lastCallTicks;
+        static long lastCallTicks, lastScreenFrame = -1, lastErrorTicks;
         static volatile bool callsSinceRestore;
+        static volatile string lastScreen, lastErrorTool, lastErrorCode, lastErrorText;
         static int active;
+        // set by the host: whether an MCP session id still belongs to a live client (McpServer.SessionLive)
+        internal static Func<string, bool> SessionLive;
 
         internal static int Active { get { return Interlocked.CompareExchange(ref active, 0, 0); } }
         internal static DateTime LastCallUtc { get { long t = Interlocked.Read(ref lastCallTicks); return t == 0 ? DateTime.MinValue : new DateTime(t, DateTimeKind.Utc); } }
+        // a tool or command ran since the last restore, so a restore may have something to put back
+        internal static bool CallsSinceRestore { get { return callsSinceRestore; } }
+        // the "screen" value of the newest tool result that had one (observe: title, playing, loading ...) and its frame
+        internal static string LastScreen { get { return lastScreen; } }
+        internal static long LastScreenFrame { get { return Interlocked.Read(ref lastScreenFrame); } }
+
+        // {tool, code, message, ago_s} of the newest failed tool call, or null
+        internal static Json.Obj LastError()
+        {
+            string tool = lastErrorTool;
+            long t = Interlocked.Read(ref lastErrorTicks);
+            if (tool == null || t == 0) return null;
+            var o = new Json.Obj();
+            o["tool"] = tool; o["code"] = lastErrorCode ?? ""; o["message"] = lastErrorText ?? "";
+            o["ago_s"] = Math.Round((DateTime.UtcNow.Ticks - t) / (double)TimeSpan.TicksPerSecond, 1);
+            return o;
+        }
 
         // true once: no call for idleS seconds after at least one call since the last restore, and nothing running
-        internal static bool IdleRestoreDue(int idleS)
+        internal static bool IdleRestoreDue(int idleS) { string held; return IdleRestoreDue(idleS, out held); }
+
+        // heldBy = what the due restore waits for (a running call, a job with a live owner, a module of McpKeepAlive)
+        internal static bool IdleRestoreDue(int idleS, out string heldBy)
         {
-            if (idleS <= 0 || !callsSinceRestore || Active > 0) return false;
-            if (HostJobs.Running(McpLanes.Control) != null) return false;
+            heldBy = null;
+            if (idleS <= 0 || !callsSinceRestore) return false;
             if ((DateTime.UtcNow - LastCallUtc).TotalSeconds < idleS) return false;
+            if (Active > 0) { heldBy = "a tool call is running"; return false; }
+            var job = HostJobs.Blocking(McpLanes.Control, SessionLive);
+            if (job != null) { heldBy = "job " + job.Id + " (" + job.Tool + ")"; return false; }
+            heldBy = McpKeepAlive.Busy();
+            if (heldBy != null) return false;
             callsSinceRestore = false;
             return true;
         }
@@ -78,6 +107,7 @@ namespace InsideDev.McpExt
                 return ToolResult.Fail(McpErr.Internal, "could not start the call thread: " + e.Message);
             }
             int wait = info.budgetMs + GraceMs;
+            var gone = info.clientGone;
             lock (run.gate)
             {
                 var until = started.AddMilliseconds(wait);
@@ -86,6 +116,12 @@ namespace InsideDev.McpExt
                     int left = (int)(until - DateTime.UtcNow).TotalMilliseconds;
                     if (left <= 0) break;
                     Monitor.Wait(run.gate, Math.Min(left, 500));
+                    if (gone != null && !run.done && !info.Cancelled)
+                    {
+                        bool closed;
+                        try { closed = gone(); } catch (Exception) { closed = false; }
+                        if (closed) { gone = null; info.Cancel("the client closed the connection"); HostLog.Write(def.name + ": the client closed the connection, call cancelled"); }
+                    }
                 }
                 if (run.done) { run.answered = true; return run.result; }
                 run.answered = true;
@@ -138,6 +174,7 @@ namespace InsideDev.McpExt
                 }
                 if (r == null) r = ToolResult.Fail(McpErr.Internal, def.name + " returned nothing");
                 Normalize(r);
+                Remember(def.name, r);
                 try { HostJobs.EndOfCall(ctx.Info, r); } catch (Exception e) { HostLog.Write("EndOfCall " + def.name + ": " + e.Message); }
                 ctx.FlushProgress();
                 ctx.CutWire();
@@ -150,6 +187,24 @@ namespace InsideDev.McpExt
                 if (r != null && !def.readOnly) AuditLog.Write(ctx.Info, late ? "late_result" : "call", AuditDetail(argText, r, (DateTime.UtcNow - started).TotalMilliseconds));
                 lock (run.gate) { run.result = r; run.done = true; Monitor.PulseAll(run.gate); }
             }
+        }
+
+        // what GET /status reports without the main thread: the last "screen" a tool returned and the last failure
+        static void Remember(string tool, ToolResult r)
+        {
+            var s = r.structured;
+            if (s == null) return;
+            if (r.isError)
+            {
+                var e = s["error"] as Json.Obj;
+                lastErrorCode = e != null ? e.Str("code", McpErr.Internal) : McpErr.Internal;
+                lastErrorText = HostText.Cut(e != null ? e.Str("message", "") : "", 300);
+                lastErrorTool = tool;
+                Interlocked.Exchange(ref lastErrorTicks, DateTime.UtcNow.Ticks);
+                return;
+            }
+            var screen = s["screen"] as string;
+            if (screen != null) { lastScreen = screen; Interlocked.Exchange(ref lastScreenFrame, MainQueue.Frame); }
         }
 
         // structured gets ok first; isError follows ok

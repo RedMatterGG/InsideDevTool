@@ -103,7 +103,7 @@ namespace InsideDev.McpExt
         public Json.Obj structured;
         public bool isError;
 
-        // legacy text result (the 13 dev tools); the server wraps it as structured {ok, text}
+        // legacy text result; the server wraps it as structured {ok, text}
         public static ToolResult Text(string s, bool error = false) { var r = new ToolResult { isError = error }; r.AddText(s); return r; }
 
         // success: structured gets ok:true as its first key unless it already has ok
@@ -147,14 +147,27 @@ namespace InsideDev.McpExt
             var c = new Json.Obj(); c["type"] = "resource_link"; c["uri"] = uri; c["name"] = name ?? uri; if (mimeType != null) c["mimeType"] = mimeType; content.Add(c); return this;
         }
 
-        // the compact JSON copy of structured in the first text block is cut at this many chars
+        // the compact JSON copy of structured in the first text block is at most about this many chars
         internal const int TextCopyCap = 100000;
 
-        // CallToolResult {content, structuredContent, isError}. content = the compact JSON of structured (cut at TextCopyCap
-        // with ..."truncated"), then image / resource_link blocks, then text blocks whose text is not already a top-level
-        // value of structured. A legacy result without structured gets structured {ok: !isError, text: its text blocks}.
-        // isError is also true when structured.ok is false.
-        public Json.Obj ToJson()
+        // EditorState mcp.text_copy = short: the first text block of every result is a short summary instead of a second
+        // copy of structuredContent (for clients that read structuredContent). Set by the host.
+        public static volatile bool ShortTextCopy;
+
+        public bool HasImage
+        {
+            get { foreach (var c in content) if (c != null && c.Str("type") == "image") return true; return false; }
+        }
+
+        public Json.Obj ToJson() { return ToJson(false); }
+
+        // CallToolResult {content, structuredContent, isError}. content = the compact JSON of structured, then image /
+        // resource_link blocks, then text blocks whose text is not already a top-level value of structured. A copy over
+        // TextCopyCap chars stays valid JSON: long top-level strings are cut and truncated / note say so, and when that is
+        // not enough the copy is {ok, error, truncated, note, head}. shortCopy: the copy is only {ok, error, note}.
+        // A legacy result without structured gets structured {ok: !isError, text: its text blocks}. isError is also
+        // true when structured.ok is false.
+        public Json.Obj ToJson(bool shortCopy)
         {
             var s = structured;
             bool legacy = s == null;
@@ -166,8 +179,13 @@ namespace InsideDev.McpExt
                 s = new Json.Obj(); s["ok"] = !isError; s["text"] = sb.ToString();
             }
             bool err = isError || (s["ok"] is bool && !(bool)s["ok"]);
-            string json = JsonOut.Write(s);
-            if (json.Length > TextCopyCap) json = json.Substring(0, TextCopyCap) + "...\"truncated\"";
+            string json;
+            if (shortCopy) json = JsonOut.Write(Summary(s, err, "the result is in structuredContent"));
+            else
+            {
+                json = JsonOut.Write(s);
+                if (json.Length > TextCopyCap) json = Shortened(s, err, json);
+            }
             var blocks = new List<object>();
             var first = new Json.Obj(); first["type"] = "text"; first["text"] = json;
             blocks.Add(first);
@@ -189,6 +207,52 @@ namespace InsideDev.McpExt
         {
             foreach (var k in s.order) { var v = s[k] as string; if (v != null && v == text) return true; }
             return false;
+        }
+
+        static Json.Obj Summary(Json.Obj s, bool err, string note)
+        {
+            var o = new Json.Obj();
+            o["ok"] = !err;
+            if (s["error"] is Json.Obj) o["error"] = s["error"];
+            o["note"] = note;
+            return o;
+        }
+
+        static string CutText(string v, int max)
+        {
+            if (max < 0) max = 0;
+            if (v.Length <= max) return v;
+            if (max > 0 && char.IsHighSurrogate(v[max - 1])) max--;
+            return v.Substring(0, max);
+        }
+
+        // the text copy of a result whose JSON is over TextCopyCap chars: still valid JSON, and it says what is missing
+        static string Shortened(Json.Obj s, bool err, string full)
+        {
+            string note = "cut to fit the text block; structuredContent has the full result (" + full.Length.ToString(System.Globalization.CultureInfo.InvariantCulture) + " chars)";
+            int longStrings = 0;
+            foreach (var k in s.order) { var v = s[k] as string; if (v != null && v.Length > 2000) longStrings++; }
+            // each long string gets its share of the cap; escaping can make it longer, so a second try halves the share
+            for (int div = 1; longStrings > 0 && div <= 2; div++)
+            {
+                int each = (TextCopyCap - 4000) / (div * longStrings);
+                var o = new Json.Obj();
+                foreach (var k in s.order)
+                {
+                    if (!s.ContainsKey(k)) continue;
+                    var v = s[k] as string;
+                    o[k] = v != null && v.Length > each ? CutText(v, each) : s[k];
+                }
+                o["truncated"] = true;
+                o["note"] = note;
+                string cut = JsonOut.Write(o);
+                if (cut.Length <= TextCopyCap) return cut;
+            }
+            var sum = Summary(s, err, note);
+            sum["truncated"] = true;
+            sum.order.Remove("note"); sum.order.Add("note");
+            sum["head"] = CutText(full, TextCopyCap / 2 - 2000);
+            return JsonOut.Write(sum);
         }
     }
 
@@ -305,6 +369,9 @@ namespace InsideDev.McpExt
         public readonly DateTime startedUtc = DateTime.UtcNow;
         public int budgetMs = 55000;
         public Action<double, double, string> progress;
+        // set by the server for a tools/call over HTTP: true once the client closed the connection (asked on the
+        // thread that waits for the call); null = unknown
+        public Func<bool> clientGone;
         volatile bool cancelled;
         string cancelReason = "";
 

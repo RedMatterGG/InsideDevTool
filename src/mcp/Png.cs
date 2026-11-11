@@ -15,26 +15,41 @@ namespace InsideDev.McpExt
         public static byte[] DecodeRgb(byte[] png, out int w, out int h)
         {
             w = h = 0;
+            if (png == null || png.Length < 8) throw new FormatException("not a PNG");
             for (int i = 0; i < 8; i++) if (png[i] != Sig[i]) throw new FormatException("not a PNG");
-            int pos = 8, bpp = 0; var idat = new MemoryStream();
+            int pos = 8, bpp = 0, idats = 0, firstData = 0;
+            MemoryStream idat = null;
             while (pos + 8 <= png.Length)
             {
                 int len = (int)BE(png, pos); string type = System.Text.Encoding.ASCII.GetString(png, pos + 4, 4); int d = pos + 8;
+                if (len < 0 || len > png.Length - d - 4) throw new FormatException("bad PNG chunk length");
                 if (type == "IHDR")
                 {
+                    if (len < 13) throw new FormatException("bad IHDR");
                     w = (int)BE(png, d); h = (int)BE(png, d + 4);
                     int depth = png[d + 8], ct = png[d + 9], inter = png[d + 12];
                     if (depth != 8 || inter != 0 || (ct != 2 && ct != 6)) throw new FormatException("unsupported PNG (depth " + depth + ", colour type " + ct + ", interlace " + inter + ")");
+                    if (w <= 0 || h <= 0 || (long)w * h > 16384L * 16384L) throw new FormatException("unsupported PNG size " + w + "x" + h);
                     bpp = ct == 6 ? 4 : 3;
                 }
-                else if (type == "IDAT") idat.Write(png, d, len);
+                else if (type == "IDAT")
+                {
+                    // the usual file has one IDAT chunk: it is inflated in place; only a second one needs the copy
+                    if (idats == 0) firstData = d;
+                    else
+                    {
+                        if (idat == null) { idat = new MemoryStream(); idat.Write(png, firstData, (int)BE(png, firstData - 8)); }
+                        idat.Write(png, d, len);
+                    }
+                    idats++;
+                }
                 else if (type == "IEND") break;
                 pos = d + len + 4;
             }
             if (bpp == 0) throw new FormatException("no IHDR");
-            var z = idat.ToArray();
+            if (idats == 0) throw new FormatException("no image data");
             int stride = w * bpp;
-            var raw = Zlib.Inflate(z, 2, (stride + 1) * h);
+            var raw = idat != null ? Zlib.Inflate(idat.ToArray(), 2, (stride + 1) * h) : Zlib.Inflate(png, firstData + 2, (stride + 1) * h);
             if (raw.Length < (stride + 1) * h) throw new FormatException("truncated image data");
             var outp = new byte[w * h * 3];
             var prev = new byte[stride]; var cur = new byte[stride];

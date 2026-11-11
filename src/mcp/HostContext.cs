@@ -10,6 +10,7 @@ namespace InsideDev.McpExt
     // HostContext.cs (owner HOST, signatures frozen): CallContext implementation and the main-thread queue it uses.
     // MainQueue.Pump runs from McpExtension.Tick (DevRoot.Update, after FixedUpdate of the frame): it updates Frame, runs
     // queued main-thread items (budget about 4 ms per frame, at least one item), and evaluates WaitUntil checks.
+    // A pump with nothing queued and nobody waiting takes no lock and allocates nothing.
     // An item whose caller gave up (timeout or cancel) is removed and never runs later: no zombie side effects.
     // Unity-free: the frame number comes from MainQueue.FrameSource (Time.frameCount, set by McpExtension.Start), so the
     // queue, waits and jobs run in the offline tests (qa/mcp/HOST) with a fake pump thread.
@@ -242,7 +243,7 @@ namespace InsideDev.McpExt
         static readonly List<MainItem> items = new List<MainItem>();
         static readonly List<Waiter> waiters = new List<Waiter>();
         static long frame, lastPumpTicks;
-        static volatile int mainThread = -1;
+        static volatile int mainThread = -1, queued, waiting;
         internal static Func<long> FrameSource;
         internal static double BudgetMs = 4.0;
         internal static long Pumps;
@@ -262,16 +263,18 @@ namespace InsideDev.McpExt
             Interlocked.Exchange(ref frame, f);
             Interlocked.Exchange(ref lastPumpTicks, DateTime.UtcNow.Ticks);
             Interlocked.Increment(ref Pumps);
-            var sw = Stopwatch.StartNew();
+            if (queued == 0 && waiting == 0) return;
+            long t0 = Stopwatch.GetTimestamp();
             int ran = 0;
-            while (true)
+            while (queued > 0)
             {
                 MainItem it = null;
                 lock (gate)
                 {
-                    if (items.Count > 0 && (ran == 0 || sw.Elapsed.TotalMilliseconds < BudgetMs))
+                    if (items.Count > 0 && (ran == 0 || (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency < BudgetMs))
                     {
                         it = items[0]; items.RemoveAt(0); it.state = MainItem.Running;
+                        queued = items.Count;
                     }
                 }
                 if (it == null) break;
@@ -295,25 +298,33 @@ namespace InsideDev.McpExt
             lock (gate)
             {
                 for (int i = waiters.Count - 1; i >= 0; i--) if (waiters[i].done) waiters.RemoveAt(i);
+                waiting = waiters.Count;
                 Monitor.PulseAll(gate);
             }
         }
 
         // Time.frameCount of the last Pump (any thread)
         public static long Frame { get { return Interlocked.Read(ref frame); } }
+        // seconds since the last Pump (any thread); -1 before the first one
+        public static double StalledS
+        {
+            get { long t = Interlocked.Read(ref lastPumpTicks); return t == 0 ? -1 : Math.Max(0, (DateTime.UtcNow.Ticks - t) / (double)TimeSpan.TicksPerSecond); }
+        }
         // true when Pump ran within the last 2 s (the main thread is alive)
         public static bool Alive
         {
             get { long t = Interlocked.Read(ref lastPumpTicks); return t != 0 && DateTime.UtcNow.Ticks - t < 2 * TimeSpan.TicksPerSecond; }
         }
         public static int Pending { get { lock (gate) return items.Count; } }
+        // something is queued or somebody waits for a frame (read every frame, no lock)
+        internal static bool HasWork { get { return queued > 0 || waiting > 0; } }
 
         internal static bool OnMainThread { get { return mainThread == Thread.CurrentThread.ManagedThreadId; } }
 
         internal static MainItem Enqueue(Func<object> fn, bool post)
         {
             var it = new MainItem { fn = fn, post = post };
-            lock (gate) items.Add(it);
+            lock (gate) { items.Add(it); queued = items.Count; }
             return it;
         }
 
@@ -323,7 +334,7 @@ namespace InsideDev.McpExt
             if (a == null) return;
             if (OnMainThread) { try { a(); } catch (Exception e) { HostLog.Write("main-thread task " + label + " failed: " + e.Message); } return; }
             var it = new MainItem { fn = () => { a(); return null; }, post = true, label = label };
-            lock (gate) items.Add(it);
+            lock (gate) { items.Add(it); queued = items.Count; }
         }
 
         // true when the item was still pending and is now removed for good
@@ -333,6 +344,7 @@ namespace InsideDev.McpExt
             {
                 if (it.state != MainItem.Pending) return false;
                 items.Remove(it);
+                queued = items.Count;
                 it.state = MainItem.Dropped;
                 return true;
             }
@@ -346,7 +358,7 @@ namespace InsideDev.McpExt
         internal static Waiter AddWaiter(Func<bool> check, long next, int every)
         {
             var w = new Waiter { check = check, next = next, every = every };
-            lock (gate) waiters.Add(w);
+            lock (gate) { waiters.Add(w); waiting = waiters.Count; }
             return w;
         }
 
@@ -359,14 +371,14 @@ namespace InsideDev.McpExt
             }
         }
 
-        internal static void RemoveWaiter(Waiter w) { lock (gate) waiters.Remove(w); }
+        internal static void RemoveWaiter(Waiter w) { lock (gate) { waiters.Remove(w); waiting = waiters.Count; } }
 
         internal static int WaiterCount { get { lock (gate) return waiters.Count; } }
 
         // offline tests only: forget every queued item and waiter
         internal static void ResetForTests()
         {
-            lock (gate) { items.Clear(); waiters.Clear(); Monitor.PulseAll(gate); }
+            lock (gate) { items.Clear(); waiters.Clear(); queued = 0; waiting = 0; Monitor.PulseAll(gate); }
             mainThread = -1;
             Interlocked.Exchange(ref lastPumpTicks, 0);
         }
@@ -377,16 +389,20 @@ namespace InsideDev.McpExt
     {
         static readonly Queue<string> q = new Queue<string>();
         const int Max = 500;
+        static volatile int pending;
+
+        // lines waiting for Drain; read every frame, so it takes no lock
+        public static int Pending { get { return pending; } }
 
         public static void Write(string msg)
         {
-            lock (q) { q.Enqueue(msg ?? ""); while (q.Count > Max) q.Dequeue(); }
+            lock (q) { q.Enqueue(msg ?? ""); while (q.Count > Max) q.Dequeue(); pending = q.Count; }
         }
 
         public static List<string> Drain()
         {
             var l = new List<string>();
-            lock (q) while (q.Count > 0) l.Add(q.Dequeue());
+            lock (q) { while (q.Count > 0) l.Add(q.Dequeue()); pending = 0; }
             return l;
         }
     }

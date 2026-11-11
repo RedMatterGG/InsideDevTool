@@ -10,31 +10,38 @@ namespace InsideDev.McpExt
     // McpStdio.cs (owner SERVER): InsideDev.McpStdio.exe, MCP over stdio for clients that launch a local process. Relays
     // every message to the game's endpoint (docs/MCP_PLAY_DESIGN.md 4.6):
     //   InsideDev.McpStdio.exe [--profile play|dev|all] [--port 47811] [--url http://127.0.0.1:47811/mcp] [--token <t>]
-    // --profile picks /mcp (dev, default), /mcp/play or /mcp/all; the token also comes from INSIDEDEV_MCP_TOKEN.
-    // initialize: when the game is up, its capabilities, serverInfo (version) and instructions; when it is down, the
-    // proxy's own short instructions and a tool list with only inside_status. Requests with a progress token are relayed
-    // as they stream (each SSE event is one stdout line); notifications/cancelled is forwarded to the game; the game's
-    // list_changed notifications are relayed from its GET stream, and the proxy itself sends list_changed when the game
-    // comes up or goes away. The HTTP timeout (90 s) is above the game's tool budget (55 s). On stdin EOF the game
-    // session is closed (DELETE), which lets the game restore its state. inside_status, also while the game is up,
-    // returns the game's instructions: a client that initialized before the game started never got them otherwise.
+    // --profile picks /mcp (dev, default), /mcp/play or /mcp/all; the port also comes from INSIDE_MCP_PORT and the token
+    // from INSIDEDEV_MCP_TOKEN. initialize: when the game is up, its capabilities, serverInfo (version) and
+    // instructions; when it is down, the proxy's own short instructions and a tool list with only inside_status.
+    // Requests with a progress token are relayed as they stream (each SSE event is one stdout line);
+    // notifications/cancelled is forwarded to the game; the game's list_changed notifications are relayed from its GET
+    // stream, and the proxy itself sends list_changed when the game comes up or goes away (it watches from initialize
+    // on). The HTTP timeout (90 s) is above the game's tool budget (55 s). On stdin EOF the game session is closed
+    // (DELETE), which lets the game restore its state; a session the proxy replaces is closed the same way.
+    // inside_status is listed and answered by the proxy whether the game is up or not: it returns the game's
+    // instructions (a client that initialized before the game started never got them otherwise) and the game's
+    // GET /status block (main thread alive, frame, control job, tool counts). stdout carries JSON-RPC lines only.
     public static class StdioProxy
     {
         // the proxy build: <version>+stdio.<id> (McpBuild: id = the first 8 hex digits of the exe's SHA-256)
         static readonly string ProxyVersion = McpBuild.Version + "+stdio." + McpBuild.IdOf(typeof(McpBuild).Assembly);
-        const int CallTimeoutMs = 90000, ShortTimeoutMs = 5000, StreamReadTimeoutMs = 60000;
+        const int CallTimeoutMs = 90000, ShortTimeoutMs = 5000, StreamReadTimeoutMs = 60000, ForgetTimeoutMs = 1000;
+        // Post result when the game accepted the connection but did not answer in time (0 = no connection at all)
+        const int TimedOut = -1;
         static string url = "http://127.0.0.1:47811/mcp", profile = McpProfile.Dev, token = "";
         static string protocol = McpServer.Versions[0];
         static volatile string sid;
         static Json.Obj gameInit;
         static readonly object outLock = new object(), gameLock = new object();
-        static volatile bool reportedUp, listed, stopping;
+        static volatile bool reportedUp, listed, watching, stopping;
         static volatile int lastCode;
         static TextWriter stdout;
 
         public static int Main(string[] args)
         {
             int port = 47811;
+            int envPort;
+            if (int.TryParse((Environment.GetEnvironmentVariable("INSIDE_MCP_PORT") ?? "").Trim(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out envPort) && envPort >= 1 && envPort <= 65535) port = envPort;
             string fullUrl = null;
             for (int i = 0; i < args.Length; i++)
             {
@@ -42,7 +49,7 @@ namespace InsideDev.McpExt
                 switch (a)
                 {
                     case "--port":
-                        if (next == null || !int.TryParse(next, out port) || port < 1 || port > 65535) return Usage("--port needs a number 1-65535");
+                        if (next == null || !int.TryParse(next, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out port) || port < 1 || port > 65535) return Usage("--port needs a number 1-65535");
                         i++; break;
                     case "--url":
                         if (next == null) return Usage("--url needs a value");
@@ -77,17 +84,28 @@ namespace InsideDev.McpExt
                 var m = msg as Json.Obj;
                 if (m == null) { Send(Err(null, -32600, "batches are not supported over stdio")); continue; }
                 var mm = m;
-                new Thread(() => { try { var r = Handle(mm); if (r != null) Send(r); } catch (Exception e) { if (mm.ContainsKey("id")) Send(Err(mm["id"], -32603, e.Message)); } }) { IsBackground = true }.Start();
+                Interlocked.Increment(ref inFlight);
+                new Thread(() =>
+                {
+                    try { var r = Handle(mm); if (r != null) Send(r); }
+                    catch (Exception e) { if (mm.ContainsKey("id")) Send(Err(mm["id"], -32603, e.Message)); }
+                    finally { Interlocked.Decrement(ref inFlight); }
+                }) { IsBackground = true }.Start();
             }
+            // stdin ended: answer what is still running (a client may write all its requests and close stdin at once)
+            var drain = System.Diagnostics.Stopwatch.StartNew();
+            while (Interlocked.CompareExchange(ref inFlight, 0, 0) > 0 && drain.ElapsedMilliseconds < 95000) Thread.Sleep(20);
             stopping = true;
             CloseSession();
             return 0;
         }
 
+        static int inFlight;
+
         static int Usage(string error)
         {
             if (error != null) Console.Error.WriteLine("InsideDev.McpStdio: " + error);
-            Console.Error.WriteLine("usage: InsideDev.McpStdio.exe [--profile play|dev|all] [--port 47811] [--url <endpoint>] [--token <token>]   (token also from INSIDEDEV_MCP_TOKEN)");
+            Console.Error.WriteLine("usage: InsideDev.McpStdio.exe [--profile play|dev|all] [--port 47811] [--url <endpoint>] [--token <token>]   (port also from INSIDE_MCP_PORT, token also from INSIDEDEV_MCP_TOKEN)");
             return error != null ? 2 : 0;
         }
 
@@ -106,6 +124,7 @@ namespace InsideDev.McpExt
             get
             {
                 if (lastCode == 401) return "INSIDE refused the token: the game has EditorState mcp.token set; pass --token <token> or set INSIDEDEV_MCP_TOKEN.";
+                if (lastCode == TimedOut) return "INSIDE at " + url + " accepted the connection but did not answer in time (the game process is frozen, or the machine was asleep). Try again.";
                 return "INSIDE is not running at " + url + ", or InsideDev / InsideDev.Mcp.dll is not loaded. Start the game; the tool list updates when it is up.";
             }
         }
@@ -133,7 +152,7 @@ namespace InsideDev.McpExt
             if (relayed) return null;
             if (code == 200 && reply.Length > 0)
             {
-                if (method == "tools/list") { listed = true; reportedUp = true; }
+                if (method == "tools/list") { listed = true; reportedUp = true; return WithStatusTool(reply); }
                 return OneLine(reply);
             }
             if (code == 202) return null;
@@ -160,23 +179,93 @@ namespace InsideDev.McpExt
             return new ToolDef
             {
                 name = "inside_status", title = "INSIDE status", owner = "SERVER",
-                description = "Whether INSIDE with InsideDev is running and reachable, and the game's instructions once it is up (read them if the session started before the game). While the game is down this is the only tool; the full list appears when it is up.",
+                description = "Whether INSIDE with InsideDev is running and reachable, the game's instructions once it is up (read them if the session started before the game) and its health: main thread alive, frame, running job, tool counts, whether InsideDev.Play is loaded. Answered by the launcher, so it works while the game is down or busy; while the game is down it is the only tool.",
                 inputSchema = Schema.Obj().Build()
             }.ReadOnly();
+        }
+
+        // the game's tools/list reply with inside_status added (the game does not define it; the launcher answers it)
+        static string WithStatusTool(string reply)
+        {
+            try
+            {
+                var o = Json.Parse(reply) as Json.Obj;
+                var res = o != null ? o["result"] as Json.Obj : null;
+                var tools = res != null ? res["tools"] as List<object> : null;
+                if (tools == null) return OneLine(reply);
+                foreach (var t in tools) { var x = t as Json.Obj; if (x != null && x.Str("name") == "inside_status") return OneLine(reply); }
+                tools.Add(StatusTool().ToJson());
+                return JsonOut.Write(o);
+            }
+            catch (Exception) { return OneLine(reply); }
+        }
+
+        // gameLock held: true when the game answers on a session. A ping that only timed out keeps the session (the
+        // game may be frozen for a moment); any other failure forgets it, with a DELETE when the game can be reached,
+        // and tries a new one.
+        static bool GameUp()
+        {
+            string s0 = sid;
+            if (s0 == null) return OpenSession() == 200;
+            string r, ns; bool relayed;
+            int code = Post("{\"jsonrpc\":\"2.0\",\"id\":\"proxy-ping\",\"method\":\"ping\"}", s0, ShortTimeoutMs, null, out r, out ns, out relayed);
+            if (code == 200) return true;
+            lastCode = code;
+            if (code == TimedOut) return false;
+            Forget(s0, code != 0 && code != 404);
+            return code != 0 && OpenSession() == 200;
+        }
+
+        // gameLock held: drop the game session id; tell = the game is reachable, so close the session there too (an
+        // abandoned session would count as a client for the game's restore-after-close)
+        static void Forget(string s0, bool tell)
+        {
+            if (s0 == null) return;
+            if (sid == s0) sid = null;
+            if (tell) CloseSession(s0, ForgetTimeoutMs);
+        }
+
+        // GET /status of the game (answered without its main thread); null when it cannot be read
+        static Json.Obj GameStatus()
+        {
+            try
+            {
+                var u = new Uri(url);
+                var req = (HttpWebRequest)WebRequest.Create(u.Scheme + "://" + u.Authority + ServerPlain.Status);
+                req.Method = "GET"; req.Timeout = 2000; req.ReadWriteTimeout = 2000; req.Proxy = null;
+                if (token.Length > 0) req.Headers["Authorization"] = "Bearer " + token;
+                using (var resp = (HttpWebResponse)req.GetResponse())
+                using (var rd = new StreamReader(resp.GetResponseStream(), Encoding.UTF8)) return Json.Parse(rd.ReadToEnd()) as Json.Obj;
+            }
+            catch (Exception) { return null; }
         }
 
         static Json.Obj Status()
         {
             bool up;
-            lock (gameLock) { up = sid != null ? Ping(sid) : OpenSession() == 200; if (!up) sid = null; }
+            lock (gameLock) up = GameUp();
             var s = new Json.Obj();
             s["running"] = up; s["endpoint"] = url; s["profile"] = profile;
             var si = gameInit != null ? gameInit["serverInfo"] as Json.Obj : null;
             if (up && si != null) s["version"] = si.Str("version", "");
             s["proxy_version"] = ProxyVersion;
+            var gs = lastCode != 0 || up ? GameStatus() : null;
+            string busy = "";
+            if (gs != null)
+            {
+                var mt = gs["main_thread"] as Json.Obj;
+                if (mt != null && mt["alive"] is bool)
+                {
+                    s["main_thread_alive"] = (bool)mt["alive"];
+                    if (!(bool)mt["alive"]) busy = " The game's main thread is not running frames (loading, paused, or the window is in the background without run-in-background): tools that need the game will answer not_ready.";
+                }
+                if (gs["play_loaded"] is bool) s["play_loaded"] = (bool)gs["play_loaded"];
+                if (gs["tools"] is Json.Obj) s["tools"] = gs["tools"];
+                s["game"] = gs;
+            }
             string ins = up && gameInit != null ? gameInit.Str("instructions", "") : "";
             if (ins.Length > 0) s["instructions"] = ins;
-            s["text"] = up ? "INSIDE is running (InsideDev " + (si != null ? si.Str("version", "?") : "?") + ", " + url + ")." + (ins.Length > 0 ? " Read instructions: they say how to use the tools." : "") : DownText;
+            s["text"] = up ? "INSIDE is running (InsideDev " + (si != null ? si.Str("version", "?") : "?") + ", " + url + ")." + busy + (ins.Length > 0 ? " Read instructions: they say how to use the tools." : "") : DownText;
             return ToolResult.Ok(s).ToJson();
         }
 
@@ -185,8 +274,9 @@ namespace InsideDev.McpExt
             string want = p.Str("protocolVersion", McpServer.Versions[0]);
             protocol = Array.IndexOf(McpServer.Versions, want) >= 0 ? want : McpServer.Versions[0];
             Json.Obj game = null;
-            lock (gameLock) { sid = null; if (OpenSession() == 200) game = gameInit; }
+            lock (gameLock) { Forget(sid, true); if (OpenSession() == 200) game = gameInit; }
             reportedUp = game != null;
+            watching = true;
             var caps = new Json.Obj();
             var gc = game != null ? game["capabilities"] as Json.Obj : null;
             if (gc != null) foreach (var k in gc.order) if (gc.ContainsKey(k)) caps[k] = gc[k];
@@ -234,9 +324,10 @@ namespace InsideDev.McpExt
                 }
                 code = Post(body, s0, CallTimeoutMs, id, out reply, out ns, out relayed);
             }
+            // no connection: the game is gone and its sessions with it. A timeout keeps the session: the game is there.
             if (code == 0) lock (gameLock) if (sid == s0) sid = null;
             lastCode = code;
-            return code;
+            return code == TimedOut ? 0 : code;
         }
 
         static void ForwardNotification(Json.Obj m)
@@ -261,12 +352,6 @@ namespace InsideDev.McpExt
             string d, ns;
             Post("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}", sid, ShortTimeoutMs, null, out d, out ns, out relayed);
             return 200;
-        }
-
-        static bool Ping(string session)
-        {
-            string r, ns; bool relayed;
-            return Post("{\"jsonrpc\":\"2.0\",\"id\":\"proxy-ping\",\"method\":\"ping\"}", session, ShortTimeoutMs, null, out r, out ns, out relayed) == 200;
         }
 
         static HttpWebRequest Request(string method, string session, int timeoutMs)
@@ -299,9 +384,12 @@ namespace InsideDev.McpExt
                     {
                         if (ct.IndexOf("text/event-stream", StringComparison.OrdinalIgnoreCase) >= 0)
                         {
+                            // from here on the request is answered on stdout by this method, whatever the stream does
                             relayed = expectId != null;
-                            bool answered = Relay(st, expectId, ref reply);
-                            if (expectId != null && !answered) Send(Err(expectId, -32000, "the game closed the stream before it answered (game quit or crashed?)"));
+                            bool answered = false;
+                            try { answered = Relay(st, expectId, ref reply); }
+                            catch (Exception) { }
+                            if (expectId != null && !answered) Send(Err(expectId, -32000, "the game stopped answering (the stream timed out or closed: game quit, crashed or frozen?)"));
                         }
                         else using (var rd = new StreamReader(st, Encoding.UTF8)) reply = rd.ReadToEnd();
                     }
@@ -311,7 +399,7 @@ namespace InsideDev.McpExt
             catch (WebException e)
             {
                 var hr = e.Response as HttpWebResponse;
-                if (hr == null) { reply = e.Message; return 0; }
+                if (hr == null) { reply = e.Message; return e.Status == WebExceptionStatus.Timeout ? TimedOut : 0; }
                 using (hr)
                 {
                     int code = (int)hr.StatusCode;
@@ -342,13 +430,15 @@ namespace InsideDev.McpExt
             return answered;
         }
 
-        static void CloseSession()
+        static void CloseSession() { CloseSession(sid, 2000); }
+
+        // best effort DELETE of a game session
+        static void CloseSession(string s0, int timeoutMs)
         {
-            string s0 = sid;
             if (s0 == null) return;
             try
             {
-                var req = Request("DELETE", s0, 2000);
+                var req = Request("DELETE", s0, timeoutMs);
                 using (var resp = (HttpWebResponse)req.GetResponse()) { }
             }
             catch { }
@@ -361,15 +451,15 @@ namespace InsideDev.McpExt
             Send(Note("notifications/prompts/list_changed"));
         }
 
-        // tell the client when the game comes up or goes away (after it has seen a tool list)
+        // tell the client when the game comes up or goes away (from its initialize or first tool list on)
         static void Watch()
         {
             while (!stopping)
             {
                 Thread.Sleep(3000);
-                if (!listed) continue;
+                if (!listed && !watching) continue;
                 bool up;
-                lock (gameLock) { up = sid != null ? Ping(sid) : OpenSession() == 200; if (!up) sid = null; }
+                lock (gameLock) up = GameUp();
                 if (up != reportedUp) { reportedUp = up; SendListChanged(); }
             }
         }

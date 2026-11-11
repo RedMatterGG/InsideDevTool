@@ -6,15 +6,17 @@ namespace InsideDev.McpExt
 {
     // HostText.cs (owner HOST): Unity-free helpers of the dev tools and the host policy. Output caps and paging of
     // legacy text, error classification of bridge replies ("not found", "usage", "busy: mcam ...", "ERROR in ..."),
-    // refusals of the command tool (OS input, server stop, and, only with EditorState play.save_guard on, game loads that
-    // skip the save backup and confirm: load, spawn, reload, respawn, cspawn go / respawn), the secret / achievement type
-    // names the dev tools refuse to drive, strict argument readers (a string never becomes 0) and the cached EditorState
-    // settings the worker threads read (mcp.tools allowlist, mcp.token, mcp.idle_restore_s, mcp.restore_on_close_s,
-    // play.save_guard).
+    // refusals of the command tool (OS input, server stop, the server's own access settings, and, only with EditorState
+    // play.save_guard on, game loads that skip the save backup and confirm: load, spawn, reload, respawn, cspawn go /
+    // respawn), the secret / achievement type names the dev tools refuse to drive, strict argument readers (a string
+    // never becomes 0) and the cached EditorState settings the worker threads read (mcp.tools allowlist, mcp.token,
+    // mcp.idle_restore_s, mcp.restore_on_close_s, play.save_guard).
     internal static class HostText
     {
         static readonly CultureInfo IC = CultureInfo.InvariantCulture;
         internal const int DefaultCap = 20000;
+        // command {wait}: texts in the reply of a status command that mean the long work has ended
+        internal const string DefaultUntil = "done|failed|idle|not running|stopped|finished|closed|error";
 
         internal sealed class Page
         {
@@ -98,7 +100,7 @@ namespace InsideDev.McpExt
                 case McpErr.BadArgs: return "command 'help' lists the bridge commands and their arguments";
                 case McpErr.Busy: return "a MultiCam capture or another job holds the game; wait for it (jobs) or stop it";
                 case McpErr.NotReady: return "no playable character now (title, loading or dead); try again after the load";
-                case McpErr.Refused: return "not available through MCP";
+                case McpErr.Refused: return "the game refused it: see the text (it names the reason, or what to use instead)";
                 case McpErr.NotBuilt: return "this feature is not in the loaded InsideDev build";
                 case McpErr.GameError: return "see the text and the log tool for details";
             }
@@ -118,10 +120,10 @@ namespace InsideDev.McpExt
 
         static readonly string[][] Starts =
         {
-            new[] { "not found", McpErr.NotFound }, new[] { "usage:", McpErr.BadArgs }, new[] { "usage ", McpErr.BadArgs },
+            new[] { "not found", McpErr.NotFound }, new[] { "no match", McpErr.NotFound }, new[] { "usage:", McpErr.BadArgs }, new[] { "usage ", McpErr.BadArgs },
             new[] { "unknown ", McpErr.BadArgs }, new[] { "unknown:", McpErr.BadArgs }, new[] { "busy:", McpErr.Busy }, new[] { "busy ", McpErr.Busy },
             new[] { "no fsm", McpErr.NotFound }, new[] { "refused", McpErr.Refused }, new[] { "failed:", McpErr.GameError }, new[] { "failed to ", McpErr.GameError },
-            new[] { "error:", McpErr.GameError }, new[] { "error in ", McpErr.GameError }, new[] { "error -", McpErr.GameError },
+            new[] { "error:", McpErr.GameError }, new[] { "error in ", McpErr.GameError }, new[] { "error -", McpErr.GameError }, new[] { "error ", McpErr.GameError },
             new[] { "cannot ", McpErr.GameError }, new[] { "can't ", McpErr.GameError }, new[] { "could not ", McpErr.GameError }, new[] { "couldn't ", McpErr.GameError },
             new[] { "no active ", McpErr.NotReady }, new[] { "not built", McpErr.NotBuilt }, new[] { "object scan not finished", McpErr.NotReady },
         };
@@ -130,7 +132,7 @@ namespace InsideDev.McpExt
         {
             new[] { "component not found", McpErr.NotFound }, new[] { "field/property not found", McpErr.NotFound },
             new[] { "no parameterless method", McpErr.NotFound }, new[] { "no active character", McpErr.NotReady },
-            new[] { " failed:", McpErr.GameError }, new[] { "not built", McpErr.NotBuilt },
+            new[] { " failed:", McpErr.GameError }, new[] { "not built", McpErr.NotBuilt }, new[] { "not ready", McpErr.NotReady },
         };
 
         // error code of a bridge reply, judged on its first line only (dumps further down may contain any text); null = ok
@@ -142,30 +144,19 @@ namespace InsideDev.McpExt
             if (first.IndexOf("ERROR in ", StringComparison.Ordinal) >= 0) return McpErr.GameError;
             string low = first.ToLowerInvariant();
             if (low == "not found") return McpErr.NotFound;
+            if (low == "busy") return McpErr.Busy;
+            if (low == "unknown") return McpErr.BadArgs;
+            if (low == "error" || low == "failed") return McpErr.GameError;
             foreach (var s in Starts) if (low.StartsWith(s[0], StringComparison.Ordinal)) return s[1];
             foreach (var s in Contains) if (low.IndexOf(s[0], StringComparison.Ordinal) >= 0) return s[1];
             if (low.EndsWith(" failed", StringComparison.Ordinal)) return McpErr.GameError;
             return null;
         }
 
-        // reason text when the command tool must not run line, else null
+        // reason text when the command tool must not run line, else null: RemotePolicy.Refusal, the one list in the core
         internal static string Refusal(string line)
         {
-            if (line == null) return "empty command";
-            if (line.IndexOf('\n') >= 0 || line.IndexOf('\r') >= 0) return "one command per call (the line contains a line break)";
-            var a = Words(line);
-            if (a.Count == 0) return "empty command";
-            string c = a[0].ToLowerInvariant();
-            string s1 = a.Count > 1 ? a[1].ToLowerInvariant() : "";
-            if (c == "keyhold" || c == "focustest") return c + " sends real OS keyboard input; use the act tool (input through AgentCore, no window focus needed)";
-            if (c == "remote" && s1 == "off") return "remote off cannot be undone without a game restart";
-            if (c == "mcp" && (s1 == "off" || s1 == "port")) return "mcp " + s1 + " would stop this MCP server from inside a call; use the in-game console";
-            if (!HostSettings.SaveGuard) return null;
-            if (c == "load" || c == "spawn" || c == "reload" || c == "respawn")
-                return c + " loads through the game without the save backup or confirm (a chapter load writes INSIDE.sav and unlocks chapters forever); use level {op:\"load_checkpoint\" | \"reload\"} or checkpoint {op:\"reload\"}";
-            if (c == "cspawn" && (s1 == "go" || s1 == "respawn"))
-                return "cspawn " + s1 + " loads a savepoint through the game without the save backup or confirm; use level {op:\"load_checkpoint\"}, then body {op:\"teleport\"}";
-            return null;
+            return RemotePolicy.Refusal(line, true, HostSettings.SaveGuard);
         }
 
         // game classes whose code calls User.Achievement.Acquire (a Steam call) or ResetProgression (clears every orb
@@ -347,7 +338,7 @@ namespace InsideDev.McpExt
     // EditorState values cached on the main thread (EditorState is not thread-safe), read by worker threads
     internal static class HostSettings
     {
-        static volatile string tools = "", token = "";
+        static volatile string tools = "", token = "", hosts = "", textCopy = "full";
         static volatile int idleRestoreS = 600, restoreOnCloseS = 60;
         static volatile bool saveGuard;
         static string parsedFrom;
@@ -356,6 +347,10 @@ namespace InsideDev.McpExt
 
         internal static string Tools { get { return tools; } set { tools = value ?? ""; } }
         internal static string Token { get { return token; } set { token = value ?? ""; } }
+        // mcp.hosts: more names for the Host header check, as written in the config
+        internal static string Hosts { get { return hosts; } set { hosts = value ?? ""; } }
+        // mcp.text_copy: full (default) or short
+        internal static string TextCopy { get { return textCopy; } set { textCopy = value == "short" ? "short" : "full"; } }
         internal static int IdleRestoreS { get { return idleRestoreS; } set { idleRestoreS = value; } }
         // mcp.restore_on_close_s: seconds after the last session's DELETE before the game is restored (0 = never on
         // DELETE; the idle restore still applies)

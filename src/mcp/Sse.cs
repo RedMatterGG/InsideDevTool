@@ -137,7 +137,8 @@ namespace InsideDev.McpExt
                 {
                     if (eof) break;
                     int k;
-                    try { k = s.Read(buf, 0, buf.Length); } catch (IOException) { k = 0; } catch (ObjectDisposedException) { k = 0; }
+                    // a read timeout on an HTTP response stream is a WebException: any failed read ends the stream
+                    try { k = s.Read(buf, 0, buf.Length); } catch (Exception) { k = 0; }
                     if (k <= 0) { eof = true; break; }
                     pos = 0; len = k;
                 }

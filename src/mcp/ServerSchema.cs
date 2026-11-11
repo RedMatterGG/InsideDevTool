@@ -129,7 +129,7 @@ namespace InsideDev.McpExt
                 .Str("message", "What went wrong.").Str("hint", "How to fix it.").BuildNested();
         }
 
-        // legacy flat builder used by the 13 dev tools: name, type, description, required(bool) ...
+        // legacy flat builder of the first dev tools: name, type, description, required(bool) ...
         public static Json.Obj Object(params object[] props)
         {
             var o = new Json.Obj(); o["type"] = "object";
