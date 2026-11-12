@@ -5,8 +5,6 @@ InsideDev is an in-game editor and explorer for Playdead's INSIDE (Unity 5.0.4f1
 > Unofficial fan-made tool, not affiliated with or endorsed by Playdead. INSIDE is a trademark of Playdead.
 > This repository contains no game files or game code; you need your own copy of the game.
 
-<a href="docs/screenshots/fsm-graph.jpg"><img width="100%" src="docs/screenshots/fsm-graph.jpg" alt="FSM Graph: the visual PlayMaker editor inside the running game"></a>
-
 **Download:** the [latest release](https://github.com/RedMatterGG/InsideDevTool/releases/latest) holds everything in one zip. What changed in each version is in the [release notes](https://github.com/RedMatterGG/InsideDevTool/releases).
 
 ## Contents
@@ -41,20 +39,20 @@ Everything beyond the editor itself is optional: copy only the files you want. N
 
 <table>
 <tr>
+<td width="50%" valign="top"><a href="docs/screenshots/fsm-graph.jpg"><img width="100%" src="docs/screenshots/fsm-graph.jpg" alt="FSM Graph: visual PlayMaker editor"></a><br><b>FSM Graph: visual PlayMaker editor</b></td>
 <td width="50%" valign="top"><a href="docs/screenshots/explorer.jpg"><img width="100%" src="docs/screenshots/explorer.jpg" alt="Explorer + Inspector"></a><br><b>Explorer + Inspector</b></td>
+</tr>
+<tr>
 <td width="50%" valign="top"><a href="docs/screenshots/fsmfind.jpg"><img width="100%" src="docs/screenshots/fsmfind.jpg" alt="FSM Find + object Graph"></a><br><b>FSM Find + object Graph</b></td>
-</tr>
-<tr>
 <td width="50%" valign="top"><a href="docs/screenshots/audio-logic.jpg"><img width="100%" src="docs/screenshots/audio-logic.jpg" alt="Audio DB + code Logic"></a><br><b>Audio DB + code Logic</b></td>
+</tr>
+<tr>
 <td width="50%" valign="top"><a href="docs/screenshots/overlays.jpg"><img width="100%" src="docs/screenshots/overlays.jpg" alt="World overlays"></a><br><b>World overlays</b></td>
-</tr>
-<tr>
 <td width="50%" valign="top"><a href="docs/screenshots/spawns-mods.jpg"><img width="100%" src="docs/screenshots/spawns-mods.jpg" alt="Spawn points + Mods"></a><br><b>Spawn points + Mods</b></td>
-<td width="50%" valign="top"><a href="docs/screenshots/cheats-memory.jpg"><img width="100%" src="docs/screenshots/cheats-memory.jpg" alt="Cheats + Cheat Engine memory"></a><br><b>Cheats + Cheat Engine memory</b></td>
 </tr>
 <tr>
+<td width="50%" valign="top"><a href="docs/screenshots/cheats-memory.jpg"><img width="100%" src="docs/screenshots/cheats-memory.jpg" alt="Cheats + Cheat Engine memory"></a><br><b>Cheats + Cheat Engine memory</b></td>
 <td width="50%" valign="top"><a href="docs/screenshots/settings.jpg"><img width="100%" src="docs/screenshots/settings.jpg" alt="Settings (post effects, game code, extensions)"></a><br><b>Settings (post effects, game code, extensions)</b></td>
-<td width="50%" valign="top"><a href="docs/screenshots/mcp-observe.jpg"><img width="100%" src="docs/screenshots/mcp-observe.jpg" alt="An AI assistant reading the scene through MCP"></a><br><b>An AI assistant reading the scene through MCP</b></td>
 </tr>
 </table>
 
@@ -230,6 +228,8 @@ Ready-made files for Claude Code, Claude Desktop, Cursor, VS Code, Codex and Gem
 ## MCP character control
 
 `InsideDev.Play.dll` lets an AI assistant play INSIDE through MCP. It reads the world as JSON (the boy or the huddle, nearby objects with ids, kinds and actions, hazards, the checkpoint, a slice of the level geometry), presses the game's own controls for an exact number of logic steps, walks to a point, uses objects, waits for conditions, respawns at checkpoints, goes through menus, reads playbooks, and records and replays input tracks. It needs only the MCP server. Input goes into the game's input system, not the Windows keyboard, so the game window does not need focus.
+
+<a href="docs/screenshots/mcp-observe.jpg"><img width="100%" src="docs/screenshots/mcp-observe.jpg" alt="An AI assistant reading the scene through MCP"></a>
 
 - **Install:** `bin\InsideDev.Mcp.dll` and `bin\InsideDev.Play.dll` to `<game>\_mod\` (or copy them while the game runs and type `ext load`). Connect the client to `http://127.0.0.1:47811/mcp/play` (stdio: `--profile play`).
 - **Play tools (15):** `observe`, `act`, `move_to`, `interact`, `wait_until`, `time`, `checkpoint`, `menu`, `screenshot`, `guide`, `notes`, `restore`, `input_track`, `geometry`, `film`.
