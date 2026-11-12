@@ -5,9 +5,9 @@ Example configurations for connecting MCP clients to the InsideDev MCP server in
 
 | Endpoint | Tools |
 |---|---|
-| `http://127.0.0.1:47811/mcp/play` | play profile, 14 tools: an AI that plays |
-| `http://127.0.0.1:47811/mcp/dev` (also `/mcp`) | dev profile, 33 tools: inspecting and editing the world |
-| `http://127.0.0.1:47811/mcp/all` | all 40 tools (the tool cap of Cursor) |
+| `http://127.0.0.1:47811/mcp/play` | play profile, 15 tools: an AI that plays |
+| `http://127.0.0.1:47811/mcp/dev` (also `/mcp`) | dev profile, 34 tools: inspecting and editing the world |
+| `http://127.0.0.1:47811/mcp/all` | all 41 tools (one more than the 40-tool cap of Cursor: use play or dev there) |
 
 stdio, for clients that start a local program:
 

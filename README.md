@@ -141,9 +141,13 @@ A docked workspace (left, right and bottom docks, resizable; ▸ moves a panel t
 | Alt+Left / Alt+Right, mouse buttons 4 / 5 | selection history |
 | Home (with Play) | flag a moment for the AI assistant (`play.notes_key` remaps it, `none` switches it off) |
 
-The game keys (F7, F8, `[ ] \`, zoom, P and the middle-click teleport) also work with the panel closed; none of them act while a text field has the focus. `hotkeys.game=0` (or the toggle in the Cheats tab) keeps F7, F8, `[ ] \` and the teleport for the open editor only. The overlay choices of F2, F3, F4, Shift+F4, F6 and F10 are saved.
+The game keys (F7, F8, `[ ] \`, zoom, P and the middle-click teleport) also work with the panel closed; none of them act while a text field has the focus. `hotkeys.game=0` (or the toggle in the Cheats tab) keeps F7, F8, `[ ] \` and the teleport for the open editor only. Insert and the zoom keys follow `cam.hotkeys` (`always`, `panel` or `off`; default `always`). The overlay choices of F2, F3, F4, Shift+F4, F6 and F10 are saved.
 
-<a href="docs/screenshots/triggers-f2.jpg"><img width="100%" src="docs/screenshots/triggers-f2.jpg" alt="F2 trigger overlay"></a>
+<table>
+<tr>
+<td valign="top"><a href="docs/screenshots/triggers-f2.jpg"><img width="100%" src="docs/screenshots/triggers-f2.jpg" alt="F2 trigger overlay: trigger and collider boxes by class"></a><br><b>F2 trigger overlay: trigger and collider boxes by class</b></td>
+</tr>
+</table>
 
 ### Console and settings
 
@@ -156,13 +160,13 @@ Every command works the same in the in-game console, through the [file bridge](#
 - `perf` splits InsideDev's time per subsystem and counts garbage collections; `perf hide` / `perf show` switch renderers of a part of the scene off and on to measure what they cost.
 - `quit` closes the game the way its own exit does.
 
-Protected settings (`mcp.*`, `play.cheats`, `play.save_guard`, `play.guide_dir`, `ffmpeg.path`, any key with `token` or `password`) are refused through MCP and `POST /cmd`: change them in the in-game console, through the file bridge, or in `editor.cfg` with the game closed. Token values are never printed.
+Protected settings (`mcp.*`, `play.cheats`, `play.save_guard`, `play.guide_dir`, `ffmpeg.path`, any key with `token` or `password`) are refused through MCP and `POST /cmd`: change them in the in-game console, through the file bridge, or in `editor.cfg` with the game closed. `cfg` never prints a token value; `mcp token new` and `mcp token show` in the console do.
 
 ### Mods
 
 A mod is a JSON file in `<game>\_mod\mods\<name>.json`: selectors and values, never game assets. Make one from your edits (`mod record <name> [description]`, or Record as mod in the History panel), then enable, disable, dry-run or validate it in the Mods panel or with `mod list | show | enable | disable | dry | validate | delete <name>`. A mod file with a JSON error is left untouched, and the error names the line and column.
 
-**A mod only works in its own level.** Its operations are grouped by level, looked up once when that level has loaded (after `mods.settle` seconds of quiet streaming), only inside that level, retried for late content, and left alone until the next load; a respawn applies them again. Mods of levels that are not loaded cost nothing. `mod list` shows each mod's levels and cost.
+**A mod only works in its own level.** Its operations are grouped by level, looked up once when that level has loaded (after `mods.settle` seconds of quiet streaming), only inside that level; operations whose objects are not there yet are retried (after 0.5 to 8 s, then every 5 to 30 s while the level stays loaded). A respawn applies them again. Mods of levels that are not loaded cost nothing. `mod list` shows each mod's levels and cost.
 
 Example mods in `mods\`, all shipped disabled (enable them in the Mods panel or with `mod enable <name>`):
 
@@ -184,11 +188,13 @@ The game only has the levels it has streamed in. The atlas (`data\atlas\*.tsv`, 
 <table>
 <tr>
 <td width="50%" valign="top"><a href="docs/screenshots/atlas-hidden.jpg"><img width="100%" src="docs/screenshots/atlas-hidden.jpg" alt="Hidden: all levels from the atlas"></a><br><b>Hidden: all levels from the atlas</b></td>
-<td width="50%" valign="top"><a href="docs/screenshots/atlas-inspector.jpg"><img width="100%" src="docs/screenshots/atlas-inspector.jpg" alt="Inspector ATLAS section"></a><br><b>Inspector ATLAS section</b></td>
+<td width="50%" valign="top"><a href="docs/screenshots/atlas-spawns.jpg"><img width="100%" src="docs/screenshots/atlas-spawns.jpg" alt="Spawn points of areas not discovered yet"></a><br><b>Spawn points of areas not discovered yet</b></td>
 </tr>
 <tr>
-<td width="50%" valign="top"><a href="docs/screenshots/atlas-fsm.jpg"><img width="100%" src="docs/screenshots/atlas-fsm.jpg" alt="FSM Graph with atlas: unreachable states in grey"></a><br><b>FSM Graph with atlas: unreachable states in grey</b></td>
-<td width="50%" valign="top"><a href="docs/screenshots/atlas-spawns.jpg"><img width="100%" src="docs/screenshots/atlas-spawns.jpg" alt="Spawn points of areas not discovered yet"></a><br><b>Spawn points of areas not discovered yet</b></td>
+<td colspan="2" valign="top"><a href="docs/screenshots/atlas-inspector.jpg"><img width="100%" src="docs/screenshots/atlas-inspector.jpg" alt="Inspector ATLAS section"></a><br><b>Inspector ATLAS section</b></td>
+</tr>
+<tr>
+<td colspan="2" valign="top"><a href="docs/screenshots/atlas-fsm.jpg"><img width="100%" src="docs/screenshots/atlas-fsm.jpg" alt="FSM Graph with atlas: unreachable states in grey"></a><br><b>FSM Graph with atlas: unreachable states in grey</b></td>
 </tr>
 </table>
 
@@ -196,7 +202,7 @@ It holds names, paths, positions and statuses only (no meshes, textures, audio o
 
 ### Cheat Engine
 
-Turn on Settings > Cheat Engine for the Inspector's MEMORY section; "what is at 0x…" resolves an address to an object and field, or a code address to a method. Load `tools\cheatengine\InsideDev.CT` (or put `InsideDev.lua` in CE's autorun): it follows the editor's selection and adds right-click "InsideDev: what is this?" and "which method?". Its menu item "InsideDev: link status" says whether the editor and the table are linked.
+Turn on Settings > Cheat Engine for the Inspector's MEMORY section; "what is at 0x…" resolves an address to an object and field, or a code address to a method. Load `tools\cheatengine\InsideDev.CT` (or put `InsideDev.lua` in CE's autorun): it follows the editor's selection and adds right-click "InsideDev: what is this?" and "which method?". The autorun script also adds "InsideDev: link status", which says whether the editor and Cheat Engine are linked.
 
 ## AI assistants (MCP)
 
@@ -207,7 +213,7 @@ Turn on Settings > Cheat Engine for the Inspector's MEMORY section; "what is at 
 - **Dev tools:** `game_state`, `screenshot`, `show_panel` (open a panel, move it to a dock, resize the dock), `find_objects`, `inspect`, `select`, `set_active`, `fsm_graph`, `fsm_find`, `fsm` (send event, force state, variables), `signal`, `log`, `jobs`, and `command` (any console command; `commands:[...]` runs several, `wait:"<status command>"` waits for a result). Edits are recorded in History. A plain object name is matched loosely (exact name, else text inside the name, the one nearest the boy); `set_active`, `fsm` and `signal` report `matches` and `candidates` and refuse with `strict:true`.
 - **Screenshots:** preview (inline image; `format:"jpeg"` makes it several times smaller), `marked` (with the ids of `observe`, needs Play) and `full` (file only, resource `inside://shots/<file>`; the newest 200 are kept in `_mod\shots\`). `fast:true` returns once the file is written.
 - **Jobs:** a tool that runs over many frames holds the control lane as a job, and a second one gets `busy` at once. `jobs` lists, awaits and cancels them; requests with a progress token get progress over SSE; `notifications/cancelled` stops a call. Every result is one JSON object with `ok` first (`error.code`, `hint`, `warnings` when they apply).
-- **Plain endpoints** for scripts without an MCP client: `POST /cmd` (one command as the text body, the reply as text; `?wait=<status command>` waits for the result), `POST /cmds` (several commands in one request and one frame, the replies as JSON), `GET /status` (server and game health as JSON, answered without the game's main thread), `GET /state` (the observe JSON, needs Play), `GET /ping`.
+- **Plain endpoints** for scripts without an MCP client: `POST /cmd` (one command as the text body, the reply as text; `?wait=<status command>&until=<text>&timeout=<s>` keeps the call open until the status reply contains the text), `POST /cmds` (several commands in one request, run in order, the replies as JSON; `?stop_on_error=1`, `?dry_run=1`), `GET /status` (server and game health as JSON, answered without the game's main thread), `GET /state` (the observe JSON, needs Play), `GET /ping`.
 - **Restore:** after a client has used the server, the game is put back 600 s after the last tool call (`mcp.idle_restore_s`) and 60 s after the last client went away (`mcp.restore_on_close_s`); `0` switches either off. Restore cancels the running job and undoes what the tools changed (panels opened by `show_panel`; with Play also the clock, the input, vSync and the world tools' changes). Both wait while a recording is running.
 - **Access:** `mcp token new` (in the in-game console or through the file bridge) makes the server require `Authorization: Bearer <token>`; `mcp tools <allowlist>` limits the tools (`tool`, `profile:*`, `profile:tool`, `*`); `mcp hosts <names>` accepts more Host names. Changing calls are logged to `_mod\mcp_audit.jsonl`.
 - **In game:** `mcp` (status; `mcp status json`), `mcp on|off`, `mcp port <n>`, `mcp sessions [json]`, `mcp jobs`, `mcp providers`, `mcp restore`, `mcp selftest` then `mcp test` (a real HTTP session against the endpoint). Settings > Extensions shows the endpoint.
@@ -229,7 +235,11 @@ Ready-made files for Claude Code, Claude Desktop, Cursor, VS Code, Codex and Gem
 
 `InsideDev.Play.dll` lets an AI assistant play INSIDE through MCP. It reads the world as JSON (the boy or the huddle, nearby objects with ids, kinds and actions, hazards, the checkpoint, a slice of the level geometry), presses the game's own controls for an exact number of logic steps, walks to a point, uses objects, waits for conditions, respawns at checkpoints, goes through menus, reads playbooks, and records and replays input tracks. It needs only the MCP server. Input goes into the game's input system, not the Windows keyboard, so the game window does not need focus.
 
-<a href="docs/screenshots/mcp-observe.jpg"><img width="100%" src="docs/screenshots/mcp-observe.jpg" alt="An AI assistant reading the scene through MCP"></a>
+<table>
+<tr>
+<td valign="top"><a href="docs/screenshots/mcp-observe.jpg"><img width="100%" src="docs/screenshots/mcp-observe.jpg" alt="What an AI assistant gets: a marked screenshot, observe and the geometry slice"></a><br><b>What an AI assistant gets: a marked screenshot, observe and the geometry slice</b></td>
+</tr>
+</table>
 
 - **Install:** `bin\InsideDev.Mcp.dll` and `bin\InsideDev.Play.dll` to `<game>\_mod\` (or copy them while the game runs and type `ext load`). Connect the client to `http://127.0.0.1:47811/mcp/play` (stdio: `--profile play`).
 - **Play tools (15):** `observe`, `act`, `move_to`, `interact`, `wait_until`, `time`, `checkpoint`, `menu`, `screenshot`, `guide`, `notes`, `restore`, `input_track`, `geometry`, `film`.
@@ -240,7 +250,7 @@ Ready-made files for Claude Code, Claude Desktop, Cursor, VS Code, Codex and Gem
 - **Off by default:** `play.cheats` (checkpoint jumps), `play.save_guard` (save backups and confirms before loads that write the save), `play.hold_timeout_s` (release held input after a quiet time). Loads through the tools can write `INSIDE.sav` like normal play.
 
 > [!TIP]
-> After a load, wait for the requested checkpoint (`wait_until {any:[{ready:true}]}` or `level {op:"wait_ready"}`) before acting. In step mode, places timed to the music drift from the music. The MCP restore after 600 s without a tool call stops input track recordings.
+> After a load, wait for the requested checkpoint (`wait_until {any:[{ready:true}]}` or `level {op:"wait_ready"}`) before acting. In step mode, places timed to the music drift from the music. The automatic MCP restores wait while an input track, `grec`, `rec` or a panorama is recording; `restore` stops them.
 
 Full reference with every parameter, workflows and pitfalls: [docs/PLAY.md](docs/PLAY.md).
 
@@ -250,15 +260,15 @@ Full reference with every parameter, workflows and pitfalls: [docs/PLAY.md](docs
 
 `grec` (with Play and `InsideReadback.dll`) films the game's own frames into a video file. At the end of every n-th rendered frame the plugin copies the back buffer on the GPU, and background threads hand the frames to a separate ffmpeg process. Windows over the game, focus changes and other programs never reach the file, and a slow encoder never holds the game back.
 
-- **Video length equals game time**, so the sound lines up: frames are placed by game time, and a 120 s recording under load gave 120.13 s of video for 120.10 s of game time. `<file>.times.csv` next to the video gives each frame's game time for exact audio alignment. Time in which an agent's game stands frozen between calls is left out, and stepped runs are recorded frame by frame.
+- **Video length equals game time**, so the sound lines up: frames are placed by game time, and a 120 s recording under load gave 120.13 s of video for 120.10 s of game time. `<file>.times.csv` next to the video gives each frame's game time for exact audio alignment. Time in which an agent's game stands frozen between calls is left out, so a stepped run films as smoothly as real-time play.
 - `grec start [file.mkv] [every n-th frame] [cq] [enc=auto|<encoder>] [fps=<rate>]`, `grec stop [wait]`, `grec status [json]`. A bare file name goes to `<game>\_mod\recordings\`.
-- `rec start` / `rec stop` and the MCP `time {op:"record"}` / `{op:"record_stop", review_fps}` are the same recorder with a target frame rate and optional review frames. Desktop capture is still there as `rec start ... desktop` or `source:"desktop"`, for the rare case that needs the screen, other windows included.
-- The MCP `film` tool (play and dev profiles) is one typed door to `grec`, `pano` and `campath`, with structured results.
+- `rec start` / `rec stop` and the MCP `time {op:"record"}` / `{op:"record_stop", review_fps}` are the same recorder with a target frame rate and optional review frames. Desktop capture is still there as `rec start ... desktop` or `source:"desktop"`, for the rare case that needs the screen, other windows included; it is capped at `film.rec_max_s` seconds (default 4 hours).
+- The MCP `film` tool is one typed door to `grec`, `pano` and `campath`, with structured results. The play profile gets `grec` and `pano` with bare file names (saved to `_mod\recordings`); the `campath` and `mount` ops need the dev profile.
 - Encoder: `film.encoder` (default `auto`: the first of NVENC, AMF, Quick Sync H.265, x265, x264 whose test encode works). A failed ffmpeg is reported at once, and ffmpeg ends with the game.
 
 ### Live director camera: `campath`
 
-`campath` puts the main game camera on a pose path planned in advance while the game itself plays: live particles, time-animated shaders, mod effects and anti-aliasing stay the game's own. `mcam passes` writes a path for every camera of a MultiCam spec, or any script can write the two CSV files. The pose goes on the camera after the game's camera script, so the game's camera logic, culling and input stay untouched. In director mode the plan also drives the clock: the game is held still during the plan's pauses and runs at the plan's speed otherwise. `campath mount` rides the camera on a transform, for example the boy's head for a first-person pass, with optional smoothing of the head bob, a level horizon, timed looks and limits for the free look up and down.
+`campath` puts the main game camera on a pose path planned in advance while the game itself plays: live particles, time-animated shaders, mod effects and anti-aliasing stay the game's own. `mcam passes` writes a path for every camera of a MultiCam spec, or any script can write the two CSV files. The pose goes on the camera after the game's camera script, so the game's camera logic and the input stay as they are, while streaming and culling follow the director's view. In director mode the plan also drives the clock: the game is held still during the plan's pauses and runs at the plan's speed otherwise. `campath mount` rides the camera on a transform, for example the boy's head for a first-person pass, with optional smoothing of the head bob, a level horizon, timed looks and limits for the free look up and down.
 
 ### 360 degree panorama: `pano`
 
@@ -274,7 +284,7 @@ The scene recorder writes what moves in a scene (transforms, bones, particles, l
 - `srec load <dir|last> [play [speed] [loop]] [t=<time>|@event]`, `srec reload`, `srec play [speed]`, `srec pause`, `srec seek <t|@event>`, `srec step next|back|<s>`, `srec end`
 - `srec objects [filter]`, `srec probe [n]`, `srec status [json]`, `srec list`
 
-A relative `<dir>` is a folder under `<game>\_mod\srec\`; without one, `take_<date_time>`. A folder that already holds a recording is refused unless you add `overwrite=on`. Free disk space is checked before the start (`record.minFreeMB`), and a full disk stops the recording cleanly. Start a recording only after the load has finished; objects spawned at run time replay only in the game session that recorded them.
+A relative `<dir>` is a folder under `<game>\_mod\srec\`; without one, `take_<date_time>`. A folder that already holds a recording is refused unless you add `overwrite=on`. A full disk stops the recording cleanly; `record.minFreeMB` makes the start check free space first (default 0: no check). Start a recording only after the load has finished; objects spawned at run time replay only in the game session that recorded them.
 
 Reference: [docs/RECORD_REPLAY.md](docs/RECORD_REPLAY.md); design notes: [docs/REPLAY_DESIGN.md](docs/REPLAY_DESIGN.md).
 
@@ -284,8 +294,10 @@ MultiCam films one scene with many cameras at once. A JSON spec describes the ca
 
 <table>
 <tr>
-<td width="50%" valign="top"><a href="docs/screenshots/multicam-layout.jpg"><img width="100%" src="docs/screenshots/multicam-layout.jpg" alt="MultiCam: one recorded take, game camera plus three tracking cameras in one layout"></a><br><b>One recorded take, game camera plus three tracking cameras in one layout</b></td>
-<td width="50%" valign="top"><a href="docs/screenshots/multicam-game-vs-director.jpg"><img width="100%" src="docs/screenshots/multicam-game-vs-director.jpg" alt="Game camera vs director camera at the same recorded moment"></a><br><b>Game camera vs director camera at the same recorded moment</b></td>
+<td colspan="2" valign="top"><a href="docs/screenshots/multicam-layout.jpg"><img width="100%" src="docs/screenshots/multicam-layout.jpg" alt="One recorded take: the game camera plus three tracking cameras in one layout"></a><br><b>One recorded take: the game camera plus three tracking cameras in one layout</b></td>
+</tr>
+<tr>
+<td colspan="2" valign="top"><a href="docs/screenshots/multicam-game-vs-director.jpg"><img width="100%" src="docs/screenshots/multicam-game-vs-director.jpg" alt="Game camera and director camera at the same recorded moment"></a><br><b>Game camera and director camera at the same recorded moment</b></td>
 </tr>
 </table>
 
@@ -328,7 +340,8 @@ Reference: [docs/LAB.md](docs/LAB.md).
 | `inside_link.py` | the connection library under `inside_ctl.py` and `mcam_previews.py` (HTTP, token, file bridge fallback, a small MCP client); standard library only |
 | `srec_tool.py` | reads and verifies `scene.srec` recordings, reports spec events and content checks |
 | `mcam_spec_check.py` | offline lint of MultiCam specs, segment table, cost and disk estimate |
-| `mcam_compose.py`, `mcam_take.py` | angle videos, layouts, director blocks and cuts from a take (H.265); `mcam_compose.py doctor` checks ffmpeg and the encoders first, `--resume` skips finished outputs |
+| `mcam_compose.py` | angle videos, layouts, director blocks and cuts from a take (H.265); `mcam_compose.py doctor` checks ffmpeg and the encoders first, `--resume` skips finished outputs |
+| `mcam_take.py` | the take reader that `mcam_compose.py` and `mcam_qa.py` share; import only |
 | `mcam_qa.py`, `mcam_track_check.py`, `fast_review.py` | take checks with exit codes, contact sheets, the replay golden test, subject tracking, review frames |
 | `mcam_previews.py` | stills of every camera of a replay spec at every beat, from a recording in the running game |
 | `mcam_audio.py` | fixes (with a `.bak`), aligns and checks captured WAV files, builds a take's sound track |
@@ -368,7 +381,8 @@ Every feature can be switched on and off. This is the state of a fresh install:
 | Director camera, panorama | off | `campath load` then `arm` or `start`; `pano [file.png]` | `campath stop`, `restore` |
 | Scene recorder, MultiCam | off | `srec record start`, `srec load`; `mcam start / take / replay` | `srec record stop`, `srec end`; `mcam stop`, `mcam abort` |
 | Overwriting a take folder | refused | `overwrite=on` | leave it out |
-| Camera and frame helpers (`cam`, `hud`, `clean`, `gamma`, `seed`) | off | `cam pose`, `cam look`, `hud off`, `clean on`, `gamma <v>`, `seed <n>` | `cam off`, `cam back`, `hud on`, `clean off`, `gamma reset` (`seed` cannot be undone) |
+| Camera and frame helpers (`cam`, `clean`, `gamma`, `seed`) | off | `cam pose`, `cam look`, `clean on`, `gamma <v>`, `seed <n>` | `cam off`, `cam back`, `clean off`, `gamma reset` (`seed` cannot be undone) |
+| HUD lines at the top of the picture | on | `hud on`, F5 | `hud off`, F5 |
 | Game audio capture | off; output `audible` | `acap start <name>`, `srec record start ... audio=on` | `acap stop` |
 | InsideMuter | not running | start `InsideMuter.exe` (it then **mutes the game**) | `InsideMuter stop`; it also exits 10 s after the game and un-mutes |
 | Lab modules | not installed | copy the DLLs, then a `lab` or `det` command | `lab stop`, `det abort` |
@@ -394,7 +408,7 @@ Measured on a laptop (Core i7-11370H, RTX 3070 Laptop GPU, 2560x1440) in one gam
 InsideDev runs inside the game with the game's rights. What can reach it, and how to close each way:
 
 - **MCP server and plain endpoints.** It listens on `127.0.0.1` and `[::1]` only, never on the network. A request whose `Host` header is not `127.0.0.1`, `localhost` or `[::1]` (DNS rebinding), whose `Origin` is not a page of one of those hosts (`null` included: sandboxed frames, `data:` and `file:` pages), or that carries `Sec-Fetch-Site: cross-site` gets HTTP 403, so web pages in your browser cannot drive the game; an MCP POST with a `Content-Type` other than `application/json` gets 415. Programs on this computer (the stdio launcher, `inside_ctl.py`, scripts, curl) are not affected. `mcp token new` makes every caller show `Authorization: Bearer <token>`; `mcp tools <allowlist>` limits the tools. Without a token, any program on this computer can drive the game through the server.
-- **What an MCP call cannot do.** `command` and `POST /cmd` refuse OS input commands (`keyhold`, `focustest`), switching the bridge or the server off, and any change to the MCP port, token, tool list or hosts; `cfg set` refuses the protected settings. No call names a program to start: ffmpeg is found by the tool itself (`ffmpeg.path` in `editor.cfg`, `INSIDEDEV_FFMPEG`, `<game>\_mod\ffmpeg\ffmpeg.exe`, `PATH`, `C:\ffmpeg\bin\ffmpeg.exe`), and a spec's `output.ffmpeg` must be the full local path of a file named `ffmpeg.exe`. `reflect` calls and writes go through an allow list: calls that write files, start processes, load code, reach the network or change the registry are refused. A JSON body nested deeper than 128 levels is refused instead of crashing the game.
+- **What an MCP call cannot do.** `command` and `POST /cmd` refuse OS input commands (`keyhold`, `focustest`), switching the bridge or the server off, any change to the MCP port, token, tool list or hosts, and commands that drive secret or achievement objects; with `play.save_guard=1` also the load commands (`load`, `spawn`, `reload`, `respawn`, `cspawn go|respawn`); `cfg set` refuses the protected settings. No call names a program to start: ffmpeg is found by the tool itself (`ffmpeg.path` in `editor.cfg`, `INSIDEDEV_FFMPEG`, `<game>\_mod\ffmpeg\ffmpeg.exe`, `PATH`, `C:\ffmpeg\bin\ffmpeg.exe`), and a spec's `output.ffmpeg` must be the full local path of a file named `ffmpeg.exe`. `reflect` calls and writes go through an allow list: calls that write files, start processes, load code, reach the network or change the registry are refused. A JSON body nested deeper than 128 levels is refused instead of crashing the game.
 - **File bridge** (`_mod\cmd`). Whoever can write into the game folder can run every command through it, including the protected settings. `remote off` stops it for the session, `bridge.enabled=0` keeps it off.
 - **Loader** (`version.dll`). It starts `_mod\InsideDev.dll` and, when `<game>\InsideMods\InsideMods.dll` exists, that module too (a separate code-mod project; without that file nothing happens). Mono's debugger agent is off unless `_mod\debugger.flag` exists. The loader never writes a game assembly to disk.
 
@@ -420,14 +434,18 @@ Players using the prebuilt DLLs in `bin\` need nothing extra: the editor reads t
 
 | File | Source |
 |---|---|
-| `UnityEngine.dll` | plain copy of `INSIDE_Data\Managed\UnityEngine.dll`: copied automatically if missing |
-| `PlayMaker.dll` | plain copy of `INSIDE_Data\Managed\PlayMaker.dll`: copied automatically if missing |
+| `UnityEngine.dll` | plain copy of `INSIDE_Data\Managed\UnityEngine.dll`: the running editor copies it at start if missing |
+| `PlayMaker.dll` | plain copy of `INSIDE_Data\Managed\PlayMaker.dll`: the running editor copies it at start if missing |
 | `Assembly-CSharp.dll` | the game's own code: **you supply it** |
 | `Assembly-CSharp-firstpass.dll` | the game's own code: **you supply it** |
 
 The game does not ship the last two as ordinary DLLs. **InsideDev does not extract, decode or dump them**, and this project does not describe how to obtain them: dump them yourself and place them in `GameCode\`. **Settings > Game code** shows which of the four are present. The loader never writes any game assembly to disk.
 
-<a href="docs/screenshots/gamecode-settings.jpg"><img width="100%" src="docs/screenshots/gamecode-settings.jpg" alt="Settings > Game code"></a>
+<table>
+<tr>
+<td valign="top"><a href="docs/screenshots/gamecode-settings.jpg"><img width="670" src="docs/screenshots/gamecode-settings.jpg" alt="Settings > Game code: which of the four assemblies are present"></a><br><b>Settings > Game code: which of the four assemblies are present</b></td>
+</tr>
+</table>
 
 ### Building
 
